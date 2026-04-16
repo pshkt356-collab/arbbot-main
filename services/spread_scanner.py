@@ -328,6 +328,7 @@ class SpreadScanner:
                 logger.error(f"Error notifying subscriber: {e}")
 
     async def _trigger_auto_trade(self, alert: SpreadAlert):
+        """Триггер авто-трейдинга для всех пользователей с включенным авто-трейдингом"""
         try:
             from services.trading_engine import trading_engine
             from database.models import Database
@@ -341,26 +342,32 @@ class SpreadScanner:
             await db.initialize()
             
             try:
-                if settings.telegram_admin_id:
-                    user = await db.get_user(settings.telegram_admin_id)
-                    
-                    if not user:
-                        return
-                    
+                # Получаем всех пользователей с включенным авто-трейдингом
+                all_users = await db.get_all_users()
+                
+                for user in all_users:
+                    # Проверяем включен ли авто-трейдинг для пользователя
                     if not user.alert_settings.get('auto_trading', False):
-                        return
+                        continue
                     
-                    open_trades = await db.get_open_trades(user.user_id)
-                    max_positions = user.risk_settings.get('max_open_positions', 5)
-                    
-                    if len(open_trades) >= max_positions:
-                        return
-                    
+                    # Проверяем есть ли API ключи для обеих бирж
                     has_buy = alert.buy_exchange in user.api_keys and user.api_keys[alert.buy_exchange].get('api_key')
                     has_sell = alert.sell_exchange in user.api_keys and user.api_keys[alert.sell_exchange].get('api_key')
                     
                     if not has_buy or not has_sell:
-                        return
+                        continue
+                    
+                    # Проверяем лимит позиций
+                    open_trades = await db.get_open_trades(user.user_id)
+                    max_positions = user.risk_settings.get('max_open_positions', 5)
+                    
+                    if len(open_trades) >= max_positions:
+                        continue
+                    
+                    # Проверяем минимальный спред для авто-трейдинга
+                    min_spread = user.alert_settings.get('min_spread_auto', settings.min_spread_auto)
+                    if alert.spread_percent < min_spread:
+                        continue
                     
                     key = f"{alert.symbol}:{alert.buy_exchange}:{alert.sell_exchange}"
                     result = await trading_engine.validate_and_open(
@@ -369,7 +376,19 @@ class SpreadScanner:
                     )
                     
                     if result.success:
-                        logger.info(f"Auto-trade opened: {alert.symbol} #{result.trade_id}")
+                        logger.info(f"Auto-trade opened for user {user.user_id}: {alert.symbol} #{result.trade_id}")
+                        
+                        # Отправляем уведомление пользователю
+                        if hasattr(self, '_bot') and self._bot:
+                            try:
+                                await self._bot.send_message(
+                                    chat_id=user.user_id,
+                                    text=f"🤖 Авто-сделка открыта: {alert.symbol}\n"
+                                         f"Спред: {alert.spread_percent:.2f}%\n"
+                                         f"ID: #{result.trade_id}"
+                                )
+                            except:
+                                pass
             finally:
                 await db.close()
         except Exception as e:
@@ -1531,3 +1550,32 @@ class SpreadScanner:
     
     async def get_prices_copy(self):
         return dict(self.prices)
+
+    async def get_top_spreads(self, limit: int = 20) -> list:
+        """Получение топ-N активных спредов"""
+        try:
+            spreads = []
+            
+            # Получаем все активные спреды из active_spreads
+            for spread_key, spread_info in self.active_spreads.items():
+                if spread_info.get('is_active', False):
+                    spreads.append({
+                        'symbol': spread_info.get('symbol', ''),
+                        'spread_percent': spread_info.get('spread_percent', 0),
+                        'buy_exchange': spread_info.get('buy_exchange', ''),
+                        'sell_exchange': spread_info.get('sell_exchange', ''),
+                        'buy_price': spread_info.get('buy_price', 0),
+                        'sell_price': spread_info.get('sell_price', 0),
+                        'volume_24h': spread_info.get('volume_24h', 0),
+                        'arbitrage_type': spread_info.get('arbitrage_type', ''),
+                        'timestamp': spread_info.get('timestamp', '')
+                    })
+            
+            # Сортируем по размеру спреда (убывание)
+            spreads.sort(key=lambda x: x['spread_percent'], reverse=True)
+            
+            return spreads[:limit]
+            
+        except Exception as e:
+            logger.error(f"Error getting top spreads: {e}")
+            return []

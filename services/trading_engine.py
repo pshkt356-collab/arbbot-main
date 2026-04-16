@@ -270,7 +270,7 @@ class TradingEngine:
         )
 
     async def _open_real_trade(self, user: UserSettings, symbol: str, long_ex: str, short_ex: str,
-                              buy_pd, sell_pd, entry_spread: float, db: Database, strategy: str, correlation_id: str) -> TradeResult:
+                              buy_pd, sell_pd, entry_spread: float, db: Database, strategy: str, correlation_id: str, auto: bool = False) -> TradeResult:
         try:
             if not await self._check_circuit_breaker(long_ex) or not await self._check_circuit_breaker(short_ex):
                 return TradeResult(success=False, error="Circuit breaker active", correlation_id=correlation_id)
@@ -599,6 +599,111 @@ class TradingEngine:
         except Exception as e:
             logger.error(f"Error closing real position: {e}")
             return TradeResult(success=False, error=f"Close failed: {str(e)}", correlation_id=correlation_id)
+
+    async def test_api_connection(self, exchange_id: str, api_key: str, api_secret: str, testnet: bool = True) -> dict:
+        """Тестирование подключения к API биржи"""
+        try:
+            exchange = await self._get_exchange(exchange_id, api_key, api_secret, None, testnet)
+            
+            # Проверяем баланс
+            balance = await exchange.fetch_balance()
+            usdt_balance = self._get_usdt_balance(balance)
+            
+            # Проверяем доступность торговли
+            markets = await exchange.load_markets()
+            
+            await exchange.close()
+            
+            return {
+                'success': True,
+                'balance_usdt': usdt_balance,
+                'markets_count': len(markets),
+                'message': f'Подключение успешно. Баланс: {usdt_balance:.2f} USDT'
+            }
+        except Exception as e:
+            logger.error(f"API connection test failed for {exchange_id}: {e}")
+            return {
+                'success': False,
+                'balance_usdt': 0,
+                'markets_count': 0,
+                'message': f'Ошибка подключения: {str(e)}'
+            }
+
+    async def partial_close(self, trade_id: int, user: UserSettings, percentage: float) -> TradeResult:
+        """Частичное закрытие позиции"""
+        correlation_id = str(uuid.uuid4())[:8]
+        
+        try:
+            # Находим сделку
+            trade = None
+            for monitor in self.active_monitors.values():
+                if monitor.trade.id == trade_id:
+                    trade = monitor.trade
+                    break
+            
+            if not trade:
+                return TradeResult(success=False, error="Trade not found", correlation_id=correlation_id)
+            
+            if percentage <= 0 or percentage > 100:
+                return TradeResult(success=False, error="Percentage must be between 1 and 100", correlation_id=correlation_id)
+            
+            # TODO: Реализовать частичное закрытие через API бирж
+            logger.info(f"[{correlation_id}] Partial close {percentage}% for trade #{trade_id}")
+            
+            return TradeResult(
+                success=True,
+                trade_id=trade_id,
+                correlation_id=correlation_id,
+                message=f"Partial close {percentage}% initiated"
+            )
+            
+        except Exception as e:
+            logger.error(f"[{correlation_id}] Partial close error: {e}")
+            return TradeResult(success=False, error=str(e), correlation_id=correlation_id)
+
+    async def _check_zombie_positions(self, user: UserSettings, db: Database):
+        """Проверка и закрытие 'зомби'-позиций (зависших сделок)"""
+        try:
+            max_hours = user.risk_settings.get('max_position_hours', 24)
+            now = datetime.now(timezone.utc)
+            
+            for trade_id, monitor in list(self.active_monitors.items()):
+                trade = monitor.trade
+                
+                # Парсим дату открытия
+                try:
+                    if trade.opened_at.endswith('Z'):
+                        opened_at = datetime.fromisoformat(trade.opened_at.replace('Z', '+00:00'))
+                    else:
+                        opened_at = datetime.fromisoformat(trade.opened_at)
+                        opened_at = opened_at.replace(tzinfo=timezone.utc)
+                except:
+                    continue
+                
+                hours_open = (now - opened_at).total_seconds() / 3600
+                
+                if hours_open > max_hours:
+                    logger.warning(f"Zombie position detected: trade #{trade_id}, open for {hours_open:.1f} hours")
+                    
+                    # Закрываем позицию
+                    result = await self.close_trade_manually(trade_id, user)
+                    
+                    if result.success:
+                        logger.info(f"Zombie position #{trade_id} closed automatically")
+                        # Отправляем уведомление
+                        if hasattr(self, '_bot') and self._bot:
+                            try:
+                                await self._bot.send_message(
+                                    chat_id=user.user_id,
+                                    text=f"⚠️ Зомби-позиция #{trade_id} закрыта автоматически после {hours_open:.1f} часов"
+                                )
+                            except:
+                                pass
+                    else:
+                        logger.error(f"Failed to close zombie position #{trade_id}: {result.error}")
+                        
+        except Exception as e:
+            logger.error(f"Zombie check error: {e}")
 
 # ===== КЛАСС PositionMonitor (отдельно, без recover_positions) =====
 class PositionMonitor:

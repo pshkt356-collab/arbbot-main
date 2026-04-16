@@ -304,8 +304,13 @@ async def subscribe_user_to_alerts(user_id: int, scanner, db: Database = None):
     logger.info(f"User {user_id} subscribed to spread alerts")
 
 # ИСПРАВЛЕНО: Убран неработающий from bot import bot, используем _bot
-async def send_spread_alert(user_id: int, spread_info):
-    """Отправка алерта пользователю"""
+async def send_spread_alert(spread_info, user_id: int):
+    """Отправка алерта пользователю
+    
+    Args:
+        spread_info: SpreadAlert объект или dict с информацией о спреде
+        user_id: ID пользователя для отправки
+    """
     try:
         global _bot
         if _bot is None:

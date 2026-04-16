@@ -52,6 +52,11 @@ class UserSettings:
         'margin_mode': 'isolated'
     })
     arbitrage_mode: str = 'all'  # 'all' или 'futures_futures_only'
+    
+    # Дополнительные поля для совместимости с callbacks.py
+    auto_trade_mode: bool = False  # Режим авто-трейдинга
+    alerts_enabled: bool = True    # Включены ли алерты
+    
     created_at: str = None
     updated_at: str = None
 
@@ -60,6 +65,21 @@ class UserSettings:
             self.created_at = datetime.now().isoformat()
         if self.updated_at is None:
             self.updated_at = datetime.now().isoformat()
+
+    @property
+    def total_balance(self) -> float:
+        """Общий баланс (заглушка - нужно интегрировать с реальными данными)"""
+        return self.risk_settings.get('total_balance', 0.0)
+    
+    @property
+    def available_balance(self) -> float:
+        """Доступный баланс (заглушка - нужно интегрировать с реальными данными)"""
+        return self.risk_settings.get('available_balance', 0.0)
+    
+    @property
+    def locked_balance(self) -> float:
+        """Заблокированный баланс (заглушка - нужно интегрировать с реальными данными)"""
+        return self.risk_settings.get('locked_balance', 0.0)
 
 @dataclass
 class Trade:
