@@ -39,9 +39,18 @@ async def cmd_start(message: Message, user: UserSettings):
     class FakeCallback:
         def __init__(self, msg):
             self.from_user = msg.from_user
-            self.message = msg
+            self.message = FakeMessage(msg)
         async def answer(self, **kwargs):
             pass
+    
+    class FakeMessage:
+        def __init__(self, msg):
+            self._msg = msg
+        async def edit_text(self, text, **kwargs):
+            # Если нельзя редактировать, отправляем новое сообщение
+            await self._msg.answer(text, **kwargs)
+        async def answer(self, text, **kwargs):
+            await self._msg.answer(text, **kwargs)
     
     fake_callback = FakeCallback(message)
     await show_main_menu(fake_callback, user)
@@ -73,9 +82,17 @@ async def cmd_menu(message: Message, user: UserSettings):
     class FakeCallback:
         def __init__(self, msg):
             self.from_user = msg.from_user
-            self.message = msg
+            self.message = FakeMessage(msg)
         async def answer(self, **kwargs):
             pass
+    
+    class FakeMessage:
+        def __init__(self, msg):
+            self._msg = msg
+        async def edit_text(self, text, **kwargs):
+            await self._msg.answer(text, **kwargs)
+        async def answer(self, text, **kwargs):
+            await self._msg.answer(text, **kwargs)
     
     fake_callback = FakeCallback(message)
     await show_main_menu(fake_callback, user)

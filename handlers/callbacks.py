@@ -767,11 +767,14 @@ async def show_positions_history(callback: CallbackQuery, user: UserSettings):
 # ==================== ERROR HANDLING ====================
 
 @callbacks_router.errors()
-async def callback_error_handler(event, exception):
+async def callback_error_handler(update, exception):
     """Обработка ошибок колбэков"""
     logger.error(f"Callback error: {exception}")
-    if hasattr(event, 'callback_query') and event.callback_query:
-        try:
-            await event.callback_query.answer("❌ Ошибка обработки", show_alert=True)
-        except:
-            pass
+    # Пытаемся отправить уведомление пользователю
+    try:
+        if hasattr(update, 'callback_query') and update.callback_query:
+            await update.callback_query.answer("❌ Ошибка обработки", show_alert=True)
+        elif hasattr(update, 'message') and update.message:
+            await update.message.answer("❌ Произошла ошибка. Попробуйте /start")
+    except Exception as e:
+        logger.error(f"Failed to send error notification: {e}")
