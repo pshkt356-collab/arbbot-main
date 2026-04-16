@@ -468,10 +468,10 @@ async def toggle_exchange(callback: CallbackQuery, user: UserSettings, db: Datab
 
     await show_exchanges(callback, user)
 
-@callbacks_router.callback_query(F.data == "exchanges:add_api")
-async def add_exchange_api(callback: CallbackQuery, state: FSMContext):
-    """Начать добавление API ключа"""
-    await callback.answer()
+@callbacks_router.callback_query(F.data.startswith("exchange_"))
+async def toggle_exchange(callback: CallbackQuery, user: UserSettings, state: FSMContext):
+    ...
+    await show_exchanges(callback, user, state)  # добавлен state
 
     builder = InlineKeyboardBuilder()
     for ex in AVAILABLE_EXCHANGES:
@@ -767,7 +767,7 @@ async def show_positions_history(callback: CallbackQuery, user: UserSettings):
 # ==================== ERROR HANDLING ====================
 
 @callbacks_router.errors()
-async def callback_error_handler(update, exception):
+async def callback_error_handler(update: Update, exception: Exception):
     """Обработка ошибок колбэков"""
     logger.error(f"Callback error: {exception}")
     # Пытаемся отправить уведомление пользователю
