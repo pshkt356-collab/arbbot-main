@@ -1,0 +1,18 @@
+2026-03-29 13:34:21,772 - __main__ - ERROR - Fatal error: HTTP Client says - ClientConnectorDNSError: Cannot connect to host api.telegram.org:443 ssl:default [Could not contact DNS servers]
+2026-03-29 13:34:22,073 - asyncio - ERROR - Unclosed client session
+client_session: <aiohttp.client.ClientSession object at 0x000001B16CFC9400>
+2026-03-29 13:43:27,728 - __main__ - ERROR - Fatal error: HTTP Client says - ClientConnectorDNSError: Cannot connect to host api.telegram.org:443 ssl:default [Could not contact DNS servers]
+2026-03-29 13:43:28,150 - asyncio - ERROR - Unclosed client session
+client_session: <aiohttp.client.ClientSession object at 0x000001D69AA49400>
+2026-03-29 13:44:07,127 - __main__ - ERROR - Fatal error: HTTP Client says - ClientConnectorDNSError: Cannot connect to host api.telegram.org:443 ssl:default [Could not contact DNS servers]
+2026-03-29 13:44:07,399 - asyncio - ERROR - Unclosed client session
+client_session: <aiohttp.client.ClientSession object at 0x00000237F7109400>
+2026-03-29 13:53:16,931 - __main__ - ERROR - Fatal error: 'ClientSession' object is not callable
+2026-03-29 13:53:17,054 - asyncio - ERROR - Unclosed client session
+client_session: <aiohttp.client.ClientSession object at 0x00000267A5B28C20>
+2026-03-29 13:59:41,599 - __main__ - ERROR - Fatal error: BaseSession.__init__() got an unexpected keyword argument 'connector'
+2026-03-29 13:59:41,602 - __main__ - ERROR - Fatal error: BaseSession.__init__() got an unexpected keyword argument 'connector'
+2026-03-29 14:01:04,922 - __main__ - ERROR - Fatal error: HTTP Client says - ClientConnectorDNSError: Cannot connect to host api.telegram.org:443 ssl:default [Could not contact DNS servers]
+2026-03-29 14:01:04,924 - __main__ - ERROR - Fatal error: HTTP Client says - ClientConnectorDNSError: Cannot connect to host api.telegram.org:443 ssl:default [Could not contact DNS servers]
+2026-03-29 14:01:05,058 - asyncio - ERROR - Unclosed client session
+client_session: <aiohttp.client.ClientSession object at 0x000001B3656F4440>
