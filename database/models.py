@@ -56,6 +56,17 @@ class UserSettings:
     # Дополнительные поля для совместимости с callbacks.py
     auto_trade_mode: bool = False  # Режим авто-трейдинга
     alerts_enabled: bool = True    # Включены ли алерты
+    notifications_enabled: bool = True  # Уведомления включены
+    selected_exchanges: list = field(default_factory=lambda: ['binance', 'bybit', 'okx', 'whitebit', 'mexc'])  # Выбранные биржи
+    min_spread_threshold: float = 0.2  # Минимальный порог спреда
+    trade_amount: float = 100.0  # Объем сделки в USDT
+    inter_exchange_enabled: bool = True  # Межбиржевой арбитраж включен
+    basis_arbitrage_enabled: bool = True  # Базисный арбитраж включен
+    leverage: int = 3  # Плечо торговли
+    total_trades: int = 0  # Всего сделок
+    successful_trades: int = 0  # Успешных сделок
+    failed_trades: int = 0  # Неудачных сделок
+    total_profit: float = 0.0  # Общая прибыль
     
     created_at: str = None
     updated_at: str = None
