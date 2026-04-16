@@ -1,8 +1,8 @@
 """
-Callback handlers for Telegram bot
+Callback handlers for Telegram bot - FINAL FIX
 """
 from aiogram import F, Router
-from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, Update
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.filters import StateFilter
@@ -450,8 +450,9 @@ async def show_exchanges(callback: CallbackQuery, user: UserSettings, state: FSM
 
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
 
+# ИСПРАВЛЕНО: Добавлен параметр state: FSMContext
 @callbacks_router.callback_query(F.data.startswith("exchanges:toggle:"))
-async def toggle_exchange(callback: CallbackQuery, user: UserSettings, db: Database = None):
+async def toggle_exchange(callback: CallbackQuery, user: UserSettings, state: FSMContext, db: Database = None):
     """Подключить/отключить биржу"""
     exchange_id = callback.data.split(":")[2]
 
@@ -466,12 +467,13 @@ async def toggle_exchange(callback: CallbackQuery, user: UserSettings, db: Datab
     if db:
         await db.update_user(user)
 
-    await show_exchanges(callback, user)
+    # ИСПРАВЛЕНО: Передаем state в show_exchanges
+    await show_exchanges(callback, user, state)
 
-@callbacks_router.callback_query(F.data.startswith("exchange_"))
-async def toggle_exchange(callback: CallbackQuery, user: UserSettings, state: FSMContext):
-    ...
-    await show_exchanges(callback, user, state)  # добавлен state
+@callbacks_router.callback_query(F.data == "exchanges:add_api")
+async def add_exchange_api(callback: CallbackQuery, state: FSMContext):
+    """Начать добавление API ключа"""
+    await callback.answer()
 
     builder = InlineKeyboardBuilder()
     for ex in AVAILABLE_EXCHANGES:
@@ -766,6 +768,7 @@ async def show_positions_history(callback: CallbackQuery, user: UserSettings):
 
 # ==================== ERROR HANDLING ====================
 
+# ИСПРАВЛЕНО: Правильная сигнатура для aiogram 3.x
 @callbacks_router.errors()
 async def callback_error_handler(update: Update, exception: Exception):
     """Обработка ошибок колбэков"""

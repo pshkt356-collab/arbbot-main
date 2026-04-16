@@ -1,5 +1,5 @@
 """
-Command handlers for Telegram bot
+Command handlers for Telegram bot - FINAL FIX
 """
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery
@@ -166,21 +166,18 @@ async def cmd_test_api(message: Message, user: UserSettings):
             continue
 
         try:
-            api_secret = api_data.get('api_secret', '') or ''
-            exchange = await trading_engine._get_exchange(
+            # ИСПРАВЛЕНО: Используем test_api_connection вместо прямого вызова _get_exchange
+            result = await trading_engine.test_api_connection(
                 exchange_id,
                 api_data['api_key'],
-                api_secret,
+                api_data.get('api_secret', ''),
                 api_data.get('testnet', True)
             )
-
-            if exchange:
-                balance = await exchange.fetch_balance()
-                usdt = trading_engine._get_usdt_balance(balance)
-                text += f"✅ **{exchange_id.upper()}**: {usdt:.2f} USDT\n"
-                await exchange.close()
+            
+            if result.get('success'):
+                text += f"✅ **{exchange_id.upper()}**: {result.get('balance_usdt', 0):.2f} USDT\n"
             else:
-                text += f"❌ **{exchange_id.upper()}**: Ошибка подключения\n"
+                text += f"❌ **{exchange_id.upper()}**: {result.get('message', 'Ошибка подключения')}\n"
 
         except Exception as e:
             logger.error(f"Test API error for {exchange_id}: {e}")
@@ -238,17 +235,24 @@ async def process_api_secret(message: Message, state: FSMContext, user: UserSett
             await state.clear()
             return
 
-        # Проверяем API через CCXT
+        # ИСПРАВЛЕНО: Используем test_api_connection для проверки API
         is_valid = False
         balance = 0.0
         try:
             from services.trading_engine import trading_engine
-            exchange = await trading_engine._get_exchange(exchange_id, api_key, api_secret)
-            if exchange:
-                bal = await exchange.fetch_balance()
-                balance = trading_engine._get_usdt_balance(bal)
-                await exchange.close()
+            result = await trading_engine.test_api_connection(
+                exchange_id, 
+                api_key, 
+                api_secret,
+                testnet=True
+            )
+            
+            if result.get('success'):
+                balance = result.get('balance_usdt', 0)
                 is_valid = True
+            else:
+                logger.error(f"API validation failed: {result.get('message')}")
+                
         except Exception as e:
             logger.error(f"API validation error: {e}")
 
