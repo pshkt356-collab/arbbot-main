@@ -25,7 +25,7 @@ class DatabaseBackup:
         self._task = asyncio.create_task(self._backup_loop(interval_hours))
         logger.info(f"Auto-backup started: every {interval_hours}h, max {self.max_backups} backups")
     
-        async def stop(self):
+    async def stop(self):
         self._running = False
         if self._task and not self._task.done():
             self._task.cancel()
