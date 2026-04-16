@@ -29,9 +29,15 @@ class ExchangeStatusChecker:
         logger.info("Exchange status checker started")
     
     async def stop(self):
-        self._running = False
-        if self._task and not self._task.done():
-            self._task.cancel()
+    self._running = False
+    if self._task and not self._task.done():
+        self._task.cancel()
+        try:
+            await asyncio.wait_for(self._task, timeout=1.0)
+        except asyncio.TimeoutError:
+            pass
+        except asyncio.CancelledError:
+            pass
     
     async def _check_loop(self):
         while self._running:

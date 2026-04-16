@@ -18,9 +18,15 @@ class DatabaseArchiver:
         logger.info("Database archiver started")
     
     async def stop(self):
-        self._running = False
-        if self._task and not self._task.done():
-            self._task.cancel()
+    self._running = False
+    if self._task and not self._task.done():
+        self._task.cancel()
+        try:
+            await asyncio.wait_for(self._task, timeout=1.0)
+        except asyncio.TimeoutError:
+            pass
+        except asyncio.CancelledError:
+            pass
     
     async def _archive_loop(self, interval_hours: int):
         await asyncio.sleep(3600)

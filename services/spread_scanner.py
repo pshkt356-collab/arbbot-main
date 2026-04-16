@@ -404,18 +404,26 @@ class SpreadScanner:
             await self.stop()
 
     async def stop(self):
-        logger.info("Stopping spread scanner...")
-        self.running = False
-        self._shutdown_event.set()
-        
-        for task in self._tasks:
-            if not task.done():
-                task.cancel()
-        
-        if self._tasks:
-            await asyncio.gather(*self._tasks, return_exceptions=True)
-        
-        logger.info("Spread scanner stopped")
+    logger.info("Stopping spread scanner...")
+    self.running = False
+    self._shutdown_event.set()
+    
+    # Отменяем все задачи
+    for task in self._tasks:
+        if not task.done():
+            task.cancel()
+    
+    # Ждем завершения с таймаутом
+    if self._tasks:
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*self._tasks, return_exceptions=True),
+                timeout=3.0
+            )
+        except asyncio.TimeoutError:
+            logger.warning("⚠️ Scanner tasks stop timeout, some tasks may still be running")
+    
+    logger.info("Spread scanner stopped")
 
     async def _cleanup_loop(self):
         while self.running:

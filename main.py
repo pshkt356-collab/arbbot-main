@@ -132,37 +132,85 @@ async def stop_health_server():
         await runner.cleanup()
     logger.info("Health check server stopped")
 
+async def _stop_with_timeout(stop_func, name, timeout=2.0):
+    """Остановка компонента с таймаутом"""
+    try:
+        await asyncio.wait_for(stop_func(), timeout=timeout)
+        logger.info(f"✅ {name} stopped")
+    except asyncio.TimeoutError:
+        logger.warning(f"⚠️ {name} stop timeout ({timeout}s), forcing...")
+    except Exception as e:
+        logger.error(f"❌ {name} stop error: {e}")
+
 async def shutdown(signal_name=None):
-    """Graceful shutdown"""
+    """Graceful shutdown with timeout for Railway (10s limit)"""
     logger.info(f"🛑 Received exit signal {signal_name}...")
-
-    await stop_health_server()
-
-    if backup_manager:
-        await backup_manager.stop()
-
-    if archiver:
-        await archiver.stop()
-
-    if scanner:
-        await scanner.stop()
-
-    if status_checker:
-        await status_checker.stop()
-
-    if trading_engine:
-        trading_engine.stop()
-
-    circuit_breaker.stop()
-
-    if db:
-        await db.close()
-
-    if bot:
-        await bot.session.close()
-
-    logger.info("✅ Shutdown complete")
-    sys.exit(0)
+    
+    # Railway дает 10 секунд на graceful shutdown
+    # Оставляем запас - используем максимум 8 секунд
+    shutdown_start = asyncio.get_event_loop().time()
+    max_shutdown_time = 8.0
+    
+    async def _do_shutdown():
+        # 1. Останавливаем health server (быстро)
+        await _stop_with_timeout(stop_health_server, "Health server", timeout=1.0)
+        
+        # 2. Останавливаем backup manager
+        if backup_manager:
+            await _stop_with_timeout(backup_manager.stop, "Backup manager", timeout=1.0)
+        
+        # 3. Останавливаем archiver
+        if archiver:
+            await _stop_with_timeout(archiver.stop, "Archiver", timeout=1.0)
+        
+        # 4. Останавливаем scanner (может занять время из-за WebSocket)
+        if scanner:
+            await _stop_with_timeout(scanner.stop, "Scanner", timeout=2.0)
+        
+        # 5. Останавливаем status checker
+        if status_checker:
+            await _stop_with_timeout(status_checker.stop, "Status checker", timeout=1.0)
+        
+        # 6. Останавливаем trading engine
+        if trading_engine:
+            try:
+                trading_engine.stop()
+                logger.info("✅ Trading engine stopped")
+            except Exception as e:
+                logger.error(f"❌ Trading engine stop error: {e}")
+        
+        # 7. Останавливаем circuit breaker
+        try:
+            circuit_breaker.stop()
+            logger.info("✅ Circuit breaker stopped")
+        except Exception as e:
+            logger.error(f"❌ Circuit breaker stop error: {e}")
+        
+        # 8. Закрываем БД
+        if db:
+            await _stop_with_timeout(db.close, "Database", timeout=1.0)
+        
+        # 9. Закрываем бота
+        if bot:
+            try:
+                await asyncio.wait_for(bot.session.close(), timeout=1.0)
+                logger.info("✅ Bot session closed")
+            except asyncio.TimeoutError:
+                logger.warning("⚠️ Bot session close timeout, forcing...")
+            except Exception as e:
+                logger.error(f"❌ Bot session close error: {e}")
+    
+    try:
+        # Запускаем shutdown с общим таймаутом
+        await asyncio.wait_for(_do_shutdown(), timeout=max_shutdown_time)
+        elapsed = asyncio.get_event_loop().time() - shutdown_start
+        logger.info(f"✅ Shutdown complete in {elapsed:.2f}s")
+    except asyncio.TimeoutError:
+        logger.warning(f"⚠️ Shutdown timeout ({max_shutdown_time}s), forcing exit...")
+    except Exception as e:
+        logger.error(f"❌ Shutdown error: {e}")
+    finally:
+        sys.exit(0)
 
 def handle_signal(sig):
     asyncio.create_task(shutdown(signal_name=sig.name))
