@@ -56,7 +56,7 @@ class SQLiteStorage(BaseStorage):
             (str_key, state_str)
         )
         await db.commit()
-    logger.info(f"[FSM STORAGE] set_state committed: key={str_key}")
+        logger.info(f"[FSM STORAGE] set_state committed: key={str_key}")
 
     async def get_state(self, key: StorageKey) -> Optional[str]:
         """Get state for a key"""
