@@ -105,7 +105,20 @@ async def process_api_secret(message: Message, state: FSMContext, user: UserSett
 
     await message.answer(f"⏳ Проверка API ключей {exchange.upper()}...")
 
-    success, msg = await trading_engine.test_api_connection(exchange, api_key, api_secret, testnet=True)
+    try:
+        result = await trading_engine.test_api_connection(exchange, api_key, api_secret, testnet=True)
+        if isinstance(result, dict):
+            success = result.get('success', False)
+            msg = result.get('message', str(result))
+        elif isinstance(result, tuple) and len(result) == 2:
+            success, msg = result
+        else:
+            success = bool(result)
+            msg = str(result)
+    except Exception as e:
+        logger.error(f"[FSM] test_api_connection error: {e}")
+        success = False
+        msg = f"Ошибка проверки: {str(e)[:100]}"
 
     if not success:
         await message.answer(f"❌ Ошибка проверки API:\n `{msg}`\n\nПопробуйте заново: /menu")
