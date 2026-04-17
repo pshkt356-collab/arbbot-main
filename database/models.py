@@ -314,6 +314,47 @@ class Database:
                 logger.error(f"Error getting open trades: {e}")
                 return []
 
+    # Aliases for compatibility with original code
+    async def add_trade(self, trade: Trade) -> int:
+        """Alias for create_trade"""
+        return await self.create_trade(trade)
+
+    async def get_trade_by_id(self, trade_id: int) -> Optional[dict]:
+        """Get trade by ID as dict (for compatibility)"""
+        trade = await self.get_trade(trade_id)
+        if trade:
+            return asdict(trade)
+        return None
+
+    async def close_trade(self, trade_id: int, close_spread: float, pnl_usd: float):
+        """Close a trade with given PnL"""
+        async with self._query_lock:
+            await self._conn.execute(
+                """UPDATE trades SET 
+                    status = 'closed',
+                    close_spread = ?,
+                    pnl_usd = ?,
+                    closed_at = ?
+                WHERE id = ?""",
+                (close_spread, pnl_usd, datetime.now().isoformat(), trade_id)
+            )
+            await self._conn.commit()
+
+    async def get_all_users(self) -> List[UserSettings]:
+        """Get all users from database"""
+        async with self._query_lock:
+            async with self._conn.execute("SELECT settings FROM users") as cursor:
+                rows = await cursor.fetchall()
+                users = []
+                for row in rows:
+                    try:
+                        settings = json.loads(row['settings'])
+                        user = UserSettings(user_id=settings.get('user_id', 0), **settings)
+                        users.append(user)
+                    except:
+                        continue
+                return users
+
     async def close(self):
         """Закрытие соединения с БД"""
         if self._conn:
