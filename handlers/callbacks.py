@@ -504,14 +504,28 @@ async def add_exchange_api(callback: CallbackQuery, state: FSMContext):
 async def start_api_input(callback: CallbackQuery, state: FSMContext):
     """Начать ввод API ключа"""
     exchange_id = callback.data.split(":")[2]
+    user_id = callback.from_user.id
+
+    logger.info(f"[FSM] start_api_input: user={user_id}, exchange={exchange_id}")
 
     if not validate_exchange(exchange_id):
         await callback.answer("❌ Неверная биржа", show_alert=True)
         return
 
-    # BUG 31 FIX: Use 'current_exchange' key to match states.py handler
-    await state.update_data(current_exchange=exchange_id, step='api_key')
+    # Clear any previous state first to avoid stale data
+    await state.clear()
+    logger.info(f"[FSM] State cleared for user={user_id}")
+
+    # Set the state FIRST, then update data
     await state.set_state(SetupStates.waiting_for_api_key)
+    logger.info(f"[FSM] State set to waiting_for_api_key for user={user_id}")
+
+    await state.update_data(current_exchange=exchange_id, step='api_key')
+    logger.info(f"[FSM] Data updated: current_exchange={exchange_id}, step=api_key for user={user_id}")
+
+    # Verify data was saved
+    verify_data = await state.get_data()
+    logger.info(f"[FSM] Verification - stored data: {verify_data} for user={user_id}")
 
     await callback.message.edit_text(
         f"**🔑 Добавление API для {escape_html(exchange_id.upper())}**\n\n"

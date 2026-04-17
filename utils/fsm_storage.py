@@ -5,11 +5,13 @@ Persists FSM states to SQLite database (replaces MemoryStorage)
 More reliable than JSON files for concurrent access.
 """
 import json
+import logging
 import aiosqlite
 from typing import Any, Dict, Optional
 from aiogram.fsm.storage.base import BaseStorage, StorageKey
 from aiogram.fsm.state import State
 
+logger = logging.getLogger(__name__)
 
 class SQLiteStorage(BaseStorage):
     """
@@ -20,6 +22,7 @@ class SQLiteStorage(BaseStorage):
     def __init__(self, db_path: str = "/app/data/fsm_storage.db"):
         self.db_path = db_path
         self._db: Optional[aiosqlite.Connection] = None
+        logger.debug(f"[FSM DEBUG] SQLiteStorage initialized with db_path={db_path}")
 
     async def _get_db(self) -> aiosqlite.Connection:
         """Get or create database connection"""
@@ -45,6 +48,7 @@ class SQLiteStorage(BaseStorage):
         db = await self._get_db()
         str_key = self._make_key(key)
         state_str = state.state if state else None
+        logger.info(f"[FSM STORAGE] set_state: key={str_key}, state={state_str}")
 
         await db.execute(
             """INSERT INTO fsm_states (key, state, data) VALUES (?, ?, '{}')
@@ -52,6 +56,7 @@ class SQLiteStorage(BaseStorage):
             (str_key, state_str)
         )
         await db.commit()
+    logger.info(f"[FSM STORAGE] set_state committed: key={str_key}")
 
     async def get_state(self, key: StorageKey) -> Optional[str]:
         """Get state for a key"""
@@ -83,35 +88,48 @@ class SQLiteStorage(BaseStorage):
         str_key = self._make_key(key)
 
         async with db.execute(
-            "SELECT data FROM fsm_states WHERE key = ?", (str_key,)
+            "SELECT state, data FROM fsm_states WHERE key = ?", (str_key,)
         ) as cursor:
             row = await cursor.fetchone()
-            if row and row['data']:
-                return json.loads(row['data'])
+            if row:
+                logger.info(f"[FSM STORAGE] get_data: key={str_key}, state={row['state']}, data={row['data']}")
+                if row['data']:
+                    return json.loads(row['data'])
+            else:
+                logger.info(f"[FSM STORAGE] get_data: key={str_key}, NO ROW FOUND")
             return {}
 
     async def update_data(self, key: StorageKey, data: Dict[str, Any]) -> None:
         """Update data for a key (merge with existing)"""
         db = await self._get_db()
         str_key = self._make_key(key)
+        logger.info(f"[FSM STORAGE] update_data: key={str_key}, new_data={data}")
 
         # Get existing data
         async with db.execute(
-            "SELECT data FROM fsm_states WHERE key = ?", (str_key,)
+            "SELECT state, data FROM fsm_states WHERE key = ?", (str_key,)
         ) as cursor:
             row = await cursor.fetchone()
-            existing = json.loads(row['data']) if row and row['data'] else {}
+            if row:
+                existing = json.loads(row['data']) if row['data'] else {}
+                current_state = row['state']
+                logger.info(f"[FSM STORAGE] update_data: existing data={existing}, state={current_state}")
+            else:
+                existing = {}
+                current_state = None
+                logger.info(f"[FSM STORAGE] update_data: no existing row")
 
         # Merge and save
         existing.update(data)
         data_json = json.dumps(existing)
 
         await db.execute(
-            """INSERT INTO fsm_states (key, state, data) VALUES (?, NULL, ?)
-               ON CONFLICT(key) DO UPDATE SET data=excluded.data""",
-            (str_key, data_json)
+            """INSERT INTO fsm_states (key, state, data) VALUES (?, ?, ?)
+               ON CONFLICT(key) DO UPDATE SET state=COALESCE(excluded.state, fsm_states.state), data=excluded.data""",
+            (str_key, current_state, data_json)
         )
         await db.commit()
+        logger.info(f"[FSM STORAGE] update_data committed: key={str_key}, merged_data={existing}")
 
     async def close(self) -> None:
         """Close database connection"""

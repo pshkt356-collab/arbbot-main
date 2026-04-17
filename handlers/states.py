@@ -33,7 +33,11 @@ class SetupStates(StatesGroup):
 
 @states_router.message(SetupStates.waiting_for_api_key)
 async def process_api_key(message: Message, state: FSMContext, user: UserSettings):
+    user_id = message.from_user.id
+    logger.info(f"[FSM] process_api_key called for user={user_id}")
+
     if message.text == "/cancel":
+        logger.debug(f"[FSM DEBUG] User {user_id} cancelled")
         await state.clear()
         await message.answer("❌ Отменено")
         return
@@ -43,17 +47,33 @@ async def process_api_key(message: Message, state: FSMContext, user: UserSetting
         await message.answer("❌ API Key слишком короткий. Попробуйте еще:")
         return
 
+    # Debug: check state
+    current_state = await state.get_state()
+    logger.info(f"[FSM] Current state for user={user_id}: {current_state}")
+
     data = await state.get_data()
+    logger.info(f"[FSM] FSM data for user={user_id}: {data}")
+
     exchange = data.get('current_exchange')
+    logger.info(f"[FSM] Extracted exchange='{exchange}' for user={user_id}")
 
     if not exchange:
-        logger.error(f"No current_exchange in FSM data for user {message.from_user.id}")
-        await message.answer("❌ Ошибка сессии. Начните заново: /menu")
+        # Log to stdout (visible in Railway logs)
+        logger.warning(f"[FSM SESSION ERROR] user={user_id}, state={current_state}, data={data}")
+        
+        # Show debug info directly to user for troubleshooting
+        debug_info = f"state={current_state}, keys={list(data.keys()) if data else 'empty'}"
+        await message.answer(
+            f"❌ Ошибка сессии. Данные: {debug_info}\n\n"
+            f"Начните заново: /menu"
+        )
         await state.clear()
         return
 
     await state.update_data(api_key=api_key)
+    logger.info(f"[FSM] api_key saved for user={user_id}")
     await state.set_state(SetupStates.waiting_for_api_secret)
+    logger.info(f"[FSM] State changed to waiting_for_api_secret for user={user_id}")
 
     await message.answer(
         f"✅ API Key сохранен\n\n"

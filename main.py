@@ -26,10 +26,39 @@ from handlers.states import states_router
 from middleware.user_context import UserContextMiddleware, ScannerMiddleware
 from middleware.rate_limiter import UserRateLimiter, DoubleSubmitProtection
 
+import os
+from pathlib import Path
+
+# Create debug logs directory
+DEBUG_LOG_DIR = Path("/app/data/debug_logs")
+DEBUG_LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+# Main logging setup
 logging.basicConfig(
     level=getattr(logging, settings.log_level),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+
+# Add debug file handler for FSM operations
+debug_handler = logging.FileHandler(DEBUG_LOG_DIR / "fsm_debug.log", encoding='utf-8')
+debug_handler.setLevel(logging.DEBUG)
+debug_handler.setFormatter(logging.Formatter(
+    '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+))
+
+# Add handler to root logger for FSM debug
+fsm_logger = logging.getLogger("utils.fsm_storage")
+fsm_logger.setLevel(logging.DEBUG)
+fsm_logger.addHandler(debug_handler)
+
+states_logger = logging.getLogger("handlers.states")
+states_logger.setLevel(logging.DEBUG)
+states_logger.addHandler(debug_handler)
+
+callbacks_logger = logging.getLogger("handlers.callbacks")
+callbacks_logger.setLevel(logging.DEBUG)
+callbacks_logger.addHandler(debug_handler)
+
 logger = logging.getLogger(__name__)
 
 scanner = None
