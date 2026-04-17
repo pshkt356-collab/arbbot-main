@@ -6,8 +6,10 @@ from datetime import datetime, timezone
 from aiohttp import web
 
 from aiogram import Bot, Dispatcher
-from aiogram.fsm.storage.file import FileStorage
 from functools import partial
+
+# Custom FSM storage that persists to filesystem
+from utils.fsm_storage import JSONFileStorage
 
 from config import settings
 from database.models import Database
@@ -269,8 +271,8 @@ async def main():
     
     init_alert_manager(bot, settings.telegram_admin_id)
 
-    # Use FileStorage for FSM state persistence across restarts
-    storage = FileStorage(settings.fsm_storage_path)
+    # Use JSONFileStorage for FSM state persistence across restarts
+    storage = JSONFileStorage(settings.fsm_storage_path)
     dp = Dispatcher(storage=storage)
 
     # Middleware порядок важен!

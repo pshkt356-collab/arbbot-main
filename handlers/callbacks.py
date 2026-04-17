@@ -812,6 +812,4 @@ async def callback_error_handler(update: Update, exception: Exception):
         if hasattr(update, 'callback_query') and update.callback_query:
             await update.callback_query.answer("❌ Ошибка обработки", show_alert=True)
         elif hasattr(update, 'message') and update.message:
-            await update.message.answer("❌ Произошла ошибка. Попробуйте /start")
-    except Exception as e:
-        logger.error(f"Failed to send error notification: {e}")
+            await update.message.answer("❌ �

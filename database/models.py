@@ -510,40 +510,4 @@ class Database:
         })
 
         async with self._query_lock:
-            await self._conn.execute("""
-                UPDATE trades SET
-                    pnl_usd = ?,
-                    status = ?,
-                    metadata = ?,
-                    closed_at = ?,
-                    close_spread = ?
-                WHERE id = ?
-            """, (
-                trade.pnl_usd,
-                trade.status,
-                json.dumps(metadata),
-                trade.closed_at,
-                trade.close_spread,
-                trade.id
-            ))
-            await self._conn.commit()
-
-    async def close_trade(self, trade_id: int, close_spread: float, pnl_usd: float):
-        async with self._query_lock:
-            await self._conn.execute("""
-                UPDATE trades SET
-                    close_spread = ?,
-                    pnl_usd = ?,
-                    status = 'closed',
-                    closed_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-            """, (close_spread, pnl_usd, trade_id))
-            await self._conn.commit()
-
-    async def log_spread(self, symbol: str, ex1: str, ex2: str, spread: float, p1: float, p2: float):
-        async with self._query_lock:
-            await self._conn.execute("""
-                INSERT INTO spread_history (symbol, exchange_1, exchange_2, spread_percent, price_1, price_2)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (symbol, ex1, ex2, spread, p1, p2))
-            await self._conn.commit()
+            await 
