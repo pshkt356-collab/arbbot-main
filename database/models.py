@@ -157,6 +157,7 @@ class Database:
                 await self._conn.execute("PRAGMA foreign_keys=ON")
                 await self._create_tables()
                 await self._migrate_add_arbitrage_mode()
+                await self._migrate_add_selected_exchanges()
                 self._initialized = True
                 logger.info(f"Database initialized: {self._db_path} (WAL mode)")
             except Exception as e:
@@ -180,6 +181,18 @@ class Database:
                     logger.info("Migration: added arbitrage_mode column")
         except Exception as e:
             logger.error(f"Migration error: {e}")
+
+    async def _migrate_add_selected_exchanges(self):
+        """Миграция: добавление колонки selected_exchanges если её нет"""
+        try:
+            async with self._conn.execute("PRAGMA table_info(users)") as cursor:
+                columns = [row['name'] for row in await cursor.fetchall()]
+                if 'selected_exchanges' not in columns:
+                    await self._conn.execute("ALTER TABLE users ADD COLUMN selected_exchanges TEXT DEFAULT '[\"binance\", \"bybit\", \"okx\", \"whitebit\", \"mexc\"]'")
+                    await self._conn.commit()
+                    logger.info("Migration: added selected_exchanges column")
+        except Exception as e:
+            logger.error(f"Migration error for selected_exchanges: {e}")
 
     async def close(self):
         """Закрытие соединения с БД"""
@@ -206,6 +219,7 @@ class Database:
                     alert_settings TEXT DEFAULT '{}',
                     risk_settings TEXT DEFAULT '{}',
                     arbitrage_mode TEXT DEFAULT 'all',
+                    selected_exchanges TEXT DEFAULT '["binance", "bybit", "okx", "whitebit", "mexc"]',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
@@ -258,6 +272,7 @@ class Database:
                     return None
 
                 # Direct column access (more efficient than dict(row))
+                selected_exchanges = json.loads(row['selected_exchanges']) if row['selected_exchanges'] else ['binance', 'bybit', 'okx', 'whitebit', 'mexc']
                 return UserSettings(
                     user_id=row['user_id'],
                     is_trading_enabled=bool(row['is_trading_enabled']),
@@ -266,6 +281,7 @@ class Database:
                     alert_settings=json.loads(row['alert_settings']),
                     risk_settings=json.loads(row['risk_settings']),
                     arbitrage_mode=row['arbitrage_mode'] if row['arbitrage_mode'] else 'all',
+                    selected_exchanges=selected_exchanges,
                     created_at=row['created_at'],
                     updated_at=row['updated_at']
                 )
@@ -280,15 +296,16 @@ class Database:
         async with self._query_lock:
             try:
                 await self._conn.execute("""
-                    INSERT INTO users (user_id, api_keys, commission_rates, alert_settings, risk_settings, arbitrage_mode)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO users (user_id, api_keys, commission_rates, alert_settings, risk_settings, arbitrage_mode, selected_exchanges)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                 """, (
                     user_id,
                     json.dumps(user.api_keys),
                     json.dumps(user.commission_rates),
                     json.dumps(user.alert_settings),
                     json.dumps(user.risk_settings),
-                    user.arbitrage_mode
+                    user.arbitrage_mode,
+                    json.dumps(user.selected_exchanges)
                 ))
                 await self._conn.commit()
                 logger.info(f"Created new user {user_id}")
@@ -310,6 +327,7 @@ class Database:
                 users = []
                 for row in rows:
                     # Direct column access (more efficient than dict(row))
+                    selected_exchanges = json.loads(row['selected_exchanges']) if row['selected_exchanges'] else ['binance', 'bybit', 'okx', 'whitebit', 'mexc']
                     users.append(UserSettings(
                         user_id=row['user_id'],
                         is_trading_enabled=bool(row['is_trading_enabled']),
@@ -318,6 +336,7 @@ class Database:
                         alert_settings=json.loads(row['alert_settings']),
                         risk_settings=json.loads(row['risk_settings']),
                         arbitrage_mode=row['arbitrage_mode'] if row['arbitrage_mode'] else 'all',
+                        selected_exchanges=selected_exchanges,
                         created_at=row['created_at'],
                         updated_at=row['updated_at']
                     ))
@@ -333,6 +352,7 @@ class Database:
                     alert_settings = ?,
                     risk_settings = ?,
                     arbitrage_mode = ?,
+                    selected_exchanges = ?,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE user_id = ?
             """, (
@@ -342,6 +362,7 @@ class Database:
                 json.dumps(user.alert_settings),
                 json.dumps(user.risk_settings),
                 getattr(user, 'arbitrage_mode', 'all'),
+                json.dumps(getattr(user, 'selected_exchanges', ['binance', 'bybit', 'okx', 'whitebit', 'mexc'])),
                 user.user_id
             ))
             await self._conn.commit()

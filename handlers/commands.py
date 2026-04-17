@@ -18,76 +18,42 @@ commands_router = Router()
 # Доступные биржи
 AVAILABLE_EXCHANGES = ['binance', 'bybit', 'okx', 'mexc', 'whitebit']
 
-
 def validate_api_key(key: str) -> bool:
     return len(key) >= 10 if key else False
-
 
 def validate_api_secret(secret: str) -> bool:
     return len(secret) >= 10 if secret else False
 
-
 def escape_html(text: str) -> str:
     return html.escape(str(text)) if text else ""
-
-
-# ==================== SHARED CALLBACK ADAPTER ====================
-
-class CallbackAdapter:
-    """
-    Adapter that wraps a Message to provide CallbackQuery-like interface.
-    This allows callback handlers to be reused from command handlers
-    without code duplication.
-    
-    Usage:
-        adapter = CallbackAdapter(message)
-        await show_main_menu(adapter, user)
-    """
-    
-    def __init__(self, message: Message):
-        self._message = message
-        self.from_user = message.from_user
-    
-    @property
-    def message(self):
-        """Returns self to provide edit_text/answer methods"""
-        return self
-    
-    async def answer(self, text: str = None, **kwargs):
-        """CallbackQuery.answer() - no-op for commands"""
-        pass
-    
-    async def edit_text(self, text: str, **kwargs):
-        """Message.edit_text() - sends new message for commands"""
-        await self._message.answer(text, **kwargs)
-    
-    async def answer_message(self, text: str, **kwargs):
-        """Message.answer() - sends a new message"""
-        await self._message.answer(text, **kwargs)
-
-
-async def call_callback_handler(message: Message, handler_func, user: UserSettings, **kwargs):
-    """
-    Helper function to call a callback handler from a command handler.
-    
-    Args:
-        message: The incoming Message object
-        handler_func: The callback handler function to call
-        user: UserSettings object
-        **kwargs: Additional arguments to pass to the handler
-    """
-    adapter = CallbackAdapter(message)
-    await handler_func(adapter, user, **kwargs)
-
 
 # ==================== START COMMAND ====================
 
 @commands_router.message(Command("start"))
 async def cmd_start(message: Message, user: UserSettings):
     """Обработка команды /start"""
+    # Импортируем здесь чтобы избежать circular import
     from handlers.callbacks import show_main_menu
-    await call_callback_handler(message, show_main_menu, user)
-
+    
+    # Создаем фейковый callback для совместимости
+    class FakeCallback:
+        def __init__(self, msg):
+            self.from_user = msg.from_user
+            self.message = FakeMessage(msg)
+        async def answer(self, **kwargs):
+            pass
+    
+    class FakeMessage:
+        def __init__(self, msg):
+            self._msg = msg
+        async def edit_text(self, text, **kwargs):
+            # Если нельзя редактировать, отправляем новое сообщение
+            await self._msg.answer(text, **kwargs)
+        async def answer(self, text, **kwargs):
+            await self._msg.answer(text, **kwargs)
+    
+    fake_callback = FakeCallback(message)
+    await show_main_menu(fake_callback, user)
 
 @commands_router.message(Command("help"))
 async def cmd_help(message: Message):
@@ -108,27 +74,58 @@ async def cmd_help(message: Message):
     )
     await message.answer(text)
 
-
 @commands_router.message(Command("menu"))
 async def cmd_menu(message: Message, user: UserSettings):
     """Команда /menu"""
     from handlers.callbacks import show_main_menu
-    await call_callback_handler(message, show_main_menu, user)
-
+    
+    class FakeCallback:
+        def __init__(self, msg):
+            self.from_user = msg.from_user
+            self.message = FakeMessage(msg)
+        async def answer(self, **kwargs):
+            pass
+    
+    class FakeMessage:
+        def __init__(self, msg):
+            self._msg = msg
+        async def edit_text(self, text, **kwargs):
+            await self._msg.answer(text, **kwargs)
+        async def answer(self, text, **kwargs):
+            await self._msg.answer(text, **kwargs)
+    
+    fake_callback = FakeCallback(message)
+    await show_main_menu(fake_callback, user)
 
 @commands_router.message(Command("profile"))
 async def cmd_profile(message: Message, user: UserSettings):
     """Команда /profile"""
     from handlers.callbacks import show_profile_menu
-    await call_callback_handler(message, show_profile_menu, user)
-
+    
+    class FakeCallback:
+        def __init__(self, msg):
+            self.from_user = msg.from_user
+            self.message = msg
+        async def answer(self, **kwargs):
+            pass
+    
+    fake_callback = FakeCallback(message)
+    await show_profile_menu(fake_callback, user)
 
 @commands_router.message(Command("settings"))
 async def cmd_settings(message: Message, user: UserSettings):
     """Быстрые настройки"""
     from handlers.callbacks import show_alert_settings
-    await call_callback_handler(message, show_alert_settings, user)
 
+    class FakeCallback:
+        def __init__(self, msg):
+            self.from_user = msg.from_user
+            self.message = msg
+        async def answer(self, **kwargs):
+            pass
+
+    fake_callback = FakeCallback(message)
+    await show_alert_settings(fake_callback, user)
 
 @commands_router.message(Command("balance"))
 async def cmd_balance(message: Message, user: UserSettings):
@@ -142,7 +139,6 @@ async def cmd_balance(message: Message, user: UserSettings):
     )
     await message.answer(text)
 
-
 @commands_router.message(Command("stop"))
 async def cmd_stop(message: Message):
     """Остановка бота"""
@@ -152,10 +148,9 @@ async def cmd_stop(message: Message):
     )
     await message.answer(text)
 
-
 @commands_router.message(Command("testapi"))
 async def cmd_test_api(message: Message, user: UserSettings):
-    """Проверка API ключей - unified implementation"""
+    """Проверка API ключей"""
     if not user.api_keys:
         await message.answer(
             "❌ **API ключи не настроены**\n\n"
@@ -170,60 +165,27 @@ async def cmd_test_api(message: Message, user: UserSettings):
         if not api_data.get('api_key'):
             continue
 
-        result = await _test_exchange_api(
-            trading_engine, 
-            exchange_id, 
-            api_data
-        )
-        text += _format_api_test_result(exchange_id, result)
+        try:
+            # ИСПРАВЛЕНО: Используем test_api_connection вместо прямого вызова _get_exchange
+            result = await trading_engine.test_api_connection(
+                exchange_id,
+                api_data['api_key'],
+                api_data.get('api_secret', ''),
+                api_data.get('testnet', True)
+            )
+            
+            if result.get('success'):
+                text += f"✅ **{exchange_id.upper()}**: {result.get('balance_usdt', 0):.2f} USDT\n"
+            else:
+                text += f"❌ **{exchange_id.upper()}**: {result.get('message', 'Ошибка подключения')}\n"
+
+        except Exception as e:
+            logger.error(f"Test API error for {exchange_id}: {e}")
+            text += f"❌ **{exchange_id.upper()}**: {str(e)[:50]}\n"
 
     keyboard = InlineKeyboardBuilder()
     keyboard.button(text="📱 Меню", callback_data="menu:main")
     await message.answer(text, reply_markup=keyboard.as_markup())
-
-
-async def _test_exchange_api(trading_engine, exchange_id: str, api_data: dict) -> dict:
-    """
-    Test API connection for a single exchange.
-    Shared helper used by cmd_test_api.
-    
-    Args:
-        trading_engine: The trading engine instance
-        exchange_id: Exchange identifier (e.g., 'binance')
-        api_data: Dictionary with api_key, api_secret, testnet
-        
-    Returns:
-        dict with 'success' boolean and either 'balance_usdt' or 'message'
-    """
-    try:
-        result = await trading_engine.test_api_connection(
-            exchange_id,
-            api_data['api_key'],
-            api_data.get('api_secret', ''),
-            api_data.get('testnet', True)
-        )
-        return result
-    except Exception as e:
-        logger.error(f"Test API error for {exchange_id}: {e}")
-        return {'success': False, 'message': str(e)[:50]}
-
-
-def _format_api_test_result(exchange_id: str, result: dict) -> str:
-    """
-    Format API test result for display.
-    
-    Args:
-        exchange_id: Exchange identifier
-        result: Result dict from _test_exchange_api
-        
-    Returns:
-        Formatted string for display
-    """
-    if result.get('success'):
-        return f"✅ **{exchange_id.upper()}**: {result.get('balance_usdt', 0):.2f} USDT\n"
-    else:
-        return f"❌ **{exchange_id.upper()}**: {result.get('message', 'Ошибка подключения')}\n"
-
 
 # ==================== STATE HANDLERS ====================
 
@@ -252,7 +214,6 @@ async def process_api_key(message: Message, state: FSMContext, user: UserSetting
         logger.error(f"Error processing API key: {e}")
         await message.answer("❌ Ошибка. Попробуй снова.")
 
-
 @commands_router.message(StateFilter(SetupStates.waiting_for_api_secret))
 async def process_api_secret(message: Message, state: FSMContext, user: UserSettings, db: Database = None):
     """Обработка ввода API Secret"""
@@ -274,16 +235,26 @@ async def process_api_secret(message: Message, state: FSMContext, user: UserSett
             await state.clear()
             return
 
-        # Используем _test_exchange_api для проверки API
-        from services.trading_engine import trading_engine
-        result = await _test_exchange_api(
-            trading_engine,
-            exchange_id,
-            {'api_key': api_key, 'api_secret': api_secret, 'testnet': True}
-        )
-        
-        is_valid = result.get('success', False)
-        balance = result.get('balance_usdt', 0.0) if is_valid else 0.0
+        # ИСПРАВЛЕНО: Используем test_api_connection для проверки API
+        is_valid = False
+        balance = 0.0
+        try:
+            from services.trading_engine import trading_engine
+            result = await trading_engine.test_api_connection(
+                exchange_id, 
+                api_key, 
+                api_secret,
+                testnet=True
+            )
+            
+            if result.get('success'):
+                balance = result.get('balance_usdt', 0)
+                is_valid = True
+            else:
+                logger.error(f"API validation failed: {result.get('message')}")
+                
+        except Exception as e:
+            logger.error(f"API validation error: {e}")
 
         if not is_valid:
             await message.answer(
@@ -322,7 +293,6 @@ async def process_api_secret(message: Message, state: FSMContext, user: UserSett
         await message.answer("❌ Ошибка сохранения. Попробуй снова.")
         await state.clear()
 
-
 @commands_router.message(StateFilter(SetupStates.waiting_for_trade_amount))
 async def process_trade_amount(message: Message, state: FSMContext, user: UserSettings, db: Database = None):
     """Обработка объема сделки"""
@@ -350,7 +320,6 @@ async def process_trade_amount(message: Message, state: FSMContext, user: UserSe
         logger.error(f"Error processing trade amount: {e}")
         await message.answer("❌ Ошибка. Попробуй снова.")
         await state.clear()
-
 
 # ==================== TEXT MESSAGES (только без состояния и не команды) ====================
 
