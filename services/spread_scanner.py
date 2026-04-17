@@ -1558,18 +1558,21 @@ class SpreadScanner:
             
             # Получаем все активные спреды из active_spreads
             for spread_key, spread_info in self.active_spreads.items():
-                if spread_info.get('is_active', False):
-                    spreads.append({
-                        'symbol': spread_info.get('symbol', ''),
-                        'spread_percent': spread_info.get('spread_percent', 0),
-                        'buy_exchange': spread_info.get('buy_exchange', ''),
-                        'sell_exchange': spread_info.get('sell_exchange', ''),
-                        'buy_price': spread_info.get('buy_price', 0),
-                        'sell_price': spread_info.get('sell_price', 0),
-                        'volume_24h': spread_info.get('volume_24h', 0),
-                        'arbitrage_type': spread_info.get('arbitrage_type', ''),
-                        'timestamp': spread_info.get('timestamp', '')
-                    })
+                # Check if the spread is fresh (not stale)
+                if not spread_info.is_fresh:
+                    continue
+                spreads.append({
+                    'symbol': spread_info.symbol,
+                    'spread': spread_info.spread_percent,
+                    'spread_percent': spread_info.spread_percent,
+                    'buy_exchange': spread_info.buy_exchange,
+                    'sell_exchange': spread_info.sell_exchange,
+                    'buy_price': spread_info.buy_price,
+                    'sell_price': spread_info.sell_price,
+                    'volume_24h': spread_info.volume_24h,
+                    'arbitrage_type': spread_info.arbitrage_type.value if hasattr(spread_info.arbitrage_type, 'value') else str(spread_info.arbitrage_type),
+                    'timestamp': spread_info.timestamp
+                })
             
             # Сортируем по размеру спреда (убывание)
             spreads.sort(key=lambda x: x['spread_percent'], reverse=True)

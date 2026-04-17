@@ -258,12 +258,7 @@ async def subscribe_existing_users():
                     # Проверяем если это partial функция (сложнее проверить)
                 
                 if not already_subscribed:
-                    # Используем partial чтобы замкнуть user_id
-                    # Теперь spread_scanner вызовет callback(alert), 
-                    # что превратится в send_spread_alert(user_id, alert)
-                    from functools import partial
-                    alert_callback = partial(send_spread_alert, user.user_id)
-                    scanner.subscribe(alert_callback, user.user_id)
+                    scanner.subscribe(send_spread_alert, user.user_id)
                     subscribed_count += 1
                     logger.info(f"Auto-subscribed user {user.user_id} to spread alerts")
 
@@ -330,7 +325,7 @@ async def main():
     await subscribe_existing_users()
 
     async def zombie_check_loop():
-        while trading_engine.running:
+        while getattr(trading_engine, 'running', True):
             try:
                 await asyncio.sleep(300)
                 if settings.telegram_admin_id:

@@ -1,6 +1,5 @@
 import asyncio
 import ccxt.async_support as ccxt
-import ccxt
 import time
 import uuid
 import logging
@@ -35,6 +34,7 @@ class TradingEngine:
         self.active_exchanges = {}
         self.circuit_breakers = {}
         self.circuit_breaker_lock = asyncio.Lock()
+        self.running = True
 
     # ===== МЕТОД ДОБАВЛЕН СЮДА (в класс TradingEngine) =====
     async def recover_positions(self):
@@ -51,6 +51,11 @@ class TradingEngine:
         finally:
             await db.close()
     # =====================================================
+
+    def stop(self):
+        """Stop the trading engine and cleanup"""
+        self.running = False
+        logger.info("Trading engine stopped")
 
     async def _get_exchange(self, exchange_id: str, api_key: str = None, api_secret: str = None,
                           password: str = None, testnet: bool = True):
