@@ -40,8 +40,8 @@ class Settings(BaseSettings):
     # Database - Railway-compatible path
     db_file: str = "/app/data/arbitrage_bot.db"
     
-    # FSM Storage - Railway-compatible path for FSM state persistence
-    fsm_storage_path: str = "/app/data/fsm_storage"
+    # FSM Storage - SQLite database path for FSM state persistence
+    fsm_storage_path: str = "/app/data/fsm_storage.db"
 
     # Logging
     log_level: str = "INFO"

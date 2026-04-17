@@ -1,4 +1,4 @@
 from .diagnostics import diagnostics, ExchangeHealth
-from .fsm_storage import JSONFileStorage
+from .fsm_storage import SQLiteStorage
 
-__all__ = ['diagnostics', 'ExchangeHealth', 'JSONFileStorage']
+__all__ = ['diagnostics', 'ExchangeHealth', 'SQLiteStorage']
