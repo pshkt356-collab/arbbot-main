@@ -1,11 +1,3 @@
-"""
-Spread scanner for arbitrage bot.
-FIXED VERSION - Addresses critical bugs while keeping original interface:
-1. Missing balance check before auto-trade (FIXED)
-2. No graceful shutdown for WebSocket (FIXED)
-3. Hardcoded minimum volumes (FIXED - configurable via settings)
-"""
-
 import asyncio
 import aiohttp
 import websockets
@@ -19,16 +11,13 @@ import logging
 from collections import OrderedDict
 
 from config import settings
-from database.models import Database, UserSettings
 
 logger = logging.getLogger(__name__)
-
 
 class ArbitrageType(Enum):
     INTER_EXCHANGE_FUTURES = "inter_exchange_futures"
     BASIS_SPOT_FUTURES = "basis_spot_futures"
     CROSS_EXCHANGE_BASIS = "cross_exchange_basis"
-
 
 @dataclass
 class PriceData:
@@ -53,7 +42,6 @@ class PriceData:
         if self.last_price == 0:
             return 0
         return abs(self.mark_price - self.last_price) / self.last_price * 100
-
 
 @dataclass
 class SpreadAlert:
@@ -81,7 +69,6 @@ class SpreadAlert:
     def is_basis(self) -> bool:
         return self.arbitrage_type in [ArbitrageType.BASIS_SPOT_FUTURES, ArbitrageType.CROSS_EXCHANGE_BASIS]
 
-
 @dataclass
 class CachedSpread:
     symbol: str
@@ -98,7 +85,6 @@ class CachedSpread:
     @property
     def is_fresh(self) -> bool:
         return time.time() - self.timestamp < settings.spread_ttl_seconds
-
 
 class RateLimiter:
     def __init__(self, max_requests: int = 10, window_seconds: int = 1):
@@ -122,10 +108,8 @@ class RateLimiter:
             
             self.requests[key].append(time.time())
 
-
 class SpreadScanner:
     def __init__(self, min_spread=0.2, check_interval=5, basis_threshold=0.3):
-        # ORIGINAL: Keep original parameters
         self.min_spread = min_spread
         self.check_interval = check_interval
         self.basis_threshold = basis_threshold
@@ -325,7 +309,6 @@ class SpreadScanner:
         
         self.active_spreads.move_to_end(key)
 
-        # FIXED: Check balance before auto-trade
         if settings.auto_trading_default and alert.spread_percent >= settings.min_spread_auto:
             await self._trigger_auto_trade(alert)
 
@@ -344,7 +327,6 @@ class SpreadScanner:
             except Exception as e:
                 logger.error(f"Error notifying subscriber: {e}")
 
-    # FIXED: Added balance check before auto-trade
     async def _trigger_auto_trade(self, alert: SpreadAlert):
         """Триггер авто-трейдинга для всех пользователей с включенным авто-трейдингом"""
         try:
@@ -387,12 +369,6 @@ class SpreadScanner:
                     if alert.spread_percent < min_spread:
                         continue
                     
-                    # FIXED: Check balance before opening trade
-                    balance_ok = await self._check_user_balance(user, alert)
-                    if not balance_ok:
-                        logger.warning(f"User {user.user_id} has insufficient balance for auto-trade")
-                        continue
-                    
                     key = f"{alert.symbol}:{alert.buy_exchange}:{alert.sell_exchange}"
                     result = await trading_engine.validate_and_open(
                         user, key, self.prices, auto=True, 
@@ -417,37 +393,6 @@ class SpreadScanner:
                 await db.close()
         except Exception as e:
             logger.error(f"Auto trade error: {e}")
-
-    # FIXED: Added balance check method
-    async def _check_user_balance(self, user: UserSettings, alert: SpreadAlert) -> bool:
-        """Check if user has sufficient balance for trade"""
-        try:
-            trade_amount = user.risk_settings.get('trade_amount', 100)
-            leverage = user.risk_settings.get('max_leverage', 3)
-
-            # Required margin for both legs
-            required_margin = (trade_amount * 2) / leverage
-
-            # Add buffer for commissions (0.1% per side)
-            commission_buffer = trade_amount * 2 * 0.001 * 2  # Open + close
-
-            total_required = required_margin + commission_buffer
-
-            # Get user balance
-            available_balance = user.risk_settings.get('available_balance', 0)
-
-            if available_balance < total_required:
-                logger.warning(
-                    f"Insufficient balance for user {user.user_id}: "
-                    f"available={available_balance:.2f}, required={total_required:.2f}"
-                )
-                return False
-
-            return True
-
-        except Exception as e:
-            logger.error(f"Error checking balance: {e}")
-            return False  # Don't open trade on error
 
     async def start(self):
         self.running = True
@@ -478,7 +423,6 @@ class SpreadScanner:
             await self.stop()
     
     async def stop(self):
-        """FIXED: Graceful shutdown with proper timeout"""
         logger.info("Stopping spread scanner...")
         self.running = False
         self._shutdown_event.set()
@@ -488,12 +432,12 @@ class SpreadScanner:
             if not task.done():
                 task.cancel()
         
-        # FIXED: Increased timeout for graceful shutdown
+        # Ждем завершения с таймаутом
         if self._tasks:
             try:
                 await asyncio.wait_for(
                     asyncio.gather(*self._tasks, return_exceptions=True),
-                    timeout=10.0  # Increased from 3.0 to 10.0
+                    timeout=3.0
                 )
             except asyncio.TimeoutError:
                 logger.warning("Scanner tasks stop timeout, some tasks may still be running")
@@ -913,8 +857,8 @@ class SpreadScanner:
                         batch = symbols_list[i:i+batch_size]
                         args = [{"channel": "tickers", "instId": f"{s}-USDT"} for s in batch]
 
-                    await ws.send(json.dumps({"op": "subscribe", "args": args}))
-                    await asyncio.sleep(0.5)
+                        await ws.send(json.dumps({"op": "subscribe", "args": args}))
+                        await asyncio.sleep(0.5)
 
                     try:
                         async for msg in ws:
@@ -1614,17 +1558,17 @@ class SpreadScanner:
             
             # Получаем все активные спреды из active_spreads
             for spread_key, spread_info in self.active_spreads.items():
-                if spread_info.is_fresh:
+                if spread_info.get('is_active', False):
                     spreads.append({
-                        'symbol': spread_info.symbol,
-                        'spread_percent': spread_info.spread_percent,
-                        'buy_exchange': spread_info.buy_exchange,
-                        'sell_exchange': spread_info.sell_exchange,
-                        'buy_price': spread_info.buy_price,
-                        'sell_price': spread_info.sell_price,
-                        'volume_24h': spread_info.volume_24h,
-                        'arbitrage_type': spread_info.arbitrage_type.value if hasattr(spread_info.arbitrage_type, 'value') else str(spread_info.arbitrage_type),
-                        'timestamp': spread_info.timestamp
+                        'symbol': spread_info.get('symbol', ''),
+                        'spread_percent': spread_info.get('spread_percent', 0),
+                        'buy_exchange': spread_info.get('buy_exchange', ''),
+                        'sell_exchange': spread_info.get('sell_exchange', ''),
+                        'buy_price': spread_info.get('buy_price', 0),
+                        'sell_price': spread_info.get('sell_price', 0),
+                        'volume_24h': spread_info.get('volume_24h', 0),
+                        'arbitrage_type': spread_info.get('arbitrage_type', ''),
+                        'timestamp': spread_info.get('timestamp', '')
                     })
             
             # Сортируем по размеру спреда (убывание)

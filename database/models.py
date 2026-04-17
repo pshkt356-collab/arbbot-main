@@ -1,11 +1,3 @@
-"""
-Database models and operations for the arbitrage bot.
-FIXED VERSION - Addresses critical bugs:
-1. Race condition in Database singleton (FIXED)
-2. SQL Injection vulnerability (FIXED)
-3. Compatible with original database schema
-"""
-
 import aiosqlite
 import json
 import asyncio
@@ -15,7 +7,6 @@ from typing import Optional, List, Dict, Any, Union
 import logging
 
 logger = logging.getLogger(__name__)
-
 
 @dataclass
 class UserSettings:
@@ -40,7 +31,7 @@ class UserSettings:
         'symbols_whitelist': [],
         'symbols_blacklist': [],
         'funding_arbitrage': True,
-        'test_mode': True,
+        'test_mode': True,  # По умолчанию тестовый режим включен
         'auto_trading': False
     })
     risk_settings: dict = field(default_factory=lambda: {
@@ -60,20 +51,23 @@ class UserSettings:
         'emergency_stop_percent': 50.0,
         'margin_mode': 'isolated'
     })
-    arbitrage_mode: str = 'all'
-    auto_trade_mode: bool = False
-    alerts_enabled: bool = True
-    notifications_enabled: bool = True
-    selected_exchanges: list = field(default_factory=lambda: ['binance', 'bybit', 'okx', 'whitebit', 'mexc'])
-    min_spread_threshold: float = 0.2
-    trade_amount: float = 100.0
-    inter_exchange_enabled: bool = True
-    basis_arbitrage_enabled: bool = True
-    leverage: int = 3
-    total_trades: int = 0
-    successful_trades: int = 0
-    failed_trades: int = 0
-    total_profit: float = 0.0
+    arbitrage_mode: str = 'all'  # 'all' или 'futures_futures_only'
+    
+    # Дополнительные поля для совместимости с callbacks.py
+    auto_trade_mode: bool = False  # Режим авто-трейдинга
+    alerts_enabled: bool = True    # Включены ли алерты
+    notifications_enabled: bool = True  # Уведомления включены
+    selected_exchanges: list = field(default_factory=lambda: ['binance', 'bybit', 'okx', 'whitebit', 'mexc'])  # Выбранные биржи
+    min_spread_threshold: float = 0.2  # Минимальный порог спреда
+    trade_amount: float = 100.0  # Объем сделки в USDT
+    inter_exchange_enabled: bool = True  # Межбиржевой арбитраж включен
+    basis_arbitrage_enabled: bool = True  # Базисный арбитраж включен
+    leverage: int = 3  # Плечо торговли
+    total_trades: int = 0  # Всего сделок
+    successful_trades: int = 0  # Успешных сделок
+    failed_trades: int = 0  # Неудачных сделок
+    total_profit: float = 0.0  # Общая прибыль
+    
     created_at: str = None
     updated_at: str = None
 
@@ -85,16 +79,18 @@ class UserSettings:
 
     @property
     def total_balance(self) -> float:
+        """Общий баланс (заглушка - нужно интегрировать с реальными данными)"""
         return self.risk_settings.get('total_balance', 0.0)
-
+    
     @property
     def available_balance(self) -> float:
+        """Доступный баланс (заглушка - нужно интегрировать с реальными данными)"""
         return self.risk_settings.get('available_balance', 0.0)
-
+    
     @property
     def locked_balance(self) -> float:
+        """Заблокированный баланс (заглушка - нужно интегрировать с реальными данными)"""
         return self.risk_settings.get('locked_balance', 0.0)
-
 
 @dataclass
 class Trade:
@@ -113,6 +109,7 @@ class Trade:
     opened_at: str = field(default_factory=lambda: datetime.now().isoformat())
     closed_at: Optional[str] = None
     metadata: dict = field(default_factory=dict)
+
     position_size_long: float = 0.0
     position_size_short: float = 0.0
     closed_portion_percent: float = 0.0
@@ -127,7 +124,6 @@ class Trade:
     trailing_enabled: bool = True
     trailing_stop_price: float = 0.0
     emergency_stop_price: float = 0.0
-
 
 class Database:
     _instance: Optional['Database'] = None
@@ -149,7 +145,10 @@ class Database:
         return instance
 
     async def initialize(self):
-        """Инициализация БД с проверкой на повторный вызов - FIXED RACE CONDITION"""
+        """Инициализация БД с проверкой на повторный вызов"""
+        if self._initialized:
+            return
+
         async with self._init_lock:
             if self._initialized:
                 return
@@ -249,7 +248,6 @@ class Database:
             await self._conn.commit()
 
     async def get_user(self, user_id: int) -> Optional[UserSettings]:
-        """Получение настроек пользователя"""
         if not self._initialized:
             await self.initialize()
 
@@ -262,6 +260,7 @@ class Database:
                 if not row:
                     return None
 
+                # ИСПРАВЛЕНО: sqlite3.Row не имеет .get(), используем dict(row)
                 row_dict = dict(row)
 
                 return UserSettings(
@@ -276,9 +275,7 @@ class Database:
                     updated_at=row_dict['updated_at']
                 )
 
-    # FIXED: Original signature - create_user(user_id: int)
     async def create_user(self, user_id: int) -> UserSettings:
-        """Создание пользователя - ORIGINAL SIGNATURE"""
         existing = await self.get_user(user_id)
         if existing:
             return existing
@@ -317,6 +314,7 @@ class Database:
 
                 users = []
                 for row in rows:
+                    # ИСПРАВЛЕНО: sqlite3.Row не имеет .get(), используем dict(row)
                     row_dict = dict(row)
                     users.append(UserSettings(
                         user_id=row_dict['user_id'],
@@ -332,7 +330,6 @@ class Database:
                 return users
 
     async def update_user(self, user: UserSettings):
-        """Обновление настроек пользователя"""
         async with self._query_lock:
             await self._conn.execute("""
                 UPDATE users SET
@@ -356,7 +353,6 @@ class Database:
             await self._conn.commit()
 
     async def add_trade(self, trade: Trade) -> int:
-        """Добавление сделки"""
         async with self._query_lock:
             cursor = await self._conn.execute("""
                 INSERT INTO trades (user_id, symbol, strategy, long_exchange, short_exchange,
@@ -370,25 +366,16 @@ class Database:
             await self._conn.commit()
             return cursor.lastrowid
 
-    async def create_trade(self, trade: Trade) -> int:
-        """Alias for add_trade"""
-        return await self.add_trade(trade)
-
     async def get_open_trades(self, user_id: int, test_mode: Optional[bool] = None) -> List[Trade]:
-        """Получить открытые сделки с опциональным фильтром по test_mode - FIXED SQL INJECTION"""
+        """Получить открытые сделки с опциональным фильтром по test_mode"""
         async with self._query_lock:
             if test_mode is not None:
-                # FIXED: Validate test_mode type to prevent SQL injection
-                if not isinstance(test_mode, bool):
-                    raise TypeError(f"test_mode must be bool, got {type(test_mode)}")
-                
-                # FIXED: Use int instead of json.dumps
-                test_mode_int = 1 if test_mode else 0
+                # Фильтруем по JSON metadata.test_mode
                 async with self._conn.execute(
                     """SELECT * FROM trades 
                     WHERE user_id = ? AND status = 'open'
                     AND json_extract(metadata, '$.test_mode') = ?""",
-                    (user_id, test_mode_int)
+                    (user_id, json.dumps(test_mode))
                 ) as cursor:
                     rows = await cursor.fetchall()
             else:
@@ -457,7 +444,6 @@ class Database:
             }
 
     async def get_trade_by_id(self, trade_id: int) -> Optional[dict]:
-        """Получить сделку по ID"""
         async with self._query_lock:
             async with self._conn.execute(
                 "SELECT * FROM trades WHERE id = ?",
@@ -468,31 +454,7 @@ class Database:
                     return dict(row)
                 return None
 
-    async def get_trade(self, trade_id: int) -> Optional[Trade]:
-        """Получить сделку по ID как Trade объект"""
-        row = await self.get_trade_by_id(trade_id)
-        if row:
-            metadata = json.loads(row['metadata'])
-            return Trade(
-                id=row['id'],
-                user_id=row['user_id'],
-                symbol=row['symbol'],
-                strategy=row['strategy'],
-                long_exchange=row['long_exchange'],
-                short_exchange=row['short_exchange'],
-                entry_spread=row['entry_spread'],
-                close_spread=row['close_spread'],
-                size_usd=row['size_usd'],
-                pnl_usd=row['pnl_usd'],
-                status=row['status'],
-                opened_at=row['opened_at'],
-                closed_at=row['closed_at'],
-                metadata=metadata
-            )
-        return None
-
     async def update_trade(self, trade: Trade):
-        """Обновление сделки"""
         # Обновляем metadata с текущими значениями
         metadata = dict(trade.metadata)
         metadata.update({
@@ -533,7 +495,6 @@ class Database:
             await self._conn.commit()
 
     async def close_trade(self, trade_id: int, close_spread: float, pnl_usd: float):
-        """Закрытие сделки"""
         async with self._query_lock:
             await self._conn.execute("""
                 UPDATE trades SET
@@ -546,7 +507,6 @@ class Database:
             await self._conn.commit()
 
     async def log_spread(self, symbol: str, ex1: str, ex2: str, spread: float, p1: float, p2: float):
-        """Логирование спреда"""
         async with self._query_lock:
             await self._conn.execute("""
                 INSERT INTO spread_history (symbol, exchange_1, exchange_2, spread_percent, price_1, price_2)

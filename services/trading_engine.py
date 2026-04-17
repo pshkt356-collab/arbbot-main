@@ -1,16 +1,6 @@
-"""
-Trading engine for arbitrage bot.
-FIXED VERSION - Addresses critical bugs while keeping all original methods:
-1. CCXT connection leak (FIXED - added try/finally for close)
-2. Wrong TP/SL calculation for SHORT positions (FIXED)
-3. Memory leak in active_monitors (FIXED - added cleanup)
-4. Missing retry for position close (FIXED)
-"""
-
 import asyncio
 import ccxt.async_support as ccxt
 import ccxt
-import sqlite3
 import time
 import uuid
 import logging
@@ -18,12 +8,10 @@ from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any
 from decimal import Decimal, ROUND_DOWN
-
 from config import settings
 from database.models import Database, Trade, UserSettings
 
 logger = logging.getLogger(__name__)
-
 
 @dataclass
 class TradeResult:
@@ -40,7 +28,6 @@ class TradeResult:
     correlation_id: Optional[str] = None
     metadata: Dict = field(default_factory=dict)
 
-
 class TradingEngine:
     def __init__(self):
         self.active_monitors = {}
@@ -48,73 +35,35 @@ class TradingEngine:
         self.active_exchanges = {}
         self.circuit_breakers = {}
         self.circuit_breaker_lock = asyncio.Lock()
-        self.running = True
 
+    # ===== МЕТОД ДОБАВЛЕН СЮДА (в класс TradingEngine) =====
     async def recover_positions(self):
         """Восстановление позиций при перезапуске бота (заглушка)"""
         logger.info("Recovering positions from database...")
         db = Database(settings.db_file)
         await db.initialize()
         try:
+            # TODO: Получить все открытые сделки и восстановить мониторы
+            # Для каждой открытой сделки запустить PositionMonitor
             logger.info("Position recovery completed (stub implementation)")
         except Exception as e:
             logger.error(f"Error during position recovery: {e}")
         finally:
             await db.close()
+    # =====================================================
 
-    async def _cleanup_cache(self):
-        """ORIGINAL: Cleanup circuit breakers periodically"""
-        while self.running:
-            try:
-                await asyncio.sleep(300)
-                async with self.circuit_breaker_lock:
-                    now = time.time()
-                    to_remove = []
-                    for exchange_id, (last_fail, count) in self.circuit_breakers.items():
-                        if now - last_fail > 3600:
-                            to_remove.append(exchange_id)
-                    for ex in to_remove:
-                        del self.circuit_breakers[ex]
-                        logger.info(f"Cleaned up circuit breaker for {ex}")
-
-                logger.debug("Cache cleanup completed")
-            except asyncio.CancelledError:
-                logger.info("Cache cleanup task cancelled")
-                break
-            except Exception as e:
-                logger.error(f"Error in cache cleanup: {e}")
-                await asyncio.sleep(60)
-
-    def stop(self):
-        """Stop the trading engine"""
-        self.running = False
-        logger.info("Trading engine stopped")
-
-    # FIXED: Connection leak - added proper cleanup
     async def _get_exchange(self, exchange_id: str, api_key: str = None, api_secret: str = None,
                           password: str = None, testnet: bool = True):
         cache_key = f"{exchange_id}_{api_key[:8] if api_key else 'public'}_{testnet}"
 
         if cache_key in self.active_exchanges:
             cached = self.active_exchanges[cache_key]
-            # FIXED: Check if cache is valid Exchange object
+            # Проверяем что кэш - это не dict (битый кэш)
             if isinstance(cached, dict):
                 logger.warning(f"Removing corrupted cache for {exchange_id}: dict instead of exchange")
                 del self.active_exchanges[cache_key]
-            elif isinstance(cached, ccxt.Exchange):
-                try:
-                    await cached.load_markets(reload=False)
-                    return cached
-                except Exception as e:
-                    logger.warning(f"Cached exchange {exchange_id} failed health check: {e}")
-                    try:
-                        await cached.close()
-                    except:
-                        pass
-                    del self.active_exchanges[cache_key]
             else:
-                logger.error(f"Invalid cache type for {exchange_id}: {type(cached)}")
-                del self.active_exchanges[cache_key]
+                return cached
 
         exchange_class = getattr(ccxt, exchange_id, None)
         if not exchange_class:
@@ -126,8 +75,7 @@ class TradingEngine:
                 'defaultType': 'future',
                 'test': testnet,
                 'adjustForTimeDifference': True,
-            },
-            'timeout': 30000
+            }
         }
 
         if api_key and api_secret:
@@ -143,34 +91,14 @@ class TradingEngine:
                 'https': settings.proxy_url,
             }
 
-        exchange = None
-        try:
-            exchange = exchange_class(config)
-            await exchange.load_markets()
+        exchange = exchange_class(config)
+        await exchange.load_markets()
 
-            if settings.use_proxy and settings.proxy_url:
-                logger.info(f"Using proxy for {exchange_id}")
+        if settings.use_proxy and settings.proxy_url:
+            logger.info(f"Using proxy for {exchange_id}")
 
-            self.active_exchanges[cache_key] = exchange
-            return exchange
-        except Exception as e:
-            # FIXED: Guaranteed cleanup on error
-            if exchange:
-                try:
-                    await exchange.close()
-                except:
-                    pass
-            raise
-
-    async def close_all_exchanges(self):
-        """FIXED: Close all active exchange connections"""
-        for cache_key, exchange in list(self.active_exchanges.items()):
-            try:
-                if isinstance(exchange, ccxt.Exchange):
-                    await exchange.close()
-            except Exception as e:
-                logger.warning(f"Error closing exchange {cache_key}: {e}")
-        self.active_exchanges.clear()
+        self.active_exchanges[cache_key] = exchange
+        return exchange
 
     async def _check_circuit_breaker(self, exchange_id: str) -> bool:
         async with self.circuit_breaker_lock:
@@ -192,53 +120,6 @@ class TradingEngine:
             else:
                 _, count = self.circuit_breakers[exchange_id]
                 self.circuit_breakers[exchange_id] = (now, count + 1)
-
-    # FIXED: Correct TP/SL calculation for SHORT positions
-    def _calculate_position_levels(self, entry_price_long: float, entry_price_short: float,
-                                   user: UserSettings) -> Dict[str, float]:
-        """FIXED: Correct calculation of stop-loss and take-profit levels"""
-        sl_percent = user.risk_settings.get('stop_loss_percent', 2.0) / 100
-        tp_percent = user.risk_settings.get('take_profit_percent', 20.0) / 100
-        auto_close_spread = user.risk_settings.get('auto_close_spread', 0.05) / 100
-        trailing_distance = user.risk_settings.get('trailing_stop_distance', 10.0) / 100
-
-        # For LONG position:
-        # - Take Profit should be ABOVE entry price
-        # - Stop Loss should be BELOW entry price
-        long_take_profit = entry_price_long * (1 + tp_percent)
-        long_stop_loss = entry_price_long * (1 - sl_percent)
-        long_breakeven = entry_price_long * (1 + auto_close_spread)
-        long_trailing_stop = entry_price_long * (1 - trailing_distance)
-
-        # For SHORT position:
-        # FIXED: Take Profit should be BELOW entry price (profit when price goes down)
-        # FIXED: Stop Loss should be ABOVE entry price (loss when price goes up)
-        short_take_profit = entry_price_short * (1 - tp_percent)
-        short_stop_loss = entry_price_short * (1 + sl_percent)
-        short_breakeven = entry_price_short * (1 - auto_close_spread)
-        short_trailing_stop = entry_price_short * (1 + trailing_distance)
-
-        return {
-            'long_stop_loss': long_stop_loss,
-            'long_take_profit': long_take_profit,
-            'long_breakeven': long_breakeven,
-            'long_trailing_stop': long_trailing_stop,
-            'short_stop_loss': short_stop_loss,
-            'short_take_profit': short_take_profit,
-            'short_breakeven': short_breakeven,
-            'short_trailing_stop': short_trailing_stop
-        }
-
-    # FIXED: Memory leak - cleanup monitors
-    async def _cleanup_monitors(self):
-        """FIXED: Cleanup completed monitors to prevent memory leak"""
-        closed_monitors = [
-            key for key, monitor in self.active_monitors.items()
-            if not monitor.running or monitor.trade.status == 'closed'
-        ]
-        for key in closed_monitors:
-            del self.active_monitors[key]
-            logger.info(f"Cleaned up monitor {key}")
 
     async def validate_and_open(self, user: UserSettings, spread_key: str, scanner_prices: Dict,
                                auto: bool = False, test_mode: bool = None, available_exchanges: Dict = None) -> TradeResult:
@@ -296,7 +177,7 @@ class TradingEngine:
                 if short_ex not in user.api_keys or not user.api_keys[short_ex].get('api_key'):
                     return TradeResult(success=False, error=f"No API keys for {short_ex}", correlation_id=correlation_id)
 
-                return await self._open_real_trade(user, symbol, long_ex, short_ex, buy_pd, sell_pd, entry_spread, db, strategy, correlation_id, auto)
+                return await self._open_real_trade(user, symbol, long_ex, short_ex, buy_pd, sell_pd, entry_spread, db, strategy, correlation_id)
         finally:
             await db.close()
 
@@ -320,8 +201,18 @@ class TradingEngine:
         position_size_long = size_usd / actual_price_long if actual_price_long > 0 else 0
         position_size_short = size_usd / actual_price_short if actual_price_short > 0 else 0
 
-        # FIXED: Use correct position levels
-        levels = self._calculate_position_levels(actual_price_long, actual_price_short, user)
+        atr = actual_price_long * 0.02
+        stop_distance = atr * user.risk_settings.get('atr_multiplier', 2.0)
+        stop_loss_price = actual_price_long - stop_distance
+        min_stop_pct = user.risk_settings.get('min_stop_loss_percent', 2.0)
+        stop_pct = (actual_price_long - stop_loss_price) / actual_price_long * 100
+        if stop_pct < min_stop_pct:
+            stop_loss_price = actual_price_long * (1 - min_stop_pct / 100)
+
+        take_profit_pct = user.risk_settings.get('take_profit_percent', 20.0)
+        take_profit_price = actual_price_short * (1 + take_profit_pct / 100)
+        emergency_stop = user.risk_settings.get('emergency_stop_percent', 50.0)
+        emergency_price = actual_price_long * (1 - emergency_stop / 100)
 
         trade = Trade(
             user_id=user.user_id,
@@ -337,11 +228,11 @@ class TradingEngine:
             entry_price_short=actual_price_short,
             current_price_long=actual_price_long,
             current_price_short=actual_price_short,
-            stop_loss_price=levels['long_stop_loss'],
-            take_profit_price=levels['short_take_profit'],
-            emergency_stop_price=levels['long_stop_loss'],  # Emergency = stop loss
+            stop_loss_price=stop_loss_price,
+            take_profit_price=take_profit_price,
+            emergency_stop_price=emergency_price,
             trailing_enabled=user.risk_settings.get('trailing_stop_enabled', True),
-            trailing_stop_price=levels['long_stop_loss'],
+            trailing_stop_price=stop_loss_price,
             status="open",
             metadata={
                 'test_mode': True,
@@ -371,8 +262,8 @@ class TradingEngine:
             entry_price_long=actual_price_long,
             entry_price_short=actual_price_short,
             position_size=size_usd,
-            stop_loss=levels['long_stop_loss'],
-            take_profit=levels['short_take_profit'],
+            stop_loss=stop_loss_price,
+            take_profit=take_profit_price,
             commission_paid=total_commission,
             correlation_id=correlation_id,
             metadata={'test_mode': True, 'strategy': strategy, 'emulated': True, 'slippage': f"{(slippage_long+slippage_short)*100:.3f}%"}
@@ -494,8 +385,16 @@ class TradingEngine:
                 await self._record_failure(long_ex if not long_order else short_ex)
                 return TradeResult(success=False, error=f"Order execution failed: {str(e)}", correlation_id=correlation_id)
 
-            # FIXED: Use correct position levels
-            levels = self._calculate_position_levels(actual_price_long, actual_price_short, user)
+            atr = actual_price_long * 0.02
+            stop_distance = atr * user.risk_settings.get('atr_multiplier', 2.0)
+            stop_loss_price = actual_price_long - stop_distance
+            min_stop_pct = user.risk_settings.get('min_stop_loss_percent', 2.0)
+            stop_pct = (actual_price_long - stop_loss_price) / actual_price_long * 100
+            if stop_pct < min_stop_pct:
+                stop_loss_price = actual_price_long * (1 - min_stop_pct / 100)
+
+            take_profit_price = actual_price_short * (1 + user.risk_settings.get('take_profit_percent', 20.0) / 100)
+            emergency_price = actual_price_long * (1 - user.risk_settings.get('emergency_stop_percent', 50.0) / 100)
 
             trade = Trade(
                 user_id=user.user_id,
@@ -511,11 +410,11 @@ class TradingEngine:
                 entry_price_short=actual_price_short,
                 current_price_long=actual_price_long,
                 current_price_short=actual_price_short,
-                stop_loss_price=levels['long_stop_loss'],
-                take_profit_price=levels['short_take_profit'],
-                emergency_stop_price=levels['long_stop_loss'],
+                stop_loss_price=stop_loss_price,
+                take_profit_price=take_profit_price,
+                emergency_stop_price=emergency_price,
                 trailing_enabled=user.risk_settings.get('trailing_stop_enabled', True),
-                trailing_stop_price=levels['long_stop_loss'],
+                trailing_stop_price=stop_loss_price,
                 status="open",
                 metadata={
                     'test_mode': False,
@@ -548,8 +447,8 @@ class TradingEngine:
                 entry_price_long=actual_price_long,
                 entry_price_short=actual_price_short,
                 position_size=size_usd,
-                stop_loss=levels['long_stop_loss'],
-                take_profit=levels['short_take_profit'],
+                stop_loss=stop_loss_price,
+                take_profit=take_profit_price,
                 commission_paid=total_commission,
                 correlation_id=correlation_id,
                 metadata={'test_mode': False, 'strategy': strategy, 'leverage': leverage}
@@ -570,14 +469,10 @@ class TradingEngine:
             logger.error(f"Error parsing balance: {e}")
             return 0
 
-    # FIXED: Memory leak - cleanup before creating new monitor
     async def _start_monitor(self, trade: Trade, user: UserSettings, db: Database):
         monitor_key = f"{trade.user_id}:{trade.id}"
 
         async with self.monitors_lock:
-            # FIXED: Cleanup before creating new monitor
-            await self._cleanup_monitors()
-
             if monitor_key in self.active_monitors:
                 logger.warning(f"Monitor already exists for {monitor_key}")
                 return
@@ -594,7 +489,28 @@ class TradingEngine:
             self.active_monitors.clear()
             logger.info("All monitors stopped")
 
-    # FIXED: Added retry logic for closing positions
+    async def _cleanup_cache(self):
+        while True:
+            try:
+                await asyncio.sleep(300)
+                async with self.circuit_breaker_lock:
+                    now = time.time()
+                    to_remove = []
+                    for exchange_id, (last_fail, count) in self.circuit_breakers.items():
+                        if now - last_fail > 3600:
+                            to_remove.append(exchange_id)
+                    for ex in to_remove:
+                        del self.circuit_breakers[ex]
+                        logger.info(f"Cleaned up circuit breaker for {ex}")
+
+                logger.debug("Cache cleanup completed")
+            except asyncio.CancelledError:
+                logger.info("Cache cleanup task cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Error in cache cleanup: {e}")
+                await asyncio.sleep(60)
+
     async def close_trade_manually(self, trade_id: int, user: UserSettings) -> TradeResult:
         correlation_id = str(uuid.uuid4())[:8]
 
@@ -642,58 +558,47 @@ class TradingEngine:
         finally:
             await db.close()
 
-    # FIXED: Added retry logic
     async def _close_real_position(self, trade: Trade, user: UserSettings, db: Database, correlation_id: str) -> TradeResult:
-        max_retries = 3
-        retry_delay = 2.0
+        try:
+            exchange_long = await self._get_exchange(trade.long_exchange,
+                user.api_keys[trade.long_exchange]['api_key'],
+                user.api_keys[trade.long_exchange]['api_secret'],
+                user.api_keys[trade.long_exchange].get('password'),
+                user.api_keys[trade.long_exchange].get('testnet', True))
+            exchange_short = await self._get_exchange(trade.short_exchange,
+                user.api_keys[trade.short_exchange]['api_key'],
+                user.api_keys[trade.short_exchange]['api_secret'],
+                user.api_keys[trade.short_exchange].get('password'),
+                user.api_keys[trade.short_exchange].get('testnet', True))
 
-        for attempt in range(max_retries):
-            try:
-                exchange_long = await self._get_exchange(trade.long_exchange,
-                    user.api_keys[trade.long_exchange]['api_key'],
-                    user.api_keys[trade.long_exchange]['api_secret'],
-                    user.api_keys[trade.long_exchange].get('password'),
-                    user.api_keys[trade.long_exchange].get('testnet', True))
-                exchange_short = await self._get_exchange(trade.short_exchange,
-                    user.api_keys[trade.short_exchange]['api_key'],
-                    user.api_keys[trade.short_exchange]['api_secret'],
-                    user.api_keys[trade.short_exchange].get('password'),
-                    user.api_keys[trade.short_exchange].get('testnet', True))
+            symbol = trade.symbol.replace('/', '')
 
-                symbol = trade.symbol.replace('/', '')
+            await exchange_long.create_market_sell_order(f"{symbol}:USDT", trade.position_size_long)
+            await exchange_short.create_market_buy_order(f"{symbol}:USDT", trade.position_size_short)
 
-                await exchange_long.create_market_sell_order(f"{symbol}:USDT", trade.position_size_long)
-                await exchange_short.create_market_buy_order(f"{symbol}:USDT", trade.position_size_short)
+            await exchange_long.close()
+            await exchange_short.close()
 
-                await exchange_long.close()
-                await exchange_short.close()
+            close_spread = 0
+            pnl_usd = trade.pnl_usd if trade.pnl_usd else 0
 
-                close_spread = 0
-                pnl_usd = trade.pnl_usd if trade.pnl_usd else 0
+            trade.close_spread = close_spread
+            trade.status = "closed"
+            trade.closed_at = datetime.now(timezone.utc).isoformat()
+            await db.update_trade(trade)
+            await db.close_trade(trade.id, close_spread, pnl_usd)
 
-                trade.close_spread = close_spread
-                trade.status = "closed"
-                trade.closed_at = datetime.now(timezone.utc).isoformat()
-                await db.update_trade(trade)
-                await db.close_trade(trade.id, close_spread, pnl_usd)
+            return TradeResult(
+                success=True,
+                trade_id=trade.id,
+                error=None,
+                correlation_id=correlation_id,
+                metadata={'pnl': trade.pnl_percent, 'test_mode': False}
+            )
 
-                return TradeResult(
-                    success=True,
-                    trade_id=trade.id,
-                    error=None,
-                    correlation_id=correlation_id,
-                    metadata={'pnl': trade.pnl_percent, 'test_mode': False}
-                )
-
-            except ccxt.NetworkError as e:
-                logger.warning(f"Network error closing trade (attempt {attempt + 1}): {e}")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(retry_delay * (2 ** attempt))
-                else:
-                    return TradeResult(success=False, error=f"Failed after {max_retries} attempts: {e}", correlation_id=correlation_id)
-            except Exception as e:
-                logger.error(f"Error closing real position: {e}")
-                return TradeResult(success=False, error=f"Close failed: {str(e)}", correlation_id=correlation_id)
+        except Exception as e:
+            logger.error(f"Error closing real position: {e}")
+            return TradeResult(success=False, error=f"Close failed: {str(e)}", correlation_id=correlation_id)
 
     async def test_api_connection(self, exchange_id: str, api_key: str, api_secret: str, testnet: bool = True) -> dict:
         """Тестирование подключения к API биржи"""
@@ -800,7 +705,7 @@ class TradingEngine:
         except Exception as e:
             logger.error(f"Zombie check error: {e}")
 
-
+# ===== КЛАСС PositionMonitor (отдельно, без recover_positions) =====
 class PositionMonitor:
     def __init__(self, trade: Trade, user: UserSettings, db: Database, engine: TradingEngine):
         self.trade = trade
@@ -820,9 +725,6 @@ class PositionMonitor:
                 await self._update_prices()
                 await self._check_conditions()
                 await asyncio.sleep(self.update_interval)
-            except sqlite3.ProgrammingError:
-                logger.warning("DB closed during monitor run, stopping")
-                break
             except Exception as e:
                 logger.error(f"Monitor error for trade {self.trade.id}: {e}")
                 await asyncio.sleep(10)
@@ -838,24 +740,10 @@ class PositionMonitor:
                 pass
 
             if self.trade.current_price_long > 0 and self.trade.current_price_short > 0:
-                # FIXED: Correct PnL calculation for arbitrage
-                entry_spread = (
-                    (self.trade.entry_price_short - self.trade.entry_price_long)
-                    / self.trade.entry_price_long * 100
-                )
-                current_spread = (
-                    (self.trade.current_price_short - self.trade.current_price_long)
-                    / self.trade.entry_price_long * 100
-                )
-                spread_change_pnl = entry_spread - current_spread
-                
-                position_size_usd = self.trade.size_usd
-                leverage = self.user.risk_settings.get('max_leverage', 3)
-                pnl_usd = spread_change_pnl / 100 * position_size_usd * leverage
-                
-                margin = position_size_usd / leverage
-                self.trade.pnl_percent = (pnl_usd / margin) * 100 if margin > 0 else 0
-                self.trade.pnl_usd = pnl_usd
+                long_pnl = (self.trade.current_price_long - self.trade.entry_price_long) / self.trade.entry_price_long * 100
+                short_pnl = (self.trade.entry_price_short - self.trade.current_price_short) / self.trade.entry_price_short * 100
+                self.trade.pnl_percent = (long_pnl + short_pnl) / 2
+                self.trade.pnl_usd = self.trade.size_usd * self.trade.pnl_percent / 100
 
             await self.db.update_trade(self.trade)
 
@@ -890,18 +778,11 @@ class PositionMonitor:
 
         max_hours = self.user.risk_settings.get('max_position_hours', 24)
         if max_hours > 0:
-            try:
-                if self.trade.opened_at.endswith('Z'):
-                    opened_at = datetime.fromisoformat(self.trade.opened_at.replace('Z', '+00:00'))
-                else:
-                    opened_at = datetime.fromisoformat(self.trade.opened_at)
-                    opened_at = opened_at.replace(tzinfo=timezone.utc)
-                hours_open = (datetime.now(timezone.utc) - opened_at).total_seconds() / 3600
-                if hours_open >= max_hours:
-                    await self._close_position("time_limit")
-                    return
-            except:
-                pass
+            opened_at = datetime.fromisoformat(self.trade.opened_at)
+            hours_open = (datetime.now(timezone.utc) - opened_at).total_seconds() / 3600
+            if hours_open >= max_hours:
+                await self._close_position("time_limit")
+                return
 
     async def _close_position(self, reason: str):
         if self.closing_in_progress:
@@ -920,7 +801,6 @@ class PositionMonitor:
             logger.error(f"Error closing trade {self.trade.id}: {e}")
         finally:
             self.running = False
-
 
 # Глобальный экземпляр
 trading_engine = TradingEngine()
