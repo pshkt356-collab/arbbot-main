@@ -247,7 +247,11 @@ async def subscribe_existing_users():
         subscribed_count = 0
 
         for user in users:
-            if user.alert_settings.get('min_spread', 0) > 0:
+            # Пропускаем если алерты выключены или бот заблокирован
+            if not user.alerts_enabled or user.bot_blocked:
+                continue
+            
+            if user.min_spread_threshold > 0:
                 # Проверяем, не подписан ли уже
                 already_subscribed = False
                 for sub in scanner.subscribers:
@@ -259,8 +263,13 @@ async def subscribe_existing_users():
                 
                 if not already_subscribed:
                     scanner.subscribe(send_spread_alert, user.user_id)
+                    scanner.set_user_threshold(
+                        user.user_id,
+                        user.min_spread_threshold,
+                        alerts_enabled=user.alerts_enabled
+                    )
                     subscribed_count += 1
-                    logger.info(f"Auto-subscribed user {user.user_id} to spread alerts")
+                    logger.info(f"Auto-subscribed user {user.user_id} to spread alerts (threshold: {user.min_spread_threshold}%)")
 
         logger.info(f"Total users subscribed to alerts: {subscribed_count}/{len(users)}")
     except Exception as e:

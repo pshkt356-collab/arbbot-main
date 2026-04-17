@@ -520,6 +520,25 @@ class Database:
             await self._conn.commit()
 
     async def add_trade(self, trade: Trade) -> int:
+        # Ensure all extended fields are in metadata
+        metadata = dict(trade.metadata)
+        metadata.update({
+            'position_size_long': trade.position_size_long,
+            'position_size_short': trade.position_size_short,
+            'closed_portion_percent': trade.closed_portion_percent,
+            'partial_close_count': trade.partial_close_count,
+            'entry_price_long': trade.entry_price_long,
+            'entry_price_short': trade.entry_price_short,
+            'current_price_long': trade.current_price_long,
+            'current_price_short': trade.current_price_short,
+            'stop_loss_price': trade.stop_loss_price,
+            'take_profit_price': trade.take_profit_price,
+            'breakeven_triggered': trade.breakeven_triggered,
+            'trailing_enabled': trade.trailing_enabled,
+            'trailing_stop_price': trade.trailing_stop_price,
+            'emergency_stop_price': trade.emergency_stop_price,
+            'pnl_percent': trade.pnl_percent
+        })
         async with self._query_lock:
             cursor = await self._conn.execute("""
                 INSERT INTO trades (user_id, symbol, strategy, long_exchange, short_exchange,
@@ -528,7 +547,7 @@ class Database:
             """, (
                 trade.user_id, trade.symbol, trade.strategy, trade.long_exchange,
                 trade.short_exchange, trade.entry_spread, trade.size_usd,
-                trade.status, json.dumps(trade.metadata)
+                trade.status, json.dumps(metadata)
             ))
             await self._conn.commit()
             return cursor.lastrowid
@@ -618,7 +637,32 @@ class Database:
             ) as cursor:
                 row = await cursor.fetchone()
                 if row:
-                    return dict(row)
+                    result = dict(row)
+                    # Parse metadata JSON
+                    metadata = {}
+                    if isinstance(result.get('metadata'), str):
+                        try:
+                            metadata = json.loads(result['metadata'])
+                        except (json.JSONDecodeError, TypeError):
+                            metadata = {}
+                    result['metadata'] = metadata
+                    # Extract extended fields from metadata for Trade(**result) compatibility
+                    result['position_size_long'] = metadata.get('position_size_long', 0)
+                    result['position_size_short'] = metadata.get('position_size_short', 0)
+                    result['closed_portion_percent'] = metadata.get('closed_portion_percent', 0)
+                    result['partial_close_count'] = metadata.get('partial_close_count', 0)
+                    result['entry_price_long'] = metadata.get('entry_price_long', 0)
+                    result['entry_price_short'] = metadata.get('entry_price_short', 0)
+                    result['current_price_long'] = metadata.get('current_price_long', 0)
+                    result['current_price_short'] = metadata.get('current_price_short', 0)
+                    result['stop_loss_price'] = metadata.get('stop_loss_price', 0)
+                    result['take_profit_price'] = metadata.get('take_profit_price', 0)
+                    result['breakeven_triggered'] = metadata.get('breakeven_triggered', False)
+                    result['trailing_enabled'] = metadata.get('trailing_enabled', True)
+                    result['trailing_stop_price'] = metadata.get('trailing_stop_price', 0)
+                    result['emergency_stop_price'] = metadata.get('emergency_stop_price', 0)
+                    result['pnl_percent'] = metadata.get('pnl_percent', 0)
+                    return result
                 return None
 
     async def update_trade(self, trade: Trade):

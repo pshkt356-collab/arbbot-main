@@ -38,14 +38,28 @@ class TradingEngine:
 
     # ===== МЕТОД ДОБАВЛЕН СЮДА (в класс TradingEngine) =====
     async def recover_positions(self):
-        """Восстановление позиций при перезапуске бота (заглушка)"""
+        """Восстановление позиций при перезапуске бота"""
         logger.info("Recovering positions from database...")
         db = Database(settings.db_file)
         await db.initialize()
         try:
-            # TODO: Получить все открытые сделки и восстановить мониторы
-            # Для каждой открытой сделки запустить PositionMonitor
-            logger.info("Position recovery completed (stub implementation)")
+            async with db._conn.execute("SELECT user_id FROM trades WHERE status = 'open' GROUP BY user_id") as cursor:
+                rows = await cursor.fetchall()
+            recovered_count = 0
+            for row in rows:
+                user_id = row['user_id']
+                user = await db.get_user(user_id)
+                if not user:
+                    continue
+                open_trades = await db.get_open_trades(user_id)
+                for trade in open_trades:
+                    try:
+                        await self._start_monitor(trade, user, db)
+                        recovered_count += 1
+                        logger.info(f"Recovered monitor for trade #{trade.id} ({trade.symbol})")
+                    except Exception as e:
+                        logger.error(f"Failed to recover trade #{trade.id}: {e}")
+            logger.info(f"Position recovery completed: {recovered_count} monitors restored")
         except Exception as e:
             logger.error(f"Error during position recovery: {e}")
         finally:
@@ -564,6 +578,9 @@ class TradingEngine:
             await db.close()
 
     async def _close_real_position(self, trade: Trade, user: UserSettings, db: Database, correlation_id: str) -> TradeResult:
+        long_closed = False
+        short_closed = False
+        
         try:
             exchange_long = await self._get_exchange(trade.long_exchange,
                 user.api_keys[trade.long_exchange]['api_key'],
@@ -578,8 +595,32 @@ class TradingEngine:
 
             symbol = trade.symbol.replace('/', '')
 
-            await exchange_long.create_market_sell_order(f"{symbol}:USDT", trade.position_size_long)
-            await exchange_short.create_market_buy_order(f"{symbol}:USDT", trade.position_size_short)
+            # Закрываем long
+            try:
+                await exchange_long.create_market_sell_order(f"{symbol}:USDT", trade.position_size_long)
+                long_closed = True
+            except Exception as e:
+                logger.error(f"[{correlation_id}] Failed to close long: {e}")
+            
+            # Закрываем short
+            try:
+                await exchange_short.create_market_buy_order(f"{symbol}:USDT", trade.position_size_short)
+                short_closed = True
+            except Exception as e:
+                logger.error(f"[{correlation_id}] Failed to close short: {e}")
+            
+            # Если один закрылся а другой нет — критическая ошибка
+            if long_closed != short_closed:
+                logger.critical(f"[{correlation_id}] UNHEDGED POSITION! Long: {long_closed}, Short: {short_closed}. Trade: {trade.id}")
+                try:
+                    from services.notification import alert_manager
+                    if alert_manager:
+                        await alert_manager.critical(
+                            f"UNHEDGED: Trade #{trade.id}. Long closed: {long_closed}, Short closed: {short_closed}",
+                            source="trading"
+                        )
+                except:
+                    pass
 
             await exchange_long.close()
             await exchange_short.close()
@@ -590,8 +631,22 @@ class TradingEngine:
             trade.close_spread = close_spread
             trade.status = "closed"
             trade.closed_at = datetime.now(timezone.utc).isoformat()
+            trade.metadata['close_info'] = {
+                'long_closed': long_closed,
+                'short_closed': short_closed,
+                'correlation_id': correlation_id
+            }
             await db.update_trade(trade)
             await db.close_trade(trade.id, close_spread, pnl_usd)
+
+            if not (long_closed and short_closed):
+                return TradeResult(
+                    success=True,
+                    trade_id=trade.id,
+                    error=f"Partial: long={long_closed}, short={short_closed}",
+                    correlation_id=correlation_id,
+                    metadata={'pnl': trade.pnl_percent, 'partial': True}
+                )
 
             return TradeResult(
                 success=True,
@@ -602,7 +657,7 @@ class TradingEngine:
             )
 
         except Exception as e:
-            logger.error(f"Error closing real position: {e}")
+            logger.error(f"[{correlation_id}] Error closing real position: {e}")
             return TradeResult(success=False, error=f"Close failed: {str(e)}", correlation_id=correlation_id)
 
     async def test_api_connection(self, exchange_id: str, api_key: str, api_secret: str, testnet: bool = True) -> dict:
@@ -672,8 +727,20 @@ class TradingEngine:
             max_hours = user.risk_settings.get('max_position_hours', 24)
             now = datetime.now(timezone.utc)
             
-            for trade_id, monitor in list(self.active_monitors.items()):
+            for monitor_key, monitor in list(self.active_monitors.items()):
                 trade = monitor.trade
+                
+                # monitor_key format: "user_id:trade_id"
+                try:
+                    _, trade_id_str = monitor_key.split(':', 1)
+                    trade_id = int(trade_id_str)
+                except (ValueError, IndexError):
+                    logger.warning(f"Invalid monitor key format: {monitor_key}")
+                    continue
+                
+                # Проверяем что сделка принадлежит пользователю
+                if trade.user_id != user.user_id:
+                    continue
                 
                 # Парсим дату открытия
                 try:
@@ -742,7 +809,24 @@ class PositionMonitor:
     async def _update_prices(self):
         try:
             if not self.trade.metadata.get('test_mode'):
-                pass
+                # Получаем реальные цены с бирж через публичный API
+                try:
+                    exchange_long = await self.engine._get_exchange(self.trade.long_exchange)
+                    exchange_short = await self.engine._get_exchange(self.trade.short_exchange)
+                    
+                    symbol_long = f"{self.trade.symbol.replace('/', '')}:USDT"
+                    symbol_short = f"{self.trade.symbol.replace('/', '')}:USDT"
+                    
+                    ticker_long = await exchange_long.fetch_ticker(symbol_long)
+                    ticker_short = await exchange_short.fetch_ticker(symbol_short)
+                    
+                    self.trade.current_price_long = ticker_long['last'] if ticker_long and ticker_long.get('last') else self.trade.current_price_long
+                    self.trade.current_price_short = ticker_short['last'] if ticker_short and ticker_short.get('last') else self.trade.current_price_short
+                    
+                    await exchange_long.close()
+                    await exchange_short.close()
+                except Exception as e:
+                    logger.warning(f"Price fetch error for trade {self.trade.id}: {e}")
 
             if self.trade.current_price_long > 0 and self.trade.current_price_short > 0:
                 long_pnl = (self.trade.current_price_long - self.trade.entry_price_long) / self.trade.entry_price_long * 100

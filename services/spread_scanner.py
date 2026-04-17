@@ -125,6 +125,7 @@ class SpreadScanner:
 
         self.user_settings: Dict[int, float] = {}
         self.user_basis_settings: Dict[int, float] = {}
+        self.user_alerts_enabled: Dict[int, bool] = {}  # user_id -> alerts_enabled
         self.default_min_spread = min_spread
 
         self.exchange_symbols: Dict[str, Set[str]] = {
@@ -195,6 +196,8 @@ class SpreadScanner:
                 self.user_settings[user_id] = self.default_min_spread
             if user_id not in self.user_basis_settings:
                 self.user_basis_settings[user_id] = self.basis_threshold
+            if user_id not in self.user_alerts_enabled:
+                self.user_alerts_enabled[user_id] = True
         else:
             self.subscribers.append(callback)
 
@@ -328,6 +331,9 @@ class SpreadScanner:
                         continue
                     user_threshold = self.get_user_threshold(user_id, for_basis=alert.is_basis)
 
+                    # skip if alerts disabled for this user
+                    if not self.user_alerts_enabled.get(user_id, True):
+                        continue
                     if alert.spread_percent >= user_threshold:
                         await callback(alert, user_id)
                 else:
