@@ -146,9 +146,6 @@ class Database:
 
     async def initialize(self):
         """Инициализация БД с проверкой на повторный вызов"""
-        if self._initialized:
-            return
-
         async with self._init_lock:
             if self._initialized:
                 return
@@ -160,8 +157,6 @@ class Database:
                 await self._conn.execute("PRAGMA foreign_keys=ON")
                 await self._create_tables()
                 await self._migrate_add_arbitrage_mode()
-                # BUG 32 FIX: Add migration for selected_exchanges column
-                await self._migrate_add_selected_exchanges()
                 self._initialized = True
                 logger.info(f"Database initialized: {self._db_path} (WAL mode)")
             except Exception as e:
@@ -185,19 +180,6 @@ class Database:
                     logger.info("Migration: added arbitrage_mode column")
         except Exception as e:
             logger.error(f"Migration error: {e}")
-
-    # BUG 32 FIX: Add migration for selected_exchanges column
-    async def _migrate_add_selected_exchanges(self):
-        """Миграция: добавление колонки selected_exchanges если её нет"""
-        try:
-            async with self._conn.execute("PRAGMA table_info(users)") as cursor:
-                columns = [row['name'] for row in await cursor.fetchall()]
-                if 'selected_exchanges' not in columns:
-                    await self._conn.execute("ALTER TABLE users ADD COLUMN selected_exchanges TEXT DEFAULT '[]'")
-                    await self._conn.commit()
-                    logger.info("Migration: added selected_exchanges column")
-        except Exception as e:
-            logger.error(f"Migration error for selected_exchanges: {e}")
 
     async def close(self):
         """Закрытие соединения с БД"""
@@ -224,7 +206,6 @@ class Database:
                     alert_settings TEXT DEFAULT '{}',
                     risk_settings TEXT DEFAULT '{}',
                     arbitrage_mode TEXT DEFAULT 'all',
-                    selected_exchanges TEXT DEFAULT '[]',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
@@ -276,25 +257,17 @@ class Database:
                 if not row:
                     return None
 
-                # ИСПРАВЛЕНО: sqlite3.Row не имеет .get(), используем dict(row)
-                row_dict = dict(row)
-
-                # BUG 32 FIX: Load selected_exchanges from DB
-                selected_exchanges = json.loads(row_dict.get('selected_exchanges', '[]'))
-                if not selected_exchanges:
-                    selected_exchanges = ['binance', 'bybit', 'okx', 'whitebit', 'mexc']
-
+                # Direct column access (more efficient than dict(row))
                 return UserSettings(
-                    user_id=row_dict['user_id'],
-                    is_trading_enabled=bool(row_dict['is_trading_enabled']),
-                    api_keys=json.loads(row_dict['api_keys']),
-                    commission_rates=json.loads(row_dict['commission_rates']),
-                    alert_settings=json.loads(row_dict['alert_settings']),
-                    risk_settings=json.loads(row_dict['risk_settings']),
-                    arbitrage_mode=row_dict.get('arbitrage_mode', 'all'),
-                    selected_exchanges=selected_exchanges,
-                    created_at=row_dict['created_at'],
-                    updated_at=row_dict['updated_at']
+                    user_id=row['user_id'],
+                    is_trading_enabled=bool(row['is_trading_enabled']),
+                    api_keys=json.loads(row['api_keys']),
+                    commission_rates=json.loads(row['commission_rates']),
+                    alert_settings=json.loads(row['alert_settings']),
+                    risk_settings=json.loads(row['risk_settings']),
+                    arbitrage_mode=row['arbitrage_mode'] if row['arbitrage_mode'] else 'all',
+                    created_at=row['created_at'],
+                    updated_at=row['updated_at']
                 )
 
     async def create_user(self, user_id: int) -> UserSettings:
@@ -306,18 +279,16 @@ class Database:
 
         async with self._query_lock:
             try:
-                # BUG 32 FIX: Include selected_exchanges in INSERT
                 await self._conn.execute("""
-                    INSERT INTO users (user_id, api_keys, commission_rates, alert_settings, risk_settings, arbitrage_mode, selected_exchanges)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO users (user_id, api_keys, commission_rates, alert_settings, risk_settings, arbitrage_mode)
+                    VALUES (?, ?, ?, ?, ?, ?)
                 """, (
                     user_id,
                     json.dumps(user.api_keys),
                     json.dumps(user.commission_rates),
                     json.dumps(user.alert_settings),
                     json.dumps(user.risk_settings),
-                    user.arbitrage_mode,
-                    json.dumps(user.selected_exchanges)
+                    user.arbitrage_mode
                 ))
                 await self._conn.commit()
                 logger.info(f"Created new user {user_id}")
@@ -338,29 +309,20 @@ class Database:
 
                 users = []
                 for row in rows:
-                    # ИСПРАВЛЕНО: sqlite3.Row не имеет .get(), используем dict(row)
-                    row_dict = dict(row)
-                    
-                    # BUG 32 FIX: Load selected_exchanges from DB
-                    selected_exchanges = json.loads(row_dict.get('selected_exchanges', '[]'))
-                    if not selected_exchanges:
-                        selected_exchanges = ['binance', 'bybit', 'okx', 'whitebit', 'mexc']
-                    
+                    # Direct column access (more efficient than dict(row))
                     users.append(UserSettings(
-                        user_id=row_dict['user_id'],
-                        is_trading_enabled=bool(row_dict['is_trading_enabled']),
-                        api_keys=json.loads(row_dict['api_keys']),
-                        commission_rates=json.loads(row_dict['commission_rates']),
-                        alert_settings=json.loads(row_dict['alert_settings']),
-                        risk_settings=json.loads(row_dict['risk_settings']),
-                        arbitrage_mode=row_dict.get('arbitrage_mode', 'all'),
-                        selected_exchanges=selected_exchanges,
-                        created_at=row_dict['created_at'],
-                        updated_at=row_dict['updated_at']
+                        user_id=row['user_id'],
+                        is_trading_enabled=bool(row['is_trading_enabled']),
+                        api_keys=json.loads(row['api_keys']),
+                        commission_rates=json.loads(row['commission_rates']),
+                        alert_settings=json.loads(row['alert_settings']),
+                        risk_settings=json.loads(row['risk_settings']),
+                        arbitrage_mode=row['arbitrage_mode'] if row['arbitrage_mode'] else 'all',
+                        created_at=row['created_at'],
+                        updated_at=row['updated_at']
                     ))
                 return users
 
-    # BUG 32 FIX: Update update_user to save selected_exchanges
     async def update_user(self, user: UserSettings):
         async with self._query_lock:
             await self._conn.execute("""
@@ -371,7 +333,6 @@ class Database:
                     alert_settings = ?,
                     risk_settings = ?,
                     arbitrage_mode = ?,
-                    selected_exchanges = ?,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE user_id = ?
             """, (
@@ -381,7 +342,6 @@ class Database:
                 json.dumps(user.alert_settings),
                 json.dumps(user.risk_settings),
                 getattr(user, 'arbitrage_mode', 'all'),
-                json.dumps(getattr(user, 'selected_exchanges', ['binance', 'bybit', 'okx', 'whitebit', 'mexc'])),
                 user.user_id
             ))
             await self._conn.commit()
@@ -409,7 +369,7 @@ class Database:
                     """SELECT * FROM trades 
                     WHERE user_id = ? AND status = 'open'
                     AND json_extract(metadata, '$.test_mode') = ?""",
-                    (user_id, json.dumps(test_mode))
+                    (user_id, int(test_mode))
                 ) as cursor:
                     rows = await cursor.fetchall()
             else:
@@ -463,7 +423,7 @@ class Database:
                 query = """SELECT COUNT(*) as count, COALESCE(SUM(pnl_usd), 0) as total_pnl
                         FROM trades WHERE user_id = ? AND status = 'closed'
                         AND json_extract(metadata, '$.test_mode') = ?"""
-                async with self._conn.execute(query, (user_id, json.dumps(test_mode))) as cursor:
+                async with self._conn.execute(query, (user_id, int(test_mode))) as cursor:
                     row = await cursor.fetchone()
             else:
                 query = """SELECT COUNT(*) as count, COALESCE(SUM(pnl_usd), 0) as total_pnl
@@ -510,4 +470,40 @@ class Database:
         })
 
         async with self._query_lock:
-            await 
+            await self._conn.execute("""
+                UPDATE trades SET
+                    pnl_usd = ?,
+                    status = ?,
+                    metadata = ?,
+                    closed_at = ?,
+                    close_spread = ?
+                WHERE id = ?
+            """, (
+                trade.pnl_usd,
+                trade.status,
+                json.dumps(metadata),
+                trade.closed_at,
+                trade.close_spread,
+                trade.id
+            ))
+            await self._conn.commit()
+
+    async def close_trade(self, trade_id: int, close_spread: float, pnl_usd: float):
+        async with self._query_lock:
+            await self._conn.execute("""
+                UPDATE trades SET
+                    close_spread = ?,
+                    pnl_usd = ?,
+                    status = 'closed',
+                    closed_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (close_spread, pnl_usd, trade_id))
+            await self._conn.commit()
+
+    async def log_spread(self, symbol: str, ex1: str, ex2: str, spread: float, p1: float, p2: float):
+        async with self._query_lock:
+            await self._conn.execute("""
+                INSERT INTO spread_history (symbol, exchange_1, exchange_2, spread_percent, price_1, price_2)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (symbol, ex1, ex2, spread, p1, p2))
+            await self._conn.commit()
