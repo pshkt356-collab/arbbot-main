@@ -27,22 +27,6 @@ callbacks_router = Router()
 _bot = None
 
 
-# FIXED: Added error handler with correct signature
-@callbacks_router.errors()
-async def callback_error_handler(event: Update, exception: Exception):
-    """Error handler for callback queries - FIXED"""
-    logger.error(f"Callback error: {exception}", exc_info=True)
-
-    # If there's a callback query, answer it
-    if event.callback_query:
-        try:
-            await event.callback_query.answer("❌ Произошла ошибка")
-        except:
-            pass
-
-    return True  # Error handled
-
-
 def set_bot(bot_instance):
     """Set bot instance for sending messages"""
     global _bot
