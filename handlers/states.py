@@ -83,6 +83,9 @@ async def process_api_key(message: Message, state: FSMContext, user: UserSetting
 
 @states_router.message(SetupStates.waiting_for_api_secret)
 async def process_api_secret(message: Message, state: FSMContext, user: UserSettings, db: Database):
+    user_id = message.from_user.id
+    logger.info(f"[FSM] process_api_secret called for user={user_id}")
+
     if message.text == "/cancel":
         await state.clear()
         await message.answer("❌ Отменено")
