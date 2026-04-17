@@ -31,23 +31,6 @@ class SetupStates(StatesGroup):
     waiting_for_balance_usage = State()
     waiting_for_trade_amount = State()
 
-@states_router.callback_query(F.data.startswith("api:"))
-async def process_api(callback: CallbackQuery, state: FSMContext):
-    exchange = callback.data.split(":")[1]
-    await state.update_data(current_exchange=exchange)
-    await state.set_state(SetupStates.waiting_for_api_key)
-
-    keyboard = InlineKeyboardBuilder()
-    keyboard.button(text="❌ Отмена", callback_data="menu:settings")
-
-    await callback.message.edit_text(
-        f"🔐 **{exchange.upper()}**\n\n"
-        f"Введите API Key для {exchange.upper()}:\n\n"
-        f" _⚠️ Требуются права: Read + Spot/Futures Trading (без вывода)_",
-        reply_markup=keyboard.as_markup()
-    )
-    await callback.answer()
-
 @states_router.message(SetupStates.waiting_for_api_key)
 async def process_api_key(message: Message, state: FSMContext, user: UserSettings):
     if message.text == "/cancel":

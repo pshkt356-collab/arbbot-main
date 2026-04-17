@@ -22,6 +22,7 @@ from services.notification import init_alert_manager, alert_manager
 from services.exchange_status import status_checker
 from handlers.commands import commands_router
 from handlers.callbacks import callbacks_router, send_spread_alert, subscribe_user_to_alerts, set_bot
+from handlers.states import states_router
 from middleware.user_context import UserContextMiddleware, ScannerMiddleware
 from middleware.rate_limiter import UserRateLimiter, DoubleSubmitProtection
 
@@ -291,6 +292,7 @@ async def main():
 
     dp.include_router(commands_router)
     dp.include_router(callbacks_router)
+    dp.include_router(states_router)
 
     scanner_task = asyncio.create_task(scanner.start(), name="scanner")
     cleanup_task = asyncio.create_task(trading_engine._cleanup_cache(), name="cache_cleanup")
