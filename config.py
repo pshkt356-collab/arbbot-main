@@ -1,3 +1,4 @@
+from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
 from typing import Optional
@@ -36,8 +37,11 @@ class Settings(BaseSettings):
     price_cache_ttl: int = 10
     min_volume_24h: float = 500000
 
-    # Database
-    db_file: str = "/app/data/arbitrage_bot.db"
+    # Database - cross-platform path using pathlib
+    db_file: str = Field(default=str(Path.home() / ".arbitrage_bot" / "data" / "arbitrage_bot.db"))
+    
+    # FSM Storage - cross-platform path for FSM state persistence
+    fsm_storage_path: str = Field(default=str(Path.home() / ".arbitrage_bot" / "fsm_storage"))
 
     # Logging
     log_level: str = "INFO"

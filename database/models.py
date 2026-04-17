@@ -160,6 +160,8 @@ class Database:
                 await self._conn.execute("PRAGMA foreign_keys=ON")
                 await self._create_tables()
                 await self._migrate_add_arbitrage_mode()
+                # BUG 32 FIX: Add migration for selected_exchanges column
+                await self._migrate_add_selected_exchanges()
                 self._initialized = True
                 logger.info(f"Database initialized: {self._db_path} (WAL mode)")
             except Exception as e:
@@ -183,6 +185,19 @@ class Database:
                     logger.info("Migration: added arbitrage_mode column")
         except Exception as e:
             logger.error(f"Migration error: {e}")
+
+    # BUG 32 FIX: Add migration for selected_exchanges column
+    async def _migrate_add_selected_exchanges(self):
+        """Миграция: добавление колонки selected_exchanges если её нет"""
+        try:
+            async with self._conn.execute("PRAGMA table_info(users)") as cursor:
+                columns = [row['name'] for row in await cursor.fetchall()]
+                if 'selected_exchanges' not in columns:
+                    await self._conn.execute("ALTER TABLE users ADD COLUMN selected_exchanges TEXT DEFAULT '[]'")
+                    await self._conn.commit()
+                    logger.info("Migration: added selected_exchanges column")
+        except Exception as e:
+            logger.error(f"Migration error for selected_exchanges: {e}")
 
     async def close(self):
         """Закрытие соединения с БД"""
@@ -209,6 +224,7 @@ class Database:
                     alert_settings TEXT DEFAULT '{}',
                     risk_settings TEXT DEFAULT '{}',
                     arbitrage_mode TEXT DEFAULT 'all',
+                    selected_exchanges TEXT DEFAULT '[]',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
@@ -263,6 +279,11 @@ class Database:
                 # ИСПРАВЛЕНО: sqlite3.Row не имеет .get(), используем dict(row)
                 row_dict = dict(row)
 
+                # BUG 32 FIX: Load selected_exchanges from DB
+                selected_exchanges = json.loads(row_dict.get('selected_exchanges', '[]'))
+                if not selected_exchanges:
+                    selected_exchanges = ['binance', 'bybit', 'okx', 'whitebit', 'mexc']
+
                 return UserSettings(
                     user_id=row_dict['user_id'],
                     is_trading_enabled=bool(row_dict['is_trading_enabled']),
@@ -271,6 +292,7 @@ class Database:
                     alert_settings=json.loads(row_dict['alert_settings']),
                     risk_settings=json.loads(row_dict['risk_settings']),
                     arbitrage_mode=row_dict.get('arbitrage_mode', 'all'),
+                    selected_exchanges=selected_exchanges,
                     created_at=row_dict['created_at'],
                     updated_at=row_dict['updated_at']
                 )
@@ -284,16 +306,18 @@ class Database:
 
         async with self._query_lock:
             try:
+                # BUG 32 FIX: Include selected_exchanges in INSERT
                 await self._conn.execute("""
-                    INSERT INTO users (user_id, api_keys, commission_rates, alert_settings, risk_settings, arbitrage_mode)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO users (user_id, api_keys, commission_rates, alert_settings, risk_settings, arbitrage_mode, selected_exchanges)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                 """, (
                     user_id,
                     json.dumps(user.api_keys),
                     json.dumps(user.commission_rates),
                     json.dumps(user.alert_settings),
                     json.dumps(user.risk_settings),
-                    user.arbitrage_mode
+                    user.arbitrage_mode,
+                    json.dumps(user.selected_exchanges)
                 ))
                 await self._conn.commit()
                 logger.info(f"Created new user {user_id}")
@@ -316,6 +340,12 @@ class Database:
                 for row in rows:
                     # ИСПРАВЛЕНО: sqlite3.Row не имеет .get(), используем dict(row)
                     row_dict = dict(row)
+                    
+                    # BUG 32 FIX: Load selected_exchanges from DB
+                    selected_exchanges = json.loads(row_dict.get('selected_exchanges', '[]'))
+                    if not selected_exchanges:
+                        selected_exchanges = ['binance', 'bybit', 'okx', 'whitebit', 'mexc']
+                    
                     users.append(UserSettings(
                         user_id=row_dict['user_id'],
                         is_trading_enabled=bool(row_dict['is_trading_enabled']),
@@ -324,11 +354,13 @@ class Database:
                         alert_settings=json.loads(row_dict['alert_settings']),
                         risk_settings=json.loads(row_dict['risk_settings']),
                         arbitrage_mode=row_dict.get('arbitrage_mode', 'all'),
+                        selected_exchanges=selected_exchanges,
                         created_at=row_dict['created_at'],
                         updated_at=row_dict['updated_at']
                     ))
                 return users
 
+    # BUG 32 FIX: Update update_user to save selected_exchanges
     async def update_user(self, user: UserSettings):
         async with self._query_lock:
             await self._conn.execute("""
@@ -339,6 +371,7 @@ class Database:
                     alert_settings = ?,
                     risk_settings = ?,
                     arbitrage_mode = ?,
+                    selected_exchanges = ?,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE user_id = ?
             """, (
@@ -348,6 +381,7 @@ class Database:
                 json.dumps(user.alert_settings),
                 json.dumps(user.risk_settings),
                 getattr(user, 'arbitrage_mode', 'all'),
+                json.dumps(getattr(user, 'selected_exchanges', ['binance', 'bybit', 'okx', 'whitebit', 'mexc'])),
                 user.user_id
             ))
             await self._conn.commit()

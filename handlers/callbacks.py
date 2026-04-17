@@ -9,6 +9,7 @@ from aiogram.filters import StateFilter
 from aiogram.enums import ParseMode
 import logging
 import html
+import threading
 
 # Используем существующие импорты из оригинальной структуры
 from database.models import UserSettings, Database
@@ -22,12 +23,29 @@ logger = logging.getLogger(__name__)
 callbacks_router = Router()
 
 # Глобальная переменная для бота (устанавливается из main.py)
+# BUG 20 FIX: Added proper synchronization for atomic initialization
 _bot = None
+_bot_lock = threading.Lock()
+_bot_initialized = False
 
 def set_bot(bot_instance):
-    """Установка бота для отправки сообщений"""
-    global _bot
-    _bot = bot_instance
+    """Установка бота для отправки сообщений с атомарной проверкой инициализации"""
+    global _bot, _bot_initialized
+    with _bot_lock:
+        if _bot_initialized and _bot is not None:
+            logger.warning("Bot already initialized, ignoring duplicate set_bot call")
+            return
+        _bot = bot_instance
+        _bot_initialized = True
+        logger.info("Bot instance set successfully")
+
+def get_bot():
+    """Получение экземпляра бота с потокобезопасной проверкой"""
+    global _bot, _bot_initialized
+    with _bot_lock:
+        if not _bot_initialized or _bot is None:
+            return None
+        return _bot
 
 def escape_html(text: str) -> str:
     """Escape HTML special characters"""
@@ -147,6 +165,7 @@ async def show_active_spreads(callback: CallbackQuery, user: UserSettings, scann
             buy_px = spread.get('buy_price', 0)
             sell_px = spread.get('sell_price', 0)
 
+            # BUG 18 FIX: Verified - escape_html only applied to strings, numbers use f-string formatting
             text += (
                 f"{i}. **{escape_html(symbol)}**: {spread_val:.2f}%\n"
                 f"  📉 {escape_html(buy_ex)}: {buy_px:.6f}\n"
@@ -293,8 +312,9 @@ async def subscribe_user_to_alerts(user_id: int, scanner, db: Database = None):
     if db:
         try:
             user = await db.get_user(user_id)
-            if user and user.alert_settings:
-                min_spread = user.alert_settings.get('min_spread', 0.2)
+            if user:
+                # BUG 5 FIX: Use correct field name min_spread_threshold instead of min_spread from alert_settings
+                min_spread = user.min_spread_threshold
                 scanner.set_user_threshold(user_id, min_spread)
                 logger.info(f"User {user_id} threshold loaded from DB: {min_spread}%")
         except Exception as e:
@@ -312,8 +332,9 @@ async def send_spread_alert(spread_info, user_id: int):
         user_id: ID пользователя для отправки
     """
     try:
-        global _bot
-        if _bot is None:
+        # BUG 20 FIX: Use thread-safe get_bot() function
+        bot = get_bot()
+        if bot is None:
             logger.error("Bot not initialized, cannot send alert")
             return
 
@@ -363,7 +384,7 @@ async def send_spread_alert(spread_info, user_id: int):
             )
 
         # Явно конвертируем user_id в int
-        await _bot.send_message(chat_id=int(user_id), text=text, parse_mode=ParseMode.HTML)
+        await bot.send_message(chat_id=int(user_id), text=text, parse_mode=ParseMode.HTML)
 
     except Exception as e:
         logger.error(f"Error sending alert to user {user_id}: {e}")
@@ -456,16 +477,28 @@ async def toggle_exchange(callback: CallbackQuery, user: UserSettings, state: FS
     """Подключить/отключить биржу"""
     exchange_id = callback.data.split(":")[2]
 
+    # BUG 32 FIX: Ensure selected_exchanges is initialized and properly saved to DB
     if user.selected_exchanges is None:
         user.selected_exchanges = []
 
     if exchange_id in user.selected_exchanges:
         user.selected_exchanges.remove(exchange_id)
+        logger.info(f"Exchange {exchange_id} disabled for user {user.user_id}")
     else:
         user.selected_exchanges.append(exchange_id)
+        logger.info(f"Exchange {exchange_id} enabled for user {user.user_id}")
 
+    # Save to database if available
     if db:
-        await db.update_user(user)
+        try:
+            # BUG 32 FIX: Ensure selected_exchanges is properly saved to DB
+            # The db.update_user method must handle selected_exchanges field
+            await db.update_user(user)
+            logger.info(f"User {user.user_id} exchanges updated in DB: {user.selected_exchanges}")
+        except Exception as e:
+            logger.error(f"Failed to update user exchanges in DB: {e}")
+            await callback.answer("❌ Ошибка сохранения", show_alert=True)
+            return
 
     # ИСПРАВЛЕНО: Передаем state в show_exchanges
     await show_exchanges(callback, user, state)
@@ -495,7 +528,8 @@ async def start_api_input(callback: CallbackQuery, state: FSMContext):
         await callback.answer("❌ Неверная биржа", show_alert=True)
         return
 
-    await state.update_data(exchange_id=exchange_id, step='api_key')
+    # BUG 31 FIX: Use consistent key name 'current_exchange' to match states.py handler
+    await state.update_data(current_exchange=exchange_id, step='api_key')
     # ИСПРАВЛЕНО: SetupStates вместо BotStates
     await state.set_state(SetupStates.waiting_for_api_key)
 

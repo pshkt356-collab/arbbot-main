@@ -14,6 +14,17 @@ from config import settings
 
 logger = logging.getLogger(__name__)
 
+# BUG 11 FIX: Configurable minimum volume constant
+MIN_VOLUME_THRESHOLD = getattr(settings, 'min_volume_threshold', 100000)
+
+# BUG 9 FIX: Graceful shutdown constants
+SHUTDOWN_TIMEOUT_SECONDS = 10.0  # Increased from 3.0 for proper WebSocket close handshake
+WS_CLOSE_TIMEOUT = 5.0
+
+# BUG 28 FIX: HTTP retry constants
+HTTP_MAX_RETRIES = 3
+HTTP_BASE_RETRY_DELAY = 1.0
+
 class ArbitrageType(Enum):
     INTER_EXCHANGE_FUTURES = "inter_exchange_futures"
     BASIS_SPOT_FUTURES = "basis_spot_futures"
@@ -170,6 +181,10 @@ class SpreadScanner:
         # Exponential backoff
         self._reconnect_attempts: Dict[str, int] = {}
         self._max_reconnect_delay = 60
+        
+        # BUG 17 FIX: Track pending trades to prevent duplicates
+        self._pending_trades: Set[str] = set()
+        self._pending_trades_lock = asyncio.Lock()
 
     def set_user_threshold(self, user_id: int, threshold: float, for_basis: bool = False):
         if for_basis:
@@ -338,59 +353,85 @@ class SpreadScanner:
                 if alert.hours_to_funding > max_hours:
                     return
 
-            db = Database(settings.db_file)
-            await db.initialize()
+            # BUG 17 FIX: Check for pending trades to prevent duplicates
+            trade_key = f"{alert.symbol}:{alert.buy_exchange}:{alert.sell_exchange}"
+            async with self._pending_trades_lock:
+                if trade_key in self._pending_trades:
+                    logger.debug(f"Trade already pending for {trade_key}, skipping")
+                    return
+                self._pending_trades.add(trade_key)
             
             try:
-                # Получаем всех пользователей с включенным авто-трейдингом
-                all_users = await db.get_all_users()
+                db = Database(settings.db_file)
+                await db.initialize()
                 
-                for user in all_users:
-                    # Проверяем включен ли авто-трейдинг для пользователя
-                    if not user.alert_settings.get('auto_trading', False):
-                        continue
+                try:
+                    # Получаем всех пользователей с включенным авто-трейдингом
+                    all_users = await db.get_all_users()
                     
-                    # Проверяем есть ли API ключи для обеих бирж
-                    has_buy = alert.buy_exchange in user.api_keys and user.api_keys[alert.buy_exchange].get('api_key')
-                    has_sell = alert.sell_exchange in user.api_keys and user.api_keys[alert.sell_exchange].get('api_key')
-                    
-                    if not has_buy or not has_sell:
-                        continue
-                    
-                    # Проверяем лимит позиций
-                    open_trades = await db.get_open_trades(user.user_id)
-                    max_positions = user.risk_settings.get('max_open_positions', 5)
-                    
-                    if len(open_trades) >= max_positions:
-                        continue
-                    
-                    # Проверяем минимальный спред для авто-трейдинга
-                    min_spread = user.alert_settings.get('min_spread_auto', settings.min_spread_auto)
-                    if alert.spread_percent < min_spread:
-                        continue
-                    
-                    key = f"{alert.symbol}:{alert.buy_exchange}:{alert.sell_exchange}"
-                    result = await trading_engine.validate_and_open(
-                        user, key, self.prices, auto=True, 
-                        available_exchanges={'buy': has_buy, 'sell': has_sell}
-                    )
-                    
-                    if result.success:
-                        logger.info(f"Auto-trade opened for user {user.user_id}: {alert.symbol} #{result.trade_id}")
+                    for user in all_users:
+                        # Проверяем включен ли авто-трейдинг для пользователя
+                        if not user.alert_settings.get('auto_trading', False):
+                            continue
                         
-                        # Отправляем уведомление пользователю
-                        if hasattr(self, '_bot') and self._bot:
-                            try:
-                                await self._bot.send_message(
-                                    chat_id=user.user_id,
-                                    text=f"🤖 Авто-сделка открыта: {alert.symbol}\n"
-                                         f"Спред: {alert.spread_percent:.2f}%\n"
-                                         f"ID: #{result.trade_id}"
-                                )
-                            except:
-                                pass
+                        # Проверяем есть ли API ключи для обеих бирж
+                        has_buy = alert.buy_exchange in user.api_keys and user.api_keys[alert.buy_exchange].get('api_key')
+                        has_sell = alert.sell_exchange in user.api_keys and user.api_keys[alert.sell_exchange].get('api_key')
+                        
+                        if not has_buy or not has_sell:
+                            continue
+                        
+                        # Проверяем лимит позиций
+                        open_trades = await db.get_open_trades(user.user_id)
+                        max_positions = user.risk_settings.get('max_open_positions', 5)
+                        
+                        if len(open_trades) >= max_positions:
+                            continue
+                        
+                        # BUG 6 FIX: Check balance before trading
+                        min_trade_amount = user.risk_settings.get('min_trade_amount', 10.0)
+                        try:
+                            # Get balance from trading engine
+                            buy_exchange = alert.buy_exchange.split(':')[0] if ':' in alert.buy_exchange else alert.buy_exchange
+                            balance = await trading_engine.get_balance(user, buy_exchange, 'USDT')
+                            if balance < min_trade_amount:
+                                logger.debug(f"Insufficient balance for user {user.user_id}: {balance} USDT < {min_trade_amount} USDT")
+                                continue
+                        except Exception as e:
+                            logger.warning(f"Could not check balance for user {user.user_id}: {e}")
+                            continue
+                        
+                        # Проверяем минимальный спред для авто-трейдинга
+                        min_spread = user.alert_settings.get('min_spread_auto', settings.min_spread_auto)
+                        if alert.spread_percent < min_spread:
+                            continue
+                        
+                        key = f"{alert.symbol}:{alert.buy_exchange}:{alert.sell_exchange}"
+                        result = await trading_engine.validate_and_open(
+                            user, key, self.prices, auto=True, 
+                            available_exchanges={'buy': has_buy, 'sell': has_sell}
+                        )
+                        
+                        if result.success:
+                            logger.info(f"Auto-trade opened for user {user.user_id}: {alert.symbol} #{result.trade_id}")
+                            
+                            # Отправляем уведомление пользователю
+                            if hasattr(self, '_bot') and self._bot:
+                                try:
+                                    await self._bot.send_message(
+                                        chat_id=user.user_id,
+                                        text=f"🤖 Авто-сделка открыта: {alert.symbol}\n"
+                                             f"Спред: {alert.spread_percent:.2f}%\n"
+                                             f"ID: #{result.trade_id}"
+                                    )
+                                except:
+                                    pass
+                finally:
+                    await db.close()
             finally:
-                await db.close()
+                # BUG 17 FIX: Remove from pending trades
+                async with self._pending_trades_lock:
+                    self._pending_trades.discard(trade_key)
         except Exception as e:
             logger.error(f"Auto trade error: {e}")
 
@@ -423,24 +464,36 @@ class SpreadScanner:
             await self.stop()
     
     async def stop(self):
+        """BUG 9 FIX: Graceful shutdown with proper WebSocket close handshake"""
         logger.info("Stopping spread scanner...")
         self.running = False
         self._shutdown_event.set()
         
-        # Отменяем все задачи
-        for task in self._tasks:
-            if not task.done():
-                task.cancel()
+        # First, signal all WebSocket connections to close gracefully
+        # by setting running=False which will break out of message loops
+        await asyncio.sleep(0.5)  # Give time for loops to notice running=False
         
-        # Ждем завершения с таймаутом
-        if self._tasks:
+        # Cancel all tasks gracefully
+        pending_tasks = [task for task in self._tasks if not task.done()]
+        if pending_tasks:
+            logger.info(f"Cancelling {len(pending_tasks)} pending tasks...")
+            for task in pending_tasks:
+                task.cancel()
+            
+            # Wait for tasks to complete with increased timeout
             try:
                 await asyncio.wait_for(
-                    asyncio.gather(*self._tasks, return_exceptions=True),
-                    timeout=3.0
+                    asyncio.gather(*pending_tasks, return_exceptions=True),
+                    timeout=SHUTDOWN_TIMEOUT_SECONDS
                 )
+                logger.info("All tasks cancelled gracefully")
             except asyncio.TimeoutError:
-                logger.warning("Scanner tasks stop timeout, some tasks may still be running")
+                logger.warning(f"Some tasks did not complete within {SHUTDOWN_TIMEOUT_SECONDS}s timeout")
+                # Force cancel remaining tasks
+                for task in pending_tasks:
+                    if not task.done():
+                        logger.warning(f"Force cancelling task: {task.get_name()}")
+                        task.cancel()
         
         logger.info("Spread scanner stopped")
     
@@ -489,6 +542,48 @@ class SpreadScanner:
                 else:
                     logger.info(f"📋 {ex.upper()}: {len(symbols)} pairs")
 
+    # BUG 28 FIX: Add exponential backoff for HTTP retries
+    async def _fetch_with_retry(self, session: aiohttp.ClientSession, url: str, exchange_name: str) -> Optional[dict]:
+        """Fetch data with exponential backoff retry logic"""
+        for attempt in range(HTTP_MAX_RETRIES):
+            try:
+                async with session.get(url, timeout=15) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+                    elif resp.status in [429, 503, 502, 504]:  # Rate limit or temporary errors
+                        if attempt < HTTP_MAX_RETRIES - 1:
+                            delay = HTTP_BASE_RETRY_DELAY * (2 ** attempt)
+                            logger.warning(f"{exchange_name} rate limited/temp error (status {resp.status}), retrying in {delay}s...")
+                            await asyncio.sleep(delay)
+                            continue
+                    raise Exception(f"HTTP {resp.status}")
+            except asyncio.TimeoutError:
+                if attempt < HTTP_MAX_RETRIES - 1:
+                    delay = HTTP_BASE_RETRY_DELAY * (2 ** attempt)
+                    logger.warning(f"{exchange_name} timeout, retrying in {delay}s...")
+                    await asyncio.sleep(delay)
+                else:
+                    raise
+            except Exception as e:
+                if attempt < HTTP_MAX_RETRIES - 1:
+                    delay = HTTP_BASE_RETRY_DELAY * (2 ** attempt)
+                    logger.warning(f"{exchange_name} error: {e}, retrying in {delay}s...")
+                    await asyncio.sleep(delay)
+                else:
+                    raise
+        return None
+
+    async def _fetch_binance_symbols(self, session: aiohttp.ClientSession):
+        try:
+            url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
+            data = await self._fetch_with_retry(session, url, "binance")
+            if data:
+                for s in data.get('symbols', []):
+                    if s.get('status') == 'TRADING' and s.get('quoteAsset') == 'USDT':
+                        self.exchange_symbols['binance'].add(s['baseAsset'])
+        except Exception as e:
+            raise e
+
     async def _binance_ws_futures(self):
         uri = "wss://fstream.binance.com/stream?streams=!ticker@arr/!markPrice@arr"
         conn_key = "binance_futures"
@@ -503,6 +598,11 @@ class SpreadScanner:
                     try:
                         async for msg in ws:
                             if not self.running:
+                                # BUG 9 FIX: Allow proper close handshake
+                                try:
+                                    await asyncio.wait_for(ws.close(), timeout=WS_CLOSE_TIMEOUT)
+                                except asyncio.TimeoutError:
+                                    pass
                                 break
 
                             try:
@@ -541,6 +641,11 @@ class SpreadScanner:
                     try:
                         async for msg in ws:
                             if not self.running:
+                                # BUG 9 FIX: Allow proper close handshake
+                                try:
+                                    await asyncio.wait_for(ws.close(), timeout=WS_CLOSE_TIMEOUT)
+                                except asyncio.TimeoutError:
+                                    pass
                                 break
                             try:
                                 data = json.loads(msg)
@@ -610,19 +715,6 @@ class SpreadScanner:
             except (KeyError, ValueError):
                 continue
 
-    async def _fetch_binance_symbols(self, session: aiohttp.ClientSession):
-        try:
-            url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
-            async with session.get(url, timeout=15) as resp:
-                if resp.status != 200:
-                    raise Exception(f"Status {resp.status}")
-                data = await resp.json()
-                for s in data.get('symbols', []):
-                    if s.get('status') == 'TRADING' and s.get('quoteAsset') == 'USDT':
-                        self.exchange_symbols['binance'].add(s['baseAsset'])
-        except Exception as e:
-            raise e
-
     async def _bybit_ws_futures(self):
         uri = "wss://stream.bybit.com/v5/public/linear"
         conn_key = "bybit_futures"
@@ -661,6 +753,11 @@ class SpreadScanner:
                     try:
                         async for msg in ws:
                             if not self.running:
+                                # BUG 9 FIX: Allow proper close handshake
+                                try:
+                                    await asyncio.wait_for(ws.close(), timeout=WS_CLOSE_TIMEOUT)
+                                except asyncio.TimeoutError:
+                                    pass
                                 break
 
                             try:
@@ -710,6 +807,11 @@ class SpreadScanner:
                     try:
                         async for msg in ws:
                             if not self.running:
+                                # BUG 9 FIX: Allow proper close handshake
+                                try:
+                                    await asyncio.wait_for(ws.close(), timeout=WS_CLOSE_TIMEOUT)
+                                except asyncio.TimeoutError:
+                                    pass
                                 break
 
                             try:
@@ -774,10 +876,8 @@ class SpreadScanner:
     async def _fetch_bybit_symbols(self, session: aiohttp.ClientSession):
         try:
             url = "https://api.bybit.com/v5/market/instruments-info?category=linear"
-            async with session.get(url, timeout=15) as resp:
-                if resp.status != 200:
-                    raise Exception(f"Status {resp.status}")
-                data = await resp.json()
+            data = await self._fetch_with_retry(session, url, "bybit")
+            if data:
                 for item in data.get('result', {}).get('list', []):
                     if item.get('status') == 'Trading' and item.get('quoteCoin') == 'USDT':
                         self.exchange_symbols['bybit'].add(item['baseCoin'])
@@ -815,6 +915,11 @@ class SpreadScanner:
                     try:
                         async for msg in ws:
                             if not self.running:
+                                # BUG 9 FIX: Allow proper close handshake
+                                try:
+                                    await asyncio.wait_for(ws.close(), timeout=WS_CLOSE_TIMEOUT)
+                                except asyncio.TimeoutError:
+                                    pass
                                 break
 
                             try:
@@ -863,6 +968,11 @@ class SpreadScanner:
                     try:
                         async for msg in ws:
                             if not self.running:
+                                # BUG 9 FIX: Allow proper close handshake
+                                try:
+                                    await asyncio.wait_for(ws.close(), timeout=WS_CLOSE_TIMEOUT)
+                                except asyncio.TimeoutError:
+                                    pass
                                 break
 
                             try:
@@ -932,8 +1042,8 @@ class SpreadScanner:
     async def _fetch_okx_symbols(self, session: aiohttp.ClientSession):
         try:
             url = "https://www.okx.com/api/v5/public/instruments?instType=SWAP"
-            async with session.get(url, timeout=15) as resp:
-                data = await resp.json()
+            data = await self._fetch_with_retry(session, url, "okx")
+            if data:
                 for item in data.get('data', []):
                     if item.get('state') == 'live' and item.get('settleCcy') == 'USDT':
                         self.exchange_symbols['okx'].add(item['instId'].split('-')[0])
@@ -971,6 +1081,16 @@ class SpreadScanner:
                     try:
                         async for msg in ws:
                             if not self.running:
+                                # BUG 9 FIX: Allow proper close handshake
+                                ping_task.cancel()
+                                try:
+                                    await asyncio.wait_for(ping_task, timeout=1.0)
+                                except asyncio.TimeoutError:
+                                    pass
+                                try:
+                                    await asyncio.wait_for(ws.close(), timeout=WS_CLOSE_TIMEOUT)
+                                except asyncio.TimeoutError:
+                                    pass
                                 break
 
                             try:
@@ -1050,12 +1170,11 @@ class SpreadScanner:
     async def _fetch_whitebit_symbols(self, session: aiohttp.ClientSession):
         try:
             url = "https://whitebit.com/api/v4/public/markets"
-            async with session.get(url, timeout=15) as resp:
-                data = await resp.json()
-                if isinstance(data, dict):
-                    for market in data.keys():
-                        if isinstance(market, str) and market.endswith('_USDT'):
-                            self.exchange_symbols['whitebit'].add(market.replace('_USDT', '').replace('_', ''))
+            data = await self._fetch_with_retry(session, url, "whitebit")
+            if data and isinstance(data, dict):
+                for market in data.keys():
+                    if isinstance(market, str) and market.endswith('_USDT'):
+                        self.exchange_symbols['whitebit'].add(market.replace('_USDT', '').replace('_', ''))
         except Exception as e:
             raise e
 
@@ -1090,6 +1209,11 @@ class SpreadScanner:
                     try:
                         async for msg in ws:
                             if not self.running:
+                                # BUG 9 FIX: Allow proper close handshake
+                                try:
+                                    await asyncio.wait_for(ws.close(), timeout=WS_CLOSE_TIMEOUT)
+                                except asyncio.TimeoutError:
+                                    pass
                                 break
 
                             try:
@@ -1167,8 +1291,8 @@ class SpreadScanner:
     async def _fetch_mexc_symbols(self, session: aiohttp.ClientSession):
         try:
             url = "https://contract.mexc.com/api/v1/contract/detail"
-            async with session.get(url, timeout=15) as resp:
-                data = await resp.json()
+            data = await self._fetch_with_retry(session, url, "mexc")
+            if data:
                 for item in data.get('data', []):
                     if item.get('quoteCoin') == 'USDT':
                         self.exchange_symbols['mexc'].add(item['baseCoin'])
@@ -1270,7 +1394,8 @@ class SpreadScanner:
                 spot_vol = spot_pd.volume_24h if spot_pd.volume_24h > 0 else 10000000
                 fut_vol = fut_pd.volume_24h if fut_pd.volume_24h > 0 else 10000000
 
-                if spot_vol < 100000 or fut_vol < 100000:
+                # BUG 11 FIX: Use configurable constant instead of magic number
+                if spot_vol < MIN_VOLUME_THRESHOLD or fut_vol < MIN_VOLUME_THRESHOLD:
                     continue
 
                 now_dt = datetime.now()
@@ -1345,7 +1470,8 @@ class SpreadScanner:
                     spot_vol = spot_pd.volume_24h if spot_pd.volume_24h > 0 else 10000000
                     fut_vol = fut_pd.volume_24h if fut_pd.volume_24h > 0 else 10000000
 
-                    if spot_vol < 100000 or fut_vol < 100000:
+                    # BUG 11 FIX: Use configurable constant instead of magic number
+                    if spot_vol < MIN_VOLUME_THRESHOLD or fut_vol < MIN_VOLUME_THRESHOLD:
                         continue
 
                     now = datetime.now()
@@ -1425,7 +1551,8 @@ class SpreadScanner:
         price_spread = abs(long_pd.effective_price - short_pd.effective_price) / min(long_pd.effective_price, short_pd.effective_price) * 100
 
         min_vol = min(long_pd.volume_24h, short_pd.volume_24h)
-        if min_vol < 100000:
+        # BUG 11 FIX: Use configurable constant instead of magic number
+        if min_vol < MIN_VOLUME_THRESHOLD:
             return
 
         now = datetime.now()
@@ -1506,7 +1633,8 @@ class SpreadScanner:
         buy_vol = buy_pd.volume_24h if buy_pd.volume_24h > 0 else 10000000
         sell_vol = sell_pd.volume_24h if sell_pd.volume_24h > 0 else 10000000
 
-        if buy_vol < 100000 or sell_vol < 100000:
+        # BUG 11 FIX: Use configurable constant instead of magic number
+        if buy_vol < MIN_VOLUME_THRESHOLD or sell_vol < MIN_VOLUME_THRESHOLD:
             return
 
         now = datetime.now()
