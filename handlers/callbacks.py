@@ -202,7 +202,7 @@ async def show_alert_settings(callback: CallbackQuery, user: UserSettings):
     thresholds = [0.1, 0.2, 0.5, 1.0, 2.0, 5.0]
     row = []
     for th in thresholds:
-        mark = "✅" if abs(user.min_spread_threshold - th) < 0.01 else ""
+        mark = "✅" if abs(user.min_spread_threshold - th) < 0.05 else ""
         row.append(InlineKeyboardButton(
             text=f"{mark} {th:.1f}%",
             callback_data=f"alerts:threshold:{th}"
@@ -534,18 +534,74 @@ async def start_api_input(callback: CallbackQuery, state: FSMContext):
         reply_markup=InlineKeyboardBuilder().button(text="❌ Отмена", callback_data="menu:main").as_markup()
     )
 
+# ==================== ИСПРАВЛЕННАЯ ФУНКЦИЯ БАЛАНСА ====================
+# ИСПРАВЛЕНО: Теперь баланс обновляется с реальных бирж через API
 @callbacks_router.callback_query(F.data == "profile:balance")
-async def show_balance(callback: CallbackQuery, user: UserSettings):
-    """Показать баланс"""
-    await callback.answer()
+async def show_balance(callback: CallbackQuery, user: UserSettings, db: Database = None):
+    """Показать баланс - с обновлением с бирж"""
+    await callback.answer("⏳ Обновляю баланс...")
 
+    # Пробуем получить реальные балансы с подключенных бирж
+    total_balance = 0.0
+    available_balance = 0.0
+    locked_balance = 0.0
+    exchange_balances = []
+
+    if user.api_keys:
+        for exchange_id, api_data in user.api_keys.items():
+            if not api_data.get('api_key'):
+                continue
+            try:
+                result = await trading_engine.test_api_connection(
+                    exchange_id,
+                    api_data['api_key'],
+                    api_data.get('api_secret', ''),
+                    api_data.get('testnet', True)
+                )
+                if result.get('success'):
+                    bal = result.get('balance_usdt', 0)
+                    total_balance += bal
+                    available_balance += bal
+                    exchange_balances.append((exchange_id, bal))
+                    # Кешируем баланс в пользователе
+                    user.update_exchange_balance(exchange_id, total=bal, free=bal, used=0)
+                else:
+                    exchange_balances.append((exchange_id, None))
+            except Exception as e:
+                logger.warning(f"Balance fetch error for {exchange_id}: {e}")
+                exchange_balances.append((exchange_id, None))
+
+    # Если не удалось получить с бирж, используем кешированные значения
+    if total_balance == 0 and hasattr(user, '_cached_balances') and user._cached_balances:
+        total_balance = sum(b.get('total', 0) for b in user._cached_balances.values() if isinstance(b, dict))
+        available_balance = sum(b.get('free', 0) for b in user._cached_balances.values() if isinstance(b, dict))
+        locked_balance = sum(b.get('used', 0) for b in user._cached_balances.values() if isinstance(b, dict))
+
+    # Сохраняем обновленные балансы в БД
+    if db:
+        try:
+            await db.update_user(user)
+        except Exception as e:
+            logger.warning(f"Failed to save balances to DB: {e}")
+
+    # Формируем текст
     text = (
         f"**💰 Баланс**\n\n"
-        f"📊 **Общий:** {user.total_balance:.2f} USDT\n"
-        f"💵 **Доступно:** {user.available_balance:.2f} USDT\n"
-        f"🔒 **В ордерах:** {user.locked_balance:.2f} USDT\n\n"
-        f"_(Обновляется автоматически при торговле.)_"
+        f"📊 **Общий:** {total_balance:.2f} USDT\n"
+        f"💵 **Доступно:** {available_balance:.2f} USDT\n"
+        f"🔒 **В ордерах:** {locked_balance:.2f} USDT\n\n"
     )
+
+    if exchange_balances:
+        text += "**По биржам:**\n"
+        for ex, bal in exchange_balances:
+            if bal is not None:
+                text += f"• {ex.upper()}: {bal:.2f} USDT\n"
+            else:
+                text += f"• {ex.upper()}: ❌ ошибка подключения\n"
+    else:
+        text += "_Нет подключенных бирж с API ключами._\n"
+        text += "Добавьте API ключи в Профиль → Мои биржи."
 
     builder = InlineKeyboardBuilder()
     builder.row(
@@ -554,6 +610,8 @@ async def show_balance(callback: CallbackQuery, user: UserSettings):
     )
 
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
+
+# ==================== END ИСПРАВЛЕННАЯ ФУНКЦИЯ БАЛАНСА ====================
 
 @callbacks_router.callback_query(F.data == "profile:stats")
 async def show_stats(callback: CallbackQuery, user: UserSettings):

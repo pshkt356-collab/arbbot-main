@@ -2,6 +2,7 @@ import logging
 from typing import Callable, Dict, Any, Awaitable
 from aiogram import BaseMiddleware
 from aiogram.types import TelegramObject, Message, CallbackQuery
+from aiogram.exceptions import TelegramBadRequest
 from database.models import Database, UserSettings
 
 logger = logging.getLogger(__name__)
@@ -40,11 +41,11 @@ class UserContextMiddleware(BaseMiddleware):
             db = self._db
             if db is None:
                 db = Database()
-            
+
             # Проверяем что db не None и инициализируем если нужно
             if db is None:
                 raise Exception("Failed to create Database instance")
-                
+
             if not db._initialized:
                 await db.initialize()
 
@@ -69,6 +70,34 @@ class UserContextMiddleware(BaseMiddleware):
         try:
             # Вызываем хендлер
             return await handler(event, data)
+        except TelegramBadRequest as e:
+            # Обрабатываем "message is not modified" как не-критическую ошибку
+            error_msg = str(e).lower()
+            if "message is not modified" in error_msg or "message_not_modified" in error_msg:
+                logger.debug(f"Message not modified for user {user_id}: {e}")
+                # Не показываем ошибку пользователю, просто подтверждаем callback
+                if isinstance(event, CallbackQuery):
+                    try:
+                        await event.answer()
+                    except Exception:
+                        pass
+                return None
+            elif "exactly the same" in error_msg:
+                logger.debug(f"Message content unchanged for user {user_id}: {e}")
+                if isinstance(event, CallbackQuery):
+                    try:
+                        await event.answer()
+                    except Exception:
+                        pass
+                return None
+            else:
+                # Другие Telegram ошибки - логируем и отправляем пользователю
+                logger.error(f"Telegram error for user {user_id}: {e}")
+                if isinstance(event, Message):
+                    await event.answer("❌ Произошла ошибка. Попробуйте /start")
+                elif isinstance(event, CallbackQuery):
+                    await event.answer("Ошибка обработки", show_alert=True)
+                raise
         except Exception as e:
             logger.error(f"Handler error: {e}", exc_info=True)
             # Если это сообщение или callback, отправляем ошибку пользователю

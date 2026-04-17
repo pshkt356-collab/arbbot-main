@@ -77,20 +77,48 @@ class UserSettings:
         if self.updated_at is None:
             self.updated_at = datetime.now().isoformat()
 
+    # Internal storage for cached exchange balances
+    _cached_balances: dict = field(default_factory=dict, repr=False)
+
     @property
     def total_balance(self) -> float:
-        """Общий баланс (заглушка - нужно интегрировать с реальными данными)"""
+        """Общий баланс: сумма всех кешированных балансов бирж"""
+        if hasattr(self, '_cached_balances') and self._cached_balances:
+            return sum(
+                bal.get('total', 0) 
+                for bal in self._cached_balances.values() 
+                if isinstance(bal, dict)
+            )
+        # Fallback to legacy storage in risk_settings
         return self.risk_settings.get('total_balance', 0.0)
     
     @property
     def available_balance(self) -> float:
-        """Доступный баланс (заглушка - нужно интегрировать с реальными данными)"""
+        """Доступный баланс: сумма доступных средств на всех биржах"""
+        if hasattr(self, '_cached_balances') and self._cached_balances:
+            return sum(
+                bal.get('free', 0) 
+                for bal in self._cached_balances.values() 
+                if isinstance(bal, dict)
+            )
         return self.risk_settings.get('available_balance', 0.0)
     
     @property
     def locked_balance(self) -> float:
-        """Заблокированный баланс (заглушка - нужно интегрировать с реальными данными)"""
+        """Заблокированный баланс: сумма средств в ордерах"""
+        if hasattr(self, '_cached_balances') and self._cached_balances:
+            return sum(
+                bal.get('used', 0) 
+                for bal in self._cached_balances.values() 
+                if isinstance(bal, dict)
+            )
         return self.risk_settings.get('locked_balance', 0.0)
+
+    def update_exchange_balance(self, exchange_id: str, total: float = 0, free: float = 0, used: float = 0):
+        """Обновить баланс конкретной биржи"""
+        if not hasattr(self, '_cached_balances'):
+            self._cached_balances = {}
+        self._cached_balances[exchange_id] = {'total': total, 'free': free, 'used': used}
 
 @dataclass
 class Trade:
@@ -158,6 +186,7 @@ class Database:
                 await self._create_tables()
                 await self._migrate_add_arbitrage_mode()
                 await self._migrate_add_selected_exchanges()
+                await self._migrate_add_user_settings_columns()
                 self._initialized = True
                 logger.info(f"Database initialized: {self._db_path} (WAL mode)")
             except Exception as e:
@@ -194,6 +223,33 @@ class Database:
         except Exception as e:
             logger.error(f"Migration error for selected_exchanges: {e}")
 
+    async def _migrate_add_user_settings_columns(self):
+        """Migration: add columns for extended user settings"""
+        new_columns = [
+            ('min_spread_threshold', 'REAL DEFAULT 0.2'),
+            ('alerts_enabled', 'BOOLEAN DEFAULT 1'),
+            ('inter_exchange_enabled', 'BOOLEAN DEFAULT 1'),
+            ('basis_arbitrage_enabled', 'BOOLEAN DEFAULT 1'),
+            ('auto_trade_mode', 'BOOLEAN DEFAULT 0'),
+            ('trade_amount', 'REAL DEFAULT 100.0'),
+            ('leverage', 'INTEGER DEFAULT 3'),
+            ('notifications_enabled', 'BOOLEAN DEFAULT 1'),
+            ('total_trades', 'INTEGER DEFAULT 0'),
+            ('successful_trades', 'INTEGER DEFAULT 0'),
+            ('failed_trades', 'INTEGER DEFAULT 0'),
+            ('total_profit', 'REAL DEFAULT 0.0'),
+        ]
+        try:
+            async with self._conn.execute("PRAGMA table_info(users)") as cursor:
+                columns = [row['name'] for row in await cursor.fetchall()]
+            for col_name, col_type in new_columns:
+                if col_name not in columns:
+                    await self._conn.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_type}")
+                    await self._conn.commit()
+                    logger.info(f"Migration: added {col_name} column")
+        except Exception as e:
+            logger.error(f"Migration error for user settings columns: {e}")
+
     async def close(self):
         """Закрытие соединения с БД"""
         async with self._init_lock:
@@ -220,6 +276,18 @@ class Database:
                     risk_settings TEXT DEFAULT '{}',
                     arbitrage_mode TEXT DEFAULT 'all',
                     selected_exchanges TEXT DEFAULT '["binance", "bybit", "okx", "whitebit", "mexc"]',
+                    min_spread_threshold REAL DEFAULT 0.2,
+                    alerts_enabled BOOLEAN DEFAULT 1,
+                    inter_exchange_enabled BOOLEAN DEFAULT 1,
+                    basis_arbitrage_enabled BOOLEAN DEFAULT 1,
+                    auto_trade_mode BOOLEAN DEFAULT 0,
+                    trade_amount REAL DEFAULT 100.0,
+                    leverage INTEGER DEFAULT 3,
+                    notifications_enabled BOOLEAN DEFAULT 1,
+                    total_trades INTEGER DEFAULT 0,
+                    successful_trades INTEGER DEFAULT 0,
+                    failed_trades INTEGER DEFAULT 0,
+                    total_profit REAL DEFAULT 0.0,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
@@ -282,6 +350,18 @@ class Database:
                     risk_settings=json.loads(row['risk_settings']),
                     arbitrage_mode=row['arbitrage_mode'] if row['arbitrage_mode'] else 'all',
                     selected_exchanges=selected_exchanges,
+                    min_spread_threshold=row['min_spread_threshold'] if row['min_spread_threshold'] is not None else 0.2,
+                    alerts_enabled=bool(row['alerts_enabled']) if row['alerts_enabled'] is not None else True,
+                    inter_exchange_enabled=bool(row['inter_exchange_enabled']) if row['inter_exchange_enabled'] is not None else True,
+                    basis_arbitrage_enabled=bool(row['basis_arbitrage_enabled']) if row['basis_arbitrage_enabled'] is not None else True,
+                    auto_trade_mode=bool(row['auto_trade_mode']) if row['auto_trade_mode'] is not None else False,
+                    trade_amount=row['trade_amount'] if row['trade_amount'] is not None else 100.0,
+                    leverage=row['leverage'] if row['leverage'] is not None else 3,
+                    notifications_enabled=bool(row['notifications_enabled']) if row['notifications_enabled'] is not None else True,
+                    total_trades=row['total_trades'] if row['total_trades'] is not None else 0,
+                    successful_trades=row['successful_trades'] if row['successful_trades'] is not None else 0,
+                    failed_trades=row['failed_trades'] if row['failed_trades'] is not None else 0,
+                    total_profit=row['total_profit'] if row['total_profit'] is not None else 0.0,
                     created_at=row['created_at'],
                     updated_at=row['updated_at']
                 )
@@ -296,8 +376,11 @@ class Database:
         async with self._query_lock:
             try:
                 await self._conn.execute("""
-                    INSERT INTO users (user_id, api_keys, commission_rates, alert_settings, risk_settings, arbitrage_mode, selected_exchanges)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO users (user_id, api_keys, commission_rates, alert_settings, risk_settings, arbitrage_mode, selected_exchanges,
+                        min_spread_threshold, alerts_enabled, inter_exchange_enabled, basis_arbitrage_enabled,
+                        auto_trade_mode, trade_amount, leverage, notifications_enabled,
+                        total_trades, successful_trades, failed_trades, total_profit)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     user_id,
                     json.dumps(user.api_keys),
@@ -305,7 +388,19 @@ class Database:
                     json.dumps(user.alert_settings),
                     json.dumps(user.risk_settings),
                     user.arbitrage_mode,
-                    json.dumps(user.selected_exchanges)
+                    json.dumps(user.selected_exchanges),
+                    user.min_spread_threshold,
+                    int(user.alerts_enabled),
+                    int(user.inter_exchange_enabled),
+                    int(user.basis_arbitrage_enabled),
+                    int(user.auto_trade_mode),
+                    user.trade_amount,
+                    user.leverage,
+                    int(user.notifications_enabled),
+                    user.total_trades,
+                    user.successful_trades,
+                    user.failed_trades,
+                    user.total_profit
                 ))
                 await self._conn.commit()
                 logger.info(f"Created new user {user_id}")
@@ -337,6 +432,18 @@ class Database:
                         risk_settings=json.loads(row['risk_settings']),
                         arbitrage_mode=row['arbitrage_mode'] if row['arbitrage_mode'] else 'all',
                         selected_exchanges=selected_exchanges,
+                        min_spread_threshold=row['min_spread_threshold'] if row['min_spread_threshold'] is not None else 0.2,
+                        alerts_enabled=bool(row['alerts_enabled']) if row['alerts_enabled'] is not None else True,
+                        inter_exchange_enabled=bool(row['inter_exchange_enabled']) if row['inter_exchange_enabled'] is not None else True,
+                        basis_arbitrage_enabled=bool(row['basis_arbitrage_enabled']) if row['basis_arbitrage_enabled'] is not None else True,
+                        auto_trade_mode=bool(row['auto_trade_mode']) if row['auto_trade_mode'] is not None else False,
+                        trade_amount=row['trade_amount'] if row['trade_amount'] is not None else 100.0,
+                        leverage=row['leverage'] if row['leverage'] is not None else 3,
+                        notifications_enabled=bool(row['notifications_enabled']) if row['notifications_enabled'] is not None else True,
+                        total_trades=row['total_trades'] if row['total_trades'] is not None else 0,
+                        successful_trades=row['successful_trades'] if row['successful_trades'] is not None else 0,
+                        failed_trades=row['failed_trades'] if row['failed_trades'] is not None else 0,
+                        total_profit=row['total_profit'] if row['total_profit'] is not None else 0.0,
                         created_at=row['created_at'],
                         updated_at=row['updated_at']
                     ))
@@ -353,6 +460,18 @@ class Database:
                     risk_settings = ?,
                     arbitrage_mode = ?,
                     selected_exchanges = ?,
+                    min_spread_threshold = ?,
+                    alerts_enabled = ?,
+                    inter_exchange_enabled = ?,
+                    basis_arbitrage_enabled = ?,
+                    auto_trade_mode = ?,
+                    trade_amount = ?,
+                    leverage = ?,
+                    notifications_enabled = ?,
+                    total_trades = ?,
+                    successful_trades = ?,
+                    failed_trades = ?,
+                    total_profit = ?,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE user_id = ?
             """, (
@@ -363,6 +482,18 @@ class Database:
                 json.dumps(user.risk_settings),
                 getattr(user, 'arbitrage_mode', 'all'),
                 json.dumps(getattr(user, 'selected_exchanges', ['binance', 'bybit', 'okx', 'whitebit', 'mexc'])),
+                getattr(user, 'min_spread_threshold', 0.2),
+                int(getattr(user, 'alerts_enabled', True)),
+                int(getattr(user, 'inter_exchange_enabled', True)),
+                int(getattr(user, 'basis_arbitrage_enabled', True)),
+                int(getattr(user, 'auto_trade_mode', False)),
+                getattr(user, 'trade_amount', 100.0),
+                getattr(user, 'leverage', 3),
+                int(getattr(user, 'notifications_enabled', True)),
+                getattr(user, 'total_trades', 0),
+                getattr(user, 'successful_trades', 0),
+                getattr(user, 'failed_trades', 0),
+                getattr(user, 'total_profit', 0.0),
                 user.user_id
             ))
             await self._conn.commit()
