@@ -44,7 +44,8 @@ class JSONFileStorage(BaseStorage):
                     with open(file_path, 'r', encoding='utf-8') as f:
                         data = json.load(f)
                         key = file_path.stem.replace("_", ":")
-                        if 'state' in data:
+                        # state can be a string or None
+                        if 'state' in data and data['state'] is not None:
                             self._states[key] = data['state']
                         if 'data' in data:
                             self._data[key] = data['data']
@@ -59,7 +60,7 @@ class JSONFileStorage(BaseStorage):
         try:
             file_path = self._get_state_file(key)
             data = {
-                'state': self._states.get(key, {}),
+                'state': self._states.get(key),
                 'data': self._data.get(key, {})
             }
             with open(file_path, 'w', encoding='utf-8') as f:
@@ -84,10 +85,8 @@ class JSONFileStorage(BaseStorage):
         if state is None:
             self._states.pop(str_key, None)
         else:
-            self._states[str_key] = {
-                'state': state.state,
-                'group': state.group
-            }
+            # Store only the state string, not the State object (which contains non-serializable group)
+            self._states[str_key] = state.state
         
         self._save(str_key)
     
@@ -95,8 +94,7 @@ class JSONFileStorage(BaseStorage):
         """Get state for a key"""
         self._load_all()
         str_key = self._get_key(key)
-        state_data = self._states.get(str_key, {})
-        return state_data.get('state') if state_data else None
+        return self._states.get(str_key)
     
     async def set_data(self, key: StorageKey, data: Dict[str, Any]) -> None:
         """Set data for a key"""
