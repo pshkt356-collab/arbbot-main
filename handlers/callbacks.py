@@ -8,6 +8,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.filters import StateFilter
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramForbiddenError
 import logging
 import html
 import threading
@@ -27,6 +28,7 @@ callbacks_router = Router()
 _bot = None
 _bot_lock = threading.Lock()
 _bot_initialized = False
+_blocked_users_cache = set()  # Кэш ID пользователей, заблокировавших бота
 
 def set_bot(bot_instance):
     """Установка бота для отправки сообщений"""
@@ -298,6 +300,16 @@ async def subscribe_user_to_alerts(user_id: int, scanner, db: Database = None):
     if not scanner:
         return
 
+    # Проверяем, не заблокировал ли пользователь бота
+    if db:
+        try:
+            user = await db.get_user(user_id)
+            if user and user.bot_blocked:
+                logger.info(f"User {user_id} blocked the bot, skipping subscription")
+                return
+        except Exception:
+            pass
+
     existing = [s for s in scanner.subscribers if isinstance(s, tuple) and s[1] == user_id]
     if existing:
         return
@@ -318,13 +330,49 @@ async def subscribe_user_to_alerts(user_id: int, scanner, db: Database = None):
     logger.info(f"User {user_id} subscribed to spread alerts")
 
 # ИСПРАВЛЕНО: Убран неработающий from bot import bot, используем _bot
+
+async def _mark_user_blocked(user_id: int):
+    """Пометить пользователя как заблокировавшего бота и отписать от алертов"""
+    global _blocked_users_cache
+    _blocked_users_cache.add(user_id)
+
+    try:
+        from services.spread_scanner import spread_scanner
+        if spread_scanner:
+            spread_scanner.unsubscribe(user_id)
+            spread_scanner._blocked_subscribers.add(user_id)
+            logger.info(f"User {user_id} unsubscribed from alerts due to bot block")
+    except Exception:
+        pass
+
+    try:
+        db = Database()
+        await db.initialize()
+        try:
+            user = await db.get_user(user_id)
+            if user and not user.bot_blocked:
+                user.bot_blocked = True
+                await db.update_user(user)
+                logger.info(f"User {user_id} marked as bot_blocked in DB")
+        finally:
+            await db.close()
+    except Exception as e:
+        logger.warning(f"Failed to mark user {user_id} as blocked in DB: {e}")
+
+
 async def send_spread_alert(spread_info, user_id: int):
     """Отправка алерта пользователю
-    
+
     Args:
         spread_info: SpreadAlert объект или dict с информацией о спреде
         user_id: ID пользователя для отправки
     """
+    global _blocked_users_cache
+
+    # Пропускаем заблокированных пользователей (кэш)
+    if user_id in _blocked_users_cache:
+        return
+
     try:
         global _bot
         if _bot is None:
@@ -338,11 +386,11 @@ async def send_spread_alert(spread_info, user_id: int):
             spread = spread_info.spread_percent
             buy_ex = spread_info.buy_exchange
             sell_ex = spread_info.sell_exchange
-            
+
             # buy_price и sell_price - это PriceData объекты
             buy_px = spread_info.buy_price.last_price if spread_info.buy_price else 0
             sell_px = spread_info.sell_price.last_price if spread_info.sell_price else 0
-            
+
             # Определяем тип по arbitrage_type
             spread_type = 'basis' if 'basis' in str(spread_info.arbitrage_type).lower() else 'inter'
         else:
@@ -379,9 +427,23 @@ async def send_spread_alert(spread_info, user_id: int):
         # Явно конвертируем user_id в int
         await _bot.send_message(chat_id=int(user_id), text=text, parse_mode=ParseMode.HTML)
 
+    except TelegramForbiddenError as e:
+        # Пользователь заблокировал бота — помечаем и отписываем
+        error_msg = str(e).lower()
+        if "bot was blocked" in error_msg or "blocked" in error_msg:
+            logger.info(f"User {user_id} blocked the bot, marking and unsubscribing")
+            await _mark_user_blocked(user_id)
+        else:
+            logger.warning(f"Telegram forbidden for user {user_id}: {e}")
     except Exception as e:
-        logger.error(f"Error sending alert to user {user_id}: {e}")
-        
+        # Другие ошибки — проверяем на блокировку
+        error_msg = str(e).lower()
+        if "bot was blocked" in error_msg or "blocked by the user" in error_msg:
+            logger.info(f"User {user_id} blocked the bot, marking and unsubscribing")
+            await _mark_user_blocked(user_id)
+        else:
+            logger.error(f"Error sending alert to user {user_id}: {e}")
+
 @callbacks_router.callback_query(F.data == "alerts:list")
 async def show_user_alerts(callback: CallbackQuery, user: UserSettings):
     """Показать список алертов пользователя"""

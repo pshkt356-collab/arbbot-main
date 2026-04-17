@@ -67,7 +67,8 @@ class UserSettings:
     successful_trades: int = 0  # Успешных сделок
     failed_trades: int = 0  # Неудачных сделок
     total_profit: float = 0.0  # Общая прибыль
-    
+    bot_blocked: bool = False  # Пользователь заблокировал бота
+
     created_at: str = None
     updated_at: str = None
 
@@ -187,6 +188,7 @@ class Database:
                 await self._migrate_add_arbitrage_mode()
                 await self._migrate_add_selected_exchanges()
                 await self._migrate_add_user_settings_columns()
+                await self._migrate_add_bot_blocked_column()
                 self._initialized = True
                 logger.info(f"Database initialized: {self._db_path} (WAL mode)")
             except Exception as e:
@@ -250,6 +252,19 @@ class Database:
         except Exception as e:
             logger.error(f"Migration error for user settings columns: {e}")
 
+
+    async def _migrate_add_bot_blocked_column(self):
+        """Миграция: добавление колонки bot_blocked если её нет"""
+        try:
+            async with self._conn.execute("PRAGMA table_info(users)") as cursor:
+                columns = [row['name'] for row in await cursor.fetchall()]
+                if 'bot_blocked' not in columns:
+                    await self._conn.execute("ALTER TABLE users ADD COLUMN bot_blocked BOOLEAN DEFAULT 0")
+                    await self._conn.commit()
+                    logger.info("Migration: added bot_blocked column")
+        except Exception as e:
+            logger.error(f"Migration error for bot_blocked: {e}")
+
     async def close(self):
         """Закрытие соединения с БД"""
         async with self._init_lock:
@@ -288,6 +303,7 @@ class Database:
                     successful_trades INTEGER DEFAULT 0,
                     failed_trades INTEGER DEFAULT 0,
                     total_profit REAL DEFAULT 0.0,
+                    bot_blocked BOOLEAN DEFAULT 0,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
@@ -362,6 +378,7 @@ class Database:
                     successful_trades=row['successful_trades'] if row['successful_trades'] is not None else 0,
                     failed_trades=row['failed_trades'] if row['failed_trades'] is not None else 0,
                     total_profit=row['total_profit'] if row['total_profit'] is not None else 0.0,
+                    bot_blocked=bool(row['bot_blocked']) if row['bot_blocked'] is not None else False,
                     created_at=row['created_at'],
                     updated_at=row['updated_at']
                 )
@@ -379,8 +396,8 @@ class Database:
                     INSERT INTO users (user_id, api_keys, commission_rates, alert_settings, risk_settings, arbitrage_mode, selected_exchanges,
                         min_spread_threshold, alerts_enabled, inter_exchange_enabled, basis_arbitrage_enabled,
                         auto_trade_mode, trade_amount, leverage, notifications_enabled,
-                        total_trades, successful_trades, failed_trades, total_profit)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        total_trades, successful_trades, failed_trades, total_profit, bot_blocked)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     user_id,
                     json.dumps(user.api_keys),
@@ -400,7 +417,8 @@ class Database:
                     user.total_trades,
                     user.successful_trades,
                     user.failed_trades,
-                    user.total_profit
+                    user.total_profit,
+                    int(user.bot_blocked)
                 ))
                 await self._conn.commit()
                 logger.info(f"Created new user {user_id}")
@@ -444,6 +462,7 @@ class Database:
                         successful_trades=row['successful_trades'] if row['successful_trades'] is not None else 0,
                         failed_trades=row['failed_trades'] if row['failed_trades'] is not None else 0,
                         total_profit=row['total_profit'] if row['total_profit'] is not None else 0.0,
+                        bot_blocked=bool(row['bot_blocked']) if row['bot_blocked'] is not None else False,
                         created_at=row['created_at'],
                         updated_at=row['updated_at']
                     ))
@@ -472,6 +491,7 @@ class Database:
                     successful_trades = ?,
                     failed_trades = ?,
                     total_profit = ?,
+                    bot_blocked = ?,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE user_id = ?
             """, (
@@ -494,6 +514,7 @@ class Database:
                 getattr(user, 'successful_trades', 0),
                 getattr(user, 'failed_trades', 0),
                 getattr(user, 'total_profit', 0.0),
+                int(getattr(user, 'bot_blocked', False)),
                 user.user_id
             ))
             await self._conn.commit()

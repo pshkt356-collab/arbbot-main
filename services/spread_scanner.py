@@ -159,6 +159,8 @@ class SpreadScanner:
         self.sent_alerts: OrderedDict[str, datetime] = OrderedDict()
         self.max_alert_history = 500
         
+        self._blocked_subscribers: Set[int] = set()  # Пользователи, заблокировавшие бота
+        
         self._shutdown_event = asyncio.Event()
         self._tasks = []
         
@@ -184,6 +186,10 @@ class SpreadScanner:
 
     def subscribe(self, callback: Callable, user_id: int = None):
         if user_id:
+            # Пропускаем пользователей, которые заблокировали бота
+            if user_id in self._blocked_subscribers:
+                logger.debug(f"Skipping subscribe for blocked user {user_id}")
+                return
             self.subscribers.append((callback, user_id))
             if user_id not in self.user_settings:
                 self.user_settings[user_id] = self.default_min_spread
@@ -312,10 +318,14 @@ class SpreadScanner:
         if settings.auto_trading_default and alert.spread_percent >= settings.min_spread_auto:
             await self._trigger_auto_trade(alert)
 
+        subscribers_to_remove = []
         for callback_info in self.subscribers:
             try:
                 if isinstance(callback_info, tuple):
                     callback, user_id = callback_info
+                    # Пропускаем заблокированных пользователей
+                    if user_id in self._blocked_subscribers:
+                        continue
                     user_threshold = self.get_user_threshold(user_id, for_basis=alert.is_basis)
 
                     if alert.spread_percent >= user_threshold:
@@ -325,7 +335,20 @@ class SpreadScanner:
                     if alert.spread_percent >= default_thresh:
                         await callback_info(alert)
             except Exception as e:
-                logger.error(f"Error notifying subscriber: {e}")
+                error_msg = str(e).lower()
+                # Если пользователь заблокировал бота — отписываем без спама в логах
+                if isinstance(callback_info, tuple) and ("bot was blocked" in error_msg or "blocked by the user" in error_msg or "forbidden" in error_msg):
+                    blocked_user_id = callback_info[1]
+                    self._blocked_subscribers.add(blocked_user_id)
+                    subscribers_to_remove.append(callback_info)
+                    logger.info(f"User {blocked_user_id} blocked the bot, unsubscribed from alerts")
+                else:
+                    logger.error(f"Error notifying subscriber: {e}")
+
+        # Удаляем заблокированных подписчиков
+        if subscribers_to_remove:
+            for sub in subscribers_to_remove:
+                self.unsubscribe(sub[1])
 
     async def _trigger_auto_trade(self, alert: SpreadAlert):
         """Триггер авто-трейдинга для всех пользователей с включенным авто-трейдингом"""
