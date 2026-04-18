@@ -1,297 +1,689 @@
-# -*- coding: utf-8 -*-
-"""
-State handlers for Telegram bot FSM - FINAL FIX v4
-Исправлено:
-1. Проверка наличия exchange в FSM data
-2. Корректная обработка waiting_for_api_secret
-3. Fallback для отсутствующих ключей
-"""
-from aiogram import Router, F
-from aiogram.types import Message
-from aiogram.fsm.context import FSMContext
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.types import InlineKeyboardButton
 import logging
+from datetime import datetime
+from aiogram import Router, F
+from aiogram.types import Message, CallbackQuery
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from database.models import Database
-from handlers.callbacks import AVAILABLE_EXCHANGES, validate_exchange
+from database.models import UserSettings, Database
+from services.trading_engine import trading_engine
 
 logger = logging.getLogger(__name__)
-
 states_router = Router()
 
-# Состояния
-class SetupStates:
-    """FSM States для настройки"""
-    waiting_for_api_key = "waiting_for_api_key"
-    waiting_for_api_secret = "waiting_for_api_secret"
-    waiting_for_trade_amount = "waiting_for_trade_amount"
-    waiting_for_sl_price = "waiting_for_sl_price"
-    waiting_for_tp_price = "waiting_for_tp_price"
+class SetupStates(StatesGroup):
+    waiting_for_api_exchange = State()
+    waiting_for_api_key = State()
+    waiting_for_api_secret = State()
+    waiting_for_custom_threshold = State()
+    waiting_for_max_position = State()
+    waiting_for_commission_exchange = State()
+    waiting_for_commission_value = State()
+    waiting_for_min_spread = State()
+    waiting_for_symbol_whitelist = State()
+    waiting_for_partial_close = State()
+    waiting_for_take_profit = State()
+    waiting_for_breakeven_trigger = State()
+    waiting_for_trailing_distance = State()
+    waiting_for_max_position_hours = State()
+    waiting_for_custom_leverage = State()
+    waiting_for_balance_usage = State()
+    waiting_for_trade_amount = State()
+    # Торговые состояния
+    waiting_for_trade_size = State()
+    waiting_for_sl_price = State()
+    waiting_for_tp_price = State()
+    waiting_for_partial_percent = State()
 
-@states_router.message(F.text, SetupStates.waiting_for_api_key)
-async def process_api_key(message: Message, state: FSMContext, user=None, db=None):
-    """Process API key input with validation"""
-    try:
-        api_key = message.text.strip()
-        
-        if len(api_key) < 10:
-            await message.answer("❌ <b>API ключ слишком короткий</b>. Попробуй еще раз:")
-            return
-        
-        data = await state.get_data()
-        exchange_id = data.get('current_exchange')
-        
-        if not exchange_id:
-            logger.error(f"[FSM] process_api_key: exchange_id is None! Data: {data}")
-            await state.clear()
-            await message.answer(
-                "❌ <b>Ошибка сессии</b>. Начни заново: /exchanges",
-                reply_markup=InlineKeyboardBuilder().button(text="📱 Меню", callback_data="menu:main").as_markup()
-            )
-            return
-        
-        if not validate_exchange(exchange_id):
-            await state.clear()
-            await message.answer(
-                f"❌ <b>Неверная биржа:</b> {exchange_id}",
-                reply_markup=InlineKeyboardBuilder().button(text="📱 Меню", callback_data="menu:main").as_markup()
-            )
-            return
-        
-        # Сохраняем API ключ
-        await state.update_data(api_key=api_key)
-        
-        # ИСПРАВЛЕНО: Правильное переключение состояния
-        await state.set_state(SetupStates.waiting_for_api_secret)
-        await state.update_data(step='api_secret')
-        
-        logger.info(f"[FSM] API key received for {exchange_id}, waiting for secret")
-        
-        keyboard = InlineKeyboardBuilder()
-        keyboard.button(text="❌ Отмена", callback_data="menu:main")
-        
-        await message.answer(
-            f"<b>🔑 Добавление API для {exchange_id.upper()}</b>\\n\\n"
-            f"API Key сохранен.\\n"
-            f"Теперь введи <b>API Secret</b>:",
-            reply_markup=keyboard.as_markup(),
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        logger.error(f"[FSM] Error in process_api_key: {e}")
+@states_router.message(SetupStates.waiting_for_api_key)
+async def process_api_key(message: Message, state: FSMContext, user: UserSettings):
+    user_id = message.from_user.id
+    logger.info(f"[FSM] process_api_key called for user={user_id}")
+
+    if message.text == "/cancel":
+        logger.debug(f"[FSM DEBUG] User {user_id} cancelled")
         await state.clear()
-        await message.answer(
-            "❌ <b>Ошибка обработки</b>. Попробуй /start",
-            reply_markup=InlineKeyboardBuilder().button(text="📱 Меню", callback_data="menu:main").as_markup()
-        )
+        await message.answer("❌ Отменено")
+        return
 
-@states_router.message(F.text, SetupStates.waiting_for_api_secret)
-async def process_api_secret(message: Message, state: FSMContext, user=None, db=None):
-    """Process API secret and test connection"""
-    try:
-        api_secret = message.text.strip()
+    api_key = message.text.strip()
+    if len(api_key) < 10:
+        await message.answer("❌ API Key слишком короткий. Попробуйте еще:")
+        return
+
+    # Debug: check state
+    current_state = await state.get_state()
+    logger.info(f"[FSM] Current state for user={user_id}: {current_state}")
+
+    data = await state.get_data()
+    logger.info(f"[FSM] FSM data for user={user_id}: {data}")
+
+    exchange = data.get('current_exchange')
+    logger.info(f"[FSM] Extracted exchange='{exchange}' for user={user_id}")
+
+    if not exchange:
+        # Log to stdout (visible in Railway logs)
+        logger.warning(f"[FSM SESSION ERROR] user={user_id}, state={current_state}, data={data}")
         
-        data = await state.get_data()
-        exchange_id = data.get('current_exchange')
-        api_key = data.get('api_key')
-        
-        # ИСПРАВЛЕНО: Проверяем наличие всех необходимых данных
-        if not exchange_id or not api_key:
-            logger.error(f"[FSM] Missing data in process_api_secret: exchange={exchange_id}, api_key exists={bool(api_key)}")
-            await state.clear()
-            await message.answer(
-                "❌ <b>Ошибка сессии</b>. Данные утеряны. Начни заново: /exchanges",
-                reply_markup=InlineKeyboardBuilder().button(text="📱 Меню", callback_data="menu:main").as_markup()
-            )
-            return
-        
-        if not validate_exchange(exchange_id):
-            await state.clear()
-            await message.answer(
-                f"❌ <b>Неверная биржа:</b> {exchange_id}",
-                reply_markup=InlineKeyboardBuilder().button(text="📱 Меню", callback_data="menu:main").as_markup()
-            )
-            return
-        
-        # Удаляем сообщение с секретом для безопасности
-        try:
-            await message.delete()
-        except:
-            pass
-        
-        processing_msg = await message.answer("⏳ <b>Проверяю API ключ...</b>", parse_mode="HTML")
-        
-        # Тестируем подключение
-        from services.trading_engine import trading_engine
-        result = await trading_engine.test_api_connection(
-            exchange_id, api_key, api_secret, testnet=True
+        # Show debug info directly to user for troubleshooting
+        debug_info = f"state={current_state}, keys={list(data.keys()) if data else 'empty'}"
+        await message.answer(
+            f"❌ Ошибка сессии. Данные: {debug_info}\n\n"
+            f"Начните заново: /menu"
         )
-        
-        if result.get('success'):
-            # Сохраняем API данные
-            if user and db:
-                user.add_api_key(exchange_id, api_key, api_secret, testnet=True)
-                await db.update_user(user)
-                
-                # Добавляем биржу в выбранные
-                if exchange_id not in user.selected_exchanges:
-                    user.selected_exchanges.append(exchange_id)
-                    await db.update_user(user)
-            
-            await state.clear()
-            
-            balance = result.get('balance_usdt', 0)
-            await processing_msg.edit_text(
-                f"✅ <b>API ключ добавлен!</b>\\n\\n"
-                f"Биржа: <b>{exchange_id.upper()}</b>\\n"
-                f"Баланс: <b>{balance:.2f} USDT</b>\\n\\n"
-                f"Теперь ты можешь торговать на этой бирже.",
-                reply_markup=InlineKeyboardBuilder()
-                    .row(
-                        InlineKeyboardButton(text="💼 Биржи", callback_data="profile:exchanges"),
-                        InlineKeyboardButton(text="📱 Меню", callback_data="menu:main")
-                    ).as_markup(),
-                parse_mode="HTML"
-            )
-            logger.info(f"[FSM] API key added successfully for {exchange_id}, balance: {balance}")
+        await state.clear()
+        return
+
+    await state.update_data(api_key=api_key)
+    logger.info(f"[FSM] api_key saved for user={user_id}")
+    await state.set_state(SetupStates.waiting_for_api_secret)
+    logger.info(f"[FSM] State changed to waiting_for_api_secret for user={user_id}")
+
+    await message.answer(
+        f"✅ API Key сохранен\n\n"
+        f"Теперь введите API Secret для {exchange.upper()}:\n\n"
+        f"(или /cancel для отмены)"
+    )
+
+@states_router.message(SetupStates.waiting_for_api_secret)
+async def process_api_secret(message: Message, state: FSMContext, user: UserSettings, db: Database):
+    user_id = message.from_user.id
+    logger.info(f"[FSM] process_api_secret called for user={user_id}")
+
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Отменено")
+        return
+
+    api_secret = message.text.strip()
+    data = await state.get_data()
+
+    exchange = data.get('current_exchange')
+    api_key = data.get('api_key')
+
+    if not exchange or not api_key:
+        logger.error(f"Missing data in FSM: exchange={exchange}, api_key exists={bool(api_key)}")
+        await message.answer("❌ Ошибка данных. Начните заново.")
+        await state.clear()
+        return
+
+    await message.answer(f"⏳ Проверка API ключей {exchange.upper()}...")
+
+    try:
+        result = await trading_engine.test_api_connection(exchange, api_key, api_secret, testnet=True)
+        if isinstance(result, dict):
+            success = result.get('success', False)
+            msg = result.get('message', str(result))
+        elif isinstance(result, tuple) and len(result) == 2:
+            success, msg = result
         else:
-            error_msg = result.get('error', 'Неизвестная ошибка')
-            await processing_msg.edit_text(
-                f"❌ <b>Ошибка подключения:</b>\\n\\n"
-                f"{error_msg}\\n\\n"
-                f"Попробуй еще раз: /exchanges",
-                reply_markup=InlineKeyboardBuilder().button(text="📱 Меню", callback_data="menu:main").as_markup(),
-                parse_mode="HTML"
-            )
-            await state.clear()
-            
+            success = bool(result)
+            msg = str(result)
     except Exception as e:
-        logger.error(f"[FSM] Error in process_api_secret: {e}")
+        logger.error(f"[FSM] test_api_connection error: {e}")
+        success = False
+        msg = f"Ошибка проверки: {str(e)[:100]}"
+
+    if not success:
+        await message.answer(f"❌ Ошибка проверки API:\n `{msg}`\n\nПопробуйте заново: /menu")
         await state.clear()
+        return
+
+    try:
+        if not isinstance(user.api_keys, dict):
+            user.api_keys = {}
+
+        user.api_keys[exchange] = {
+            'api_key': api_key,
+            'api_secret': api_secret,
+            'testnet': True,
+            'created_at': str(datetime.now())
+        }
+        user.is_trading_enabled = True
+
+        await db.update_user(user)
+        logger.info(f"API saved for user {user.user_id}: {exchange} (verified)")
+
+        await state.clear()
+
+        keyboard = InlineKeyboardBuilder()
+        keyboard.button(text="🔌 Добавить еще биржу", callback_data="setup:trading")
+        keyboard.button(text="📱 Меню", callback_data="menu:main")
+        keyboard.adjust(1)
+
         await message.answer(
-            "❌ <b>Ошибка обработки секрета</b>. Попробуй /start",
-            reply_markup=InlineKeyboardBuilder().button(text="📱 Меню", callback_data="menu:main").as_markup()
+            f"✅ **{exchange.upper()} успешно подключена!**\n\n"
+            f"Проверка: {msg}\n"
+            f"API Key: {api_key[:8]}...{api_key[-4:]}\n"
+            f"Режим: Testnet (безопасный)\n\n"
+            f"Теперь вы можете:\n"
+            f"• Получать алерты о спредах\n"
+            f"• Торговать в тестовом режиме\n"
+            f"• Настроить автоторговлю",
+            reply_markup=keyboard.as_markup()
         )
 
-@states_router.message(F.text, SetupStates.waiting_for_trade_amount)
-async def process_trade_amount(message: Message, state: FSMContext, user=None, db=None):
-    """Process trade amount input"""
+    except Exception as e:
+        logger.error(f"Error saving API: {e}")
+        await message.answer(f"❌ Ошибка сохранения: {str(e)[:100]}")
+        await state.clear()
+
+@states_router.message(SetupStates.waiting_for_max_position)
+async def process_max_position(message: Message, state: FSMContext, user: UserSettings, db: Database):
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Отменено")
+        return
+
     try:
         amount = float(message.text.strip())
-        if amount < 10:
-            await message.answer("❌ <b>Минимальный объем: 10 USDT</b>. Попробуй еще раз:")
+        if amount < 100:
+            await message.answer("❌ Минимум $100. Введите сумму:")
             return
-        if amount > 100000:
-            await message.answer("❌ <b>Максимальный объем: 100000 USDT</b>. Попробуй еще раз:")
+        if amount > 1000000:
+            await message.answer("❌ Слишком большая сумма. Введите реалистичное значение:")
             return
-        
-        if user and db:
-            user.trade_amount = amount
-            await db.update_user(user)
-        
-        await state.clear()
-        
-        await message.answer(
-            f"✅ <b>Объем сделки установлен: ${amount}</b>",
-            reply_markup=InlineKeyboardBuilder()
-                .row(
-                    InlineKeyboardButton(text="⚙️ Настройки", callback_data="auto_trade:settings"),
-                    InlineKeyboardButton(text="📱 Меню", callback_data="menu:main")
-                ).as_markup(),
-            parse_mode="HTML"
-        )
-        logger.info(f"[FSM] Trade amount set: {amount}")
-    except ValueError:
-        await message.answer("❌ <b>Введи число</b> (например: 100):")
-    except Exception as e:
-        logger.error(f"[FSM] Error in process_trade_amount: {e}")
-        await state.clear()
-        await message.answer(
-            "❌ <b>Ошибка</b>. Попробуй /start",
-            reply_markup=InlineKeyboardBuilder().button(text="📱 Меню", callback_data="menu:main").as_markup()
-        )
 
-@states_router.message(F.text, SetupStates.waiting_for_sl_price)
-async def process_sl_price(message: Message, state: FSMContext, user=None, db=None):
-    """Process stop-loss price input"""
+        user.risk_settings['max_position_usd'] = amount
+        await db.update_user(user)
+        await state.clear()
+
+        keyboard = InlineKeyboardBuilder()
+        keyboard.button(text="⚠️ Риск-меню", callback_data="setup:risk")
+        keyboard.button(text="📱 Меню", callback_data="menu:main")
+
+        await message.answer(
+            f"✅ Макс. позиция установлена: ${amount:,.0f}",
+            reply_markup=keyboard.as_markup()
+        )
+    except ValueError:
+        await message.answer("❌ Введите число (например: 5000):")
+
+@states_router.message(SetupStates.waiting_for_min_spread)
+async def process_custom_spread(message: Message, state: FSMContext, user: UserSettings, db: Database):
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Отменено")
+        return
+
+    try:
+        spread = float(message.text.strip())
+        if spread < 0.05 or spread > 10:
+            await message.answer("❌ Допустимый диапазон: 0.05% - 10%. Введите значение:")
+            return
+
+        user.alert_settings['min_spread'] = spread
+        await db.update_user(user)
+        await state.clear()
+
+        keyboard = InlineKeyboardBuilder()
+        keyboard.button(text="🔔 Настройки алертов", callback_data="setup:alerts")
+        keyboard.button(text="📱 Меню", callback_data="menu:main")
+
+        await message.answer(
+            f"✅ Порог алертов установлен: {spread}%",
+            reply_markup=keyboard.as_markup()
+        )
+    except ValueError:
+        await message.answer("❌ Введите число (например: 0.5):")
+
+@states_router.message(SetupStates.waiting_for_custom_leverage)
+async def process_custom_leverage(message: Message, state: FSMContext, user: UserSettings, db: Database):
+    """Обработка произвольного плеча"""
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Отменено")
+        return
+        
+    try:
+        lev = int(message.text.strip())
+        if lev < 1 or lev > 125:
+            await message.answer("❌ Плечо должно быть от 1 до 125")
+            return
+            
+        user.risk_settings['max_leverage'] = lev
+        await db.update_user(user)
+        await state.clear()
+        
+        keyboard = InlineKeyboardBuilder()
+        keyboard.button(text="⚠️ Риск-меню", callback_data="setup:risk")
+        keyboard.button(text="📱 Меню", callback_data="menu:main")
+        
+        await message.answer(f"✅ Плечо установлено: {lev}x", reply_markup=keyboard.as_markup())
+    except ValueError:
+        await message.answer("❌ Введите число (например: 20):")
+
+@states_router.message(SetupStates.waiting_for_take_profit)
+async def process_take_profit(message: Message, state: FSMContext, user: UserSettings, db: Database):
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Отменено")
+        return
+
+    try:
+        tp = float(message.text.strip())
+        if tp < 5 or tp > 100:
+            await message.answer("❌ Допустимый диапазон: 5% - 100%")
+            return
+
+        user.risk_settings['take_profit_percent'] = tp
+        await db.update_user(user)
+        await state.clear()
+        
+        keyboard = InlineKeyboardBuilder()
+        keyboard.button(text="⚠️ Риск-меню", callback_data="setup:risk")
+        keyboard.button(text="📱 Меню", callback_data="menu:main")
+        
+        await message.answer(f"✅ Тейк-профит установлен: {tp}%", reply_markup=keyboard.as_markup())
+    except ValueError:
+        await message.answer("❌ Введите число:")
+
+@states_router.message(SetupStates.waiting_for_breakeven_trigger)
+async def process_breakeven(message: Message, state: FSMContext, user: UserSettings, db: Database):
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Отменено")
+        return
+
+    try:
+        be = float(message.text.strip())
+        if be < 3 or be > 50:
+            await message.answer("❌ Допустимый диапазон: 3% - 50%")
+            return
+
+        user.risk_settings['stop_loss_breakeven_trigger'] = be
+        await db.update_user(user)
+        await state.clear()
+        
+        keyboard = InlineKeyboardBuilder()
+        keyboard.button(text="⚠️ Риск-меню", callback_data="setup:risk")
+        keyboard.button(text="📱 Меню", callback_data="menu:main")
+        
+        await message.answer(f"✅ Триггер безубытка: {be}%", reply_markup=keyboard.as_markup())
+    except ValueError:
+        await message.answer("❌ Введите число:")
+
+@states_router.message(SetupStates.waiting_for_trailing_distance)
+async def process_trailing(message: Message, state: FSMContext, user: UserSettings, db: Database):
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Отменено")
+        return
+
+    try:
+        dist = float(message.text.strip())
+        if dist < 2 or dist > 30:
+            await message.answer("❌ Допустимый диапазон: 2% - 30%")
+            return
+
+        user.risk_settings['trailing_stop_distance'] = dist
+        await db.update_user(user)
+        await state.clear()
+        
+        keyboard = InlineKeyboardBuilder()
+        keyboard.button(text="⚠️ Риск-меню", callback_data="setup:risk")
+        keyboard.button(text="📱 Меню", callback_data="menu:main")
+        
+        await message.answer(f"✅ Дистанция трейлинга: {dist}%", reply_markup=keyboard.as_markup())
+    except ValueError:
+        await message.answer("❌ Введите число:")
+
+@states_router.message(SetupStates.waiting_for_max_position_hours)
+async def process_max_hours(message: Message, state: FSMContext, user: UserSettings, db: Database):
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Отменено")
+        return
+
+    try:
+        hours = int(message.text.strip())
+        if hours < 0 or hours > 168:
+            await message.answer("❌ Допустимый диапазон: 0 - 168 часов")
+            return
+
+        user.risk_settings['max_position_hours'] = hours
+        await db.update_user(user)
+        await state.clear()
+        
+        keyboard = InlineKeyboardBuilder()
+        keyboard.button(text="⚠️ Риск-меню", callback_data="setup:risk")
+        keyboard.button(text="📱 Меню", callback_data="menu:main")
+        
+        if hours == 0:
+            await message.answer("✅ Авто-закрытие отключено", reply_markup=keyboard.as_markup())
+        else:
+            await message.answer(f"✅ Авто-закрытие через: {hours}ч", reply_markup=keyboard.as_markup())
+    except ValueError:
+        await message.answer("❌ Введите целое число:")
+
+@states_router.message(SetupStates.waiting_for_balance_usage)
+async def process_balance_usage(message: Message, state: FSMContext, user: UserSettings, db: Database):
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Отменено")
+        return
+
+    try:
+        pct = float(message.text.strip())
+        if pct < 1 or pct > 100:
+            await message.answer("❌ Допустимый диапазон: 1% - 100%")
+            return
+
+        user.risk_settings['balance_usage_percent'] = pct
+        await db.update_user(user)
+        await state.clear()
+        
+        keyboard = InlineKeyboardBuilder()
+        keyboard.button(text="⚠️ Риск-меню", callback_data="setup:risk")
+        keyboard.button(text="📱 Меню", callback_data="menu:main")
+        
+        await message.answer(f"✅ Использование баланса: {pct}%", reply_markup=keyboard.as_markup())
+    except ValueError:
+        await message.answer("❌ Введите число (например: 95):")
+
+@states_router.callback_query(F.data.startswith("partial:"))
+async def partial_close_start(callback: CallbackQuery, state: FSMContext):
+    trade_id = callback.data.split(":")[1]
+    await state.update_data(partial_trade_id=int(trade_id))
+    await state.set_state(SetupStates.waiting_for_partial_close)
+
+    keyboard = InlineKeyboardBuilder()
+    keyboard.button(text="25%", callback_data="partial_pct:25")
+    keyboard.button(text="50%", callback_data="partial_pct:50")
+    keyboard.button(text="75%", callback_data="partial_pct:75")
+    keyboard.button(text="🔙 Отмена", callback_data="menu:trades")
+    keyboard.adjust(3, 1)
+
+    await callback.message.edit_text(
+        f"💰 **Частичное закрытие сделки #{trade_id}**\n\n"
+        f"Введите процент для закрытия (1-100):\n"
+        f"Или выберите быстрый вариант:",
+        reply_markup=keyboard.as_markup()
+    )
+    await callback.answer()
+
+@states_router.callback_query(F.data.startswith("partial_pct:"))
+async def partial_close_pct(callback: CallbackQuery, state: FSMContext, user: UserSettings, db: Database):
+    pct = float(callback.data.split(":")[1])
+    data = await state.get_data()
+    trade_id = data.get('partial_trade_id')
+
+    if not trade_id:
+        await callback.answer("Ошибка: не найден ID сделки")
+        return
+
+    await callback.message.edit_text(f"⏳ Закрытие {pct}% позиции #{trade_id}...")
+
+    result = await trading_engine.partial_close(trade_id, user, pct)
+
+    if result.success:
+        remaining = result.metadata.get('remaining', 0)
+        profit = result.metadata.get('profit', 0)
+
+        keyboard = InlineKeyboardBuilder()
+        keyboard.button(text="💼 Мои сделки", callback_data="menu:trades")
+        keyboard.button(text="📱 Меню", callback_data="menu:main")
+
+        text = (f"✅ **Частично закрыто {pct}%**\n\n"
+                f"Сделка #{trade_id}\n"
+                f"Прибыль: ${profit:.2f}\n")
+        if remaining > 0:
+            text += f"Осталось открыто: {remaining:.0f}%"
+        else:
+            text += "Сделка полностью закрыта"
+
+        await callback.message.edit_text(text, reply_markup=keyboard.as_markup())
+    else:
+        await callback.message.edit_text(f"❌ Ошибка: {result.error}")
+
+    await state.clear()
+    await callback.answer()
+
+@states_router.message(SetupStates.waiting_for_partial_close)
+async def process_partial_close(message: Message, state: FSMContext, user: UserSettings, db: Database):
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Отменено")
+        return
+
+    try:
+        pct = float(message.text.strip())
+        if pct <= 0 or pct > 100:
+            await message.answer("❌ Введите процент от 1 до 100:")
+            return
+
+        data = await state.get_data()
+        trade_id = data.get('partial_trade_id')
+
+        if not trade_id:
+            await message.answer("❌ Ошибка: не найден ID сделки")
+            await state.clear()
+            return
+
+        await message.answer(f"⏳ Закрытие {pct}% позиции...")
+
+        result = await trading_engine.partial_close(trade_id, user, pct)
+
+        if result.success:
+            remaining = result.metadata.get('remaining', 0)
+            profit = result.metadata.get('profit', 0)
+
+            keyboard = InlineKeyboardBuilder()
+            keyboard.button(text="💼 Мои сделки", callback_data="menu:trades")
+
+            text = (f"✅ **Частично закрыто {pct}%**\n\n"
+                    f"Прибыль: ${profit:.2f}\n")
+            if remaining > 0:
+                text += f"Осталось: {remaining:.0f}%"
+
+            await message.answer(text, reply_markup=keyboard.as_markup())
+        else:
+            await message.answer(f"❌ Ошибка: {result.error}")
+
+        await state.clear()
+
+    except ValueError:
+        await message.answer("❌ Введите число (например: 50):")
+
+
+# ==================== TRADE SIZE HANDLER ====================
+
+@states_router.message(SetupStates.waiting_for_trade_size)
+async def process_trade_size_input(message: Message, state: FSMContext, user: UserSettings, db: Database):
+    """Обработка ввода размера сделки"""
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Отменено")
+        return
+    try:
+        size = float(message.text.strip())
+        if size < 10 or size > 100000:
+            await message.answer("❌ Допустимый диапазон: $10 - $100000. Введите сумму:")
+            return
+        data = await state.get_data()
+        symbol = data.get('trade_symbol')
+        exchange = data.get('trade_exchange')
+        side = data.get('trade_side', 'long')
+        if not symbol:
+            await message.answer("❌ Ошибка: не найден символ. Начните заново.")
+            await state.clear()
+            return
+        from services.trading_engine import trading_engine
+        await message.answer(f"⏳ Открываю сделку {symbol} на ${size:.0f}...")
+        if side == 'long' and exchange:
+            result = await trading_engine.open_single_exchange_trade(
+                user=user, symbol=symbol, exchange_id=exchange,
+                side='long', size_usd=size, test_mode=user.alert_settings.get('test_mode', True)
+            )
+        elif side == 'short' and exchange:
+            result = await trading_engine.open_single_exchange_trade(
+                user=user, symbol=symbol, exchange_id=exchange,
+                side='short', size_usd=size, test_mode=user.alert_settings.get('test_mode', True)
+            )
+        else:
+            await message.answer("❌ Ошибка параметров сделки. Начните заново.")
+            await state.clear()
+            return
+        await state.clear()
+        if result.success:
+            user.total_trades += 1
+            if db:
+                await db.update_user(user)
+            keyboard = InlineKeyboardBuilder()
+            keyboard.button(text="📊 Мои позиции", callback_data="positions:menu")
+            keyboard.button(text="📱 Меню", callback_data="menu:main")
+            await message.answer(
+                f"✅ **Сделка #{result.trade_id} открыта!**\n\n"
+                f"💎 {html.escape(symbol)}\n"
+                f"💰 Размер: ${size:.0f}\n"
+                f"📊 SL: {result.stop_loss:.4f if result.stop_loss else 'авто'}\n"
+                f"📊 TP: {result.take_profit:.4f if result.take_profit else 'авто'}",
+                reply_markup=keyboard.as_markup()
+            )
+        else:
+            await message.answer(
+                f"❌ **Ошибка открытия сделки**\n\n"
+                f"{html.escape(result.error or 'Неизвестная ошибка')}"
+            )
+    except ValueError:
+        await message.answer("❌ Введите число (например: 100):")
+    except Exception as e:
+        logger.error(f"Trade size error: {e}")
+        await message.answer(f"❌ Ошибка: {html.escape(str(e))[:200]}")
+        await state.clear()
+
+# ==================== SL/TP MODIFICATION HANDLERS ====================
+
+@states_router.message(SetupStates.waiting_for_sl_price)
+async def process_sl_price(message: Message, state: FSMContext, user: UserSettings, db: Database):
+    """Обработка ввода цены стоп-лосса"""
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Отменено")
+        return
     try:
         sl_price = float(message.text.strip())
         if sl_price <= 0:
-            await message.answer("❌ <b>Цена должна быть больше 0</b>. Попробуй еще раз:")
+            await message.answer("❌ Цена должна быть положительной. Введите цену SL:")
             return
-        
         data = await state.get_data()
         trade_id = data.get('modify_trade_id')
-        
-        if not trade_id or not db:
+        if not trade_id:
+            await message.answer("❌ Ошибка: не найден ID сделки.")
             await state.clear()
-            await message.answer("❌ <b>Ошибка сессии</b>. Попробуй снова.")
             return
-        
-        # Обновляем SL в БД
-        await db.update_trade_field(trade_id, 'stop_loss_price', sl_price)
-        await db.update_trade_field(trade_id, 'updated_at', 'CURRENT_TIMESTAMP')
-        
-        await state.clear()
-        await message.answer(
-            f"✅ <b>Stop-Loss обновлен: {sl_price}</b>",
-            reply_markup=InlineKeyboardBuilder()
-                .button(text="📊 Позиция", callback_data=f"position:details:{trade_id}")
-                .as_markup(),
-            parse_mode="HTML"
+        from services.trading_engine import trading_engine
+        tp_price = data.get('new_tp_price')
+        result = await trading_engine.modify_sl_tp(
+            trade_id=trade_id, user=user,
+            stop_loss=sl_price, take_profit=tp_price
         )
-        logger.info(f"[FSM] SL updated for trade {trade_id}: {sl_price}")
+        await state.clear()
+        if result.success:
+            keyboard = InlineKeyboardBuilder()
+            keyboard.button(text="📊 К позиции", callback_data=f"position:details:{trade_id}")
+            keyboard.button(text="📱 Меню", callback_data="menu:main")
+            await message.answer(
+                f"✅ **Стоп-лосс обновлён!**\n\n"
+                f"📊 SL: {sl_price:.4f}\n"
+                f"📊 TP: {tp_price:.4f if tp_price else 'без изменений'}",
+                reply_markup=keyboard.as_markup()
+            )
+        else:
+            await message.answer(f"❌ Ошибка: {html.escape(result.error or 'Не удалось изменить SL')}")
     except ValueError:
-        await message.answer("❌ <b>Введи число</b> (например: 65000):")
+        await message.answer("❌ Введите числовое значение цены:")
     except Exception as e:
-        logger.error(f"[FSM] Error in process_sl_price: {e}")
+        logger.error(f"SL modification error: {e}")
+        await message.answer(f"❌ Ошибка: {html.escape(str(e))[:200]}")
         await state.clear()
 
-@states_router.message(F.text, SetupStates.waiting_for_tp_price)
-async def process_tp_price(message: Message, state: FSMContext, user=None, db=None):
-    """Process take-profit price input"""
+@states_router.message(SetupStates.waiting_for_tp_price)
+async def process_tp_price(message: Message, state: FSMContext, user: UserSettings, db: Database):
+    """Обработка ввода цены тейк-профита"""
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Отменено")
+        return
     try:
         tp_price = float(message.text.strip())
         if tp_price <= 0:
-            await message.answer("❌ <b>Цена должна быть больше 0</b>. Попробуй еще раз:")
+            await message.answer("❌ Цена должна быть положительной. Введите цену TP:")
             return
-        
         data = await state.get_data()
         trade_id = data.get('modify_trade_id')
-        
-        if not trade_id or not db:
+        if not trade_id:
+            await message.answer("❌ Ошибка: не найден ID сделки.")
             await state.clear()
-            await message.answer("❌ <b>Ошибка сессии</b>. Попробуй снова.")
             return
-        
-        # Обновляем TP в БД
-        await db.update_trade_field(trade_id, 'take_profit_price', tp_price)
-        await db.update_trade_field(trade_id, 'updated_at', 'CURRENT_TIMESTAMP')
-        
-        await state.clear()
-        await message.answer(
-            f"✅ <b>Take-Profit обновлен: {tp_price}</b>",
-            reply_markup=InlineKeyboardBuilder()
-                .button(text="📊 Позиция", callback_data=f"position:details:{trade_id}")
-                .as_markup(),
-            parse_mode="HTML"
+        from services.trading_engine import trading_engine
+        sl_price = data.get('new_sl_price')
+        result = await trading_engine.modify_sl_tp(
+            trade_id=trade_id, user=user,
+            stop_loss=sl_price, take_profit=tp_price
         )
-        logger.info(f"[FSM] TP updated for trade {trade_id}: {tp_price}")
+        await state.clear()
+        if result.success:
+            keyboard = InlineKeyboardBuilder()
+            keyboard.button(text="📊 К позиции", callback_data=f"position:details:{trade_id}")
+            keyboard.button(text="📱 Меню", callback_data="menu:main")
+            await message.answer(
+                f"✅ **Тейк-профит обновлён!**\n\n"
+                f"📊 SL: {sl_price:.4f if sl_price else 'без изменений'}\n"
+                f"📊 TP: {tp_price:.4f}",
+                reply_markup=keyboard.as_markup()
+            )
+        else:
+            await message.answer(f"❌ Ошибка: {html.escape(result.error or 'Не удалось изменить TP')}")
     except ValueError:
-        await message.answer("❌ <b>Введи число</b> (например: 75000):")
+        await message.answer("❌ Введите числовое значение цены:")
     except Exception as e:
-        logger.error(f"[FSM] Error in process_tp_price: {e}")
+        logger.error(f"TP modification error: {e}")
+        await message.answer(f"❌ Ошибка: {html.escape(str(e))[:200]}")
         await state.clear()
 
-@states_router.message(F.text.startswith("/cancel"))
-async def cancel_any_state(message: Message, state: FSMContext):
-    """Cancel any state"""
-    current_state = await state.get_state()
-    if current_state:
+# ==================== PARTIAL CLOSE HANDLER ====================
+
+@states_router.message(SetupStates.waiting_for_partial_percent)
+async def process_partial_percent(message: Message, state: FSMContext, user: UserSettings, db: Database):
+    """Обработка ввода процента частичного закрытия"""
+    if message.text == "/cancel":
         await state.clear()
-        await message.answer(
-            "✅ <b>Отменено</b>",
-            reply_markup=InlineKeyboardBuilder().button(text="📱 Меню", callback_data="menu:main").as_markup(),
-            parse_mode="HTML"
-        )
+        await message.answer("❌ Отменено")
+        return
+    try:
+        text = message.text.strip().replace('%', '')
+        percentage = float(text)
+        if percentage <= 0 or percentage > 100:
+            await message.answer("❌ Допустимый диапазон: 1% - 100%. Введите процент:")
+            return
+        data = await state.get_data()
+        trade_id = data.get('partial_trade_id')
+        if not trade_id:
+            await message.answer("❌ Ошибка: не найден ID сделки.")
+            await state.clear()
+            return
+        from services.trading_engine import trading_engine
+        await message.answer(f"⏳ Закрываю {percentage:.0f}% позиции #{trade_id}...")
+        result = await trading_engine.partial_close(trade_id=trade_id, user=user, percentage=percentage)
+        await state.clear()
+        if result.success:
+            metadata = result.metadata or {}
+            keyboard = InlineKeyboardBuilder()
+            keyboard.button(text="📊 Мои позиции", callback_data="positions:menu")
+            keyboard.button(text="📱 Меню", callback_data="menu:main")
+            await message.answer(
+                f"✅ **Частичное закрытие выполнено!**\n\n"
+                f"💰 P&L: ${metadata.get('partial_pnl', 0):.2f}\n"
+                f"📊 Остаток: ${metadata.get('remaining_size', 0):.2f}",
+                reply_markup=keyboard.as_markup()
+            )
+        else:
+            await message.answer(f"❌ Ошибка: {html.escape(result.error or 'Не удалось закрыть часть')}")
+    except ValueError:
+        await message.answer("❌ Введите число от 1 до 100:")
+    except Exception as e:
+        logger.error(f"Partial close error: {e}")
+        await message.answer(f"❌ Ошибка: {html.escape(str(e))[:200]}")
+        await state.clear()

@@ -1,12 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Main entry point for Arbitrage Bot - FINAL FIX v4
-Исправлено:
-1. Правильная передача scanner во все middleware
-2. Корректная подписка пользователей с учетом arbitrage_mode
-3. Установка user_alert_settings при подписке
-4. Использование Database.is_initialized вместо _initialized
-"""
 import asyncio
 import logging
 import signal
@@ -88,8 +79,7 @@ async def health_handler(request):
     }
 
     try:
-        # ИСПРАВЛЕНО: Используем is_initialized property
-        if db and db.is_initialized:
+        if db and db._initialized:
             health_status["services"]["database"] = "connected"
         else:
             health_status["services"]["database"] = "disconnected"
@@ -99,8 +89,15 @@ async def health_handler(request):
         health_status["status"] = "unhealthy"
 
     try:
-        if scanner and scanner._is_running:
-            health_status["services"]["scanner"] = "running"
+        if scanner and scanner.running:
+            active_streams = sum(1 for v in scanner.stats['connections'].values() if v)
+            health_status["services"]["scanner"] = {
+                "status": "running",
+                "mode": "degraded" if getattr(scanner, '_degraded_mode', False) else "normal",
+                "active_streams": f"{active_streams}/10"
+            }
+            if getattr(scanner, '_degraded_mode', False):
+                health_status["status"] = "degraded"
         else:
             health_status["services"]["scanner"] = "stopped"
             health_status["status"] = "unhealthy"
@@ -132,10 +129,10 @@ async def metrics_handler(request):
     metrics = []
 
     if scanner:
-        stats = scanner.get_stats()
-        metrics.append(f'scanner_spreads_total {stats["profitable_spreads"]}')
-        metrics.append(f'scanner_calculations_total {stats["total_calculations"]}')
-        metrics.append(f'scanner_subscribers {stats["subscribers"]}')
+        metrics.append(f'scanner_spreads_total {scanner.stats["spreads_found"]}')
+        metrics.append(f'scanner_basis_total {scanner.stats["basis_found"]}')
+        active_streams = sum(1 for v in scanner.stats['connections'].values() if v)
+        metrics.append(f'scanner_active_streams {active_streams}')
 
     if trading_engine:
         metrics.append(f'trading_active_monitors {len(trading_engine.active_monitors)}')
@@ -166,7 +163,7 @@ async def stop_health_server():
     if runner:
         await runner.cleanup()
     logger.info("Health check server stopped")
-
+    
 async def _stop_with_timeout(stop_func, name, timeout=2.0):
     """Остановка компонента с таймаутом"""
     try:
@@ -180,41 +177,41 @@ async def _stop_with_timeout(stop_func, name, timeout=2.0):
 async def shutdown(signal_name=None):
     """Graceful shutdown with timeout for Railway (10s limit)"""
     logger.info(f"Received exit signal {signal_name}...")
-
+    
     shutdown_start = asyncio.get_event_loop().time()
     max_shutdown_time = 8.0
-
+    
     async def _do_shutdown():
         await _stop_with_timeout(stop_health_server, "Health server", timeout=1.0)
-
+        
         if backup_manager:
             await _stop_with_timeout(backup_manager.stop, "Backup manager", timeout=1.0)
-
+        
         if archiver:
             await _stop_with_timeout(archiver.stop, "Archiver", timeout=1.0)
-
+        
         if scanner:
             await _stop_with_timeout(scanner.stop, "Scanner", timeout=2.0)
-
+        
         if status_checker:
             await _stop_with_timeout(status_checker.stop, "Status checker", timeout=1.0)
-
+        
         if trading_engine:
             try:
                 trading_engine.stop()
                 logger.info("Trading engine stopped")
             except Exception as e:
                 logger.error(f"Trading engine stop error: {e}")
-
+        
         try:
             circuit_breaker.stop()
             logger.info("Circuit breaker stopped")
         except Exception as e:
             logger.error(f"Circuit breaker stop error: {e}")
-
+        
         if db:
             await _stop_with_timeout(db.close, "Database", timeout=1.0)
-
+        
         if bot:
             try:
                 await asyncio.wait_for(bot.session.close(), timeout=1.0)
@@ -223,7 +220,7 @@ async def shutdown(signal_name=None):
                 logger.warning("Bot session close timeout, forcing...")
             except Exception as e:
                 logger.error(f"Bot session close error: {e}")
-
+    
     try:
         await asyncio.wait_for(_do_shutdown(), timeout=max_shutdown_time)
         elapsed = asyncio.get_event_loop().time() - shutdown_start
@@ -253,33 +250,31 @@ async def subscribe_existing_users():
             # Пропускаем если алерты выключены или бот заблокирован
             if not user.alerts_enabled or user.bot_blocked:
                 continue
-
-            # Проверяем, не подписан ли уже
-            already_subscribed = False
-            for sub in scanner.subscribers:
-                if isinstance(sub, tuple) and len(sub) >= 2 and sub[1] == user.user_id:
-                    already_subscribed = True
-                    break
-
-            if not already_subscribed:
-                # ИСПРАВЛЕНО: Правильная подписка с учетом всех настроек
-                scanner.subscribe(send_spread_alert, user.user_id)
-                scanner.set_user_threshold(user.user_id, user.min_spread_threshold)
-                scanner.set_user_arbitrage_mode(user.user_id, getattr(user, 'arbitrage_mode', 'all'))
-                scanner.set_user_alert_settings(
-                    user.user_id, 
-                    getattr(user, 'inter_exchange_enabled', True),
-                    getattr(user, 'basis_arbitrage_enabled', True)
-                )
-                scanner.user_alerts_enabled[user.user_id] = user.alerts_enabled
+            
+            if user.min_spread_threshold > 0:
+                # Проверяем, не подписан ли уже
+                already_subscribed = False
+                for sub in scanner.subscribers:
+                    # Проверяем если subscriber - это tuple с user_id
+                    if isinstance(sub, tuple) and len(sub) >= 2 and sub[1] == user.user_id:
+                        already_subscribed = True
+                        break
+                    # Проверяем если это partial функция (сложнее проверить)
                 
-                subscribed_count += 1
-                logger.info(f"Auto-subscribed user {user.user_id} (threshold: {user.min_spread_threshold}%, mode: {getattr(user, 'arbitrage_mode', 'all')})")
+                if not already_subscribed:
+                    scanner.subscribe(send_spread_alert, user.user_id)
+                    scanner.set_user_threshold(
+                        user.user_id,
+                        user.min_spread_threshold,
+                        alerts_enabled=user.alerts_enabled
+                    )
+                    subscribed_count += 1
+                    logger.info(f"Auto-subscribed user {user.user_id} to spread alerts (threshold: {user.min_spread_threshold}%)")
 
         logger.info(f"Total users subscribed to alerts: {subscribed_count}/{len(users)}")
     except Exception as e:
         logger.error(f"Error subscribing existing users: {e}")
-
+        
 async def main():
     global scanner, db, bot, backup_manager, archiver
 
@@ -298,16 +293,16 @@ async def main():
 
     await status_checker.start()
 
-    # ИСПРАВЛЕНО: Инициализация сканера
-    scanner = SpreadScanner()
-    await scanner.initialize()
-    await scanner.start_scanning()
+    scanner = SpreadScanner(
+        min_spread=0.2,
+        check_interval=settings.scan_interval
+    )
 
     bot = Bot(token=settings.telegram_bot_token)
-
+    
     # Устанавливаем бота для callbacks
     set_bot(bot)
-
+    
     init_alert_manager(bot, settings.telegram_admin_id)
 
     # Use SQLiteStorage for reliable FSM state persistence
@@ -332,6 +327,8 @@ async def main():
     dp.include_router(callbacks_router)
     dp.include_router(states_router)
 
+    scanner_task = asyncio.create_task(scanner.start(), name="scanner")
+    cleanup_task = asyncio.create_task(trading_engine._cleanup_cache(), name="cache_cleanup")
     health_task = asyncio.create_task(start_health_server(), name="health")
 
     await subscribe_existing_users()
