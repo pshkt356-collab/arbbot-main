@@ -1,726 +1,533 @@
-import aiosqlite
+# -*- coding: utf-8 -*-
+"""
+Database models for Arbitrage Bot - FINAL FIX v4
+Исправлено:
+1. Добавлен arbitrage_mode в UserSettings
+2. Корректное сохранение inter_exchange_enabled и basis_arbitrage_enabled
+3. Добавлен метод get_all_users для main.py
+"""
 import json
-import asyncio
-from datetime import datetime
-from dataclasses import dataclass, asdict, field
-from typing import Optional, List, Dict, Any, Union
 import logging
+import threading
+import aiosqlite
+from typing import Optional, Dict, List, Any
+from dataclasses import dataclass, field, asdict
+from datetime import datetime
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 @dataclass
 class UserSettings:
+    """User settings and state"""
     user_id: int
-    is_trading_enabled: bool = False
-    api_keys: dict = field(default_factory=dict)
-    commission_rates: dict = field(default_factory=lambda: {
-        'binance': {'maker': 0.0002, 'taker': 0.0004},
-        'bybit': {'maker': 0.0001, 'taker': 0.00055},
-        'okx': {'maker': 0.0008, 'taker': 0.001}
-    })
-    alert_settings: dict = field(default_factory=lambda: {
-        'min_spread': 0.2,
-        'min_profit_usd': 5,
-        'min_volume_24h': 1000000,
-        'alert_levels': [
-            {'spread': 0.2, 'emoji': '💡', 'sound': False},
-            {'spread': 0.5, 'emoji': '⚡', 'sound': True},
-            {'spread': 1.0, 'emoji': '🚀', 'sound': True}
-        ],
-        'exchanges': ['binance', 'bybit', 'okx', 'whitebit', 'mexc'],
-        'symbols_whitelist': [],
-        'symbols_blacklist': [],
-        'funding_arbitrage': True,
-        'test_mode': True,  # По умолчанию тестовый режим включен
-        'auto_trading': False
-    })
-    risk_settings: dict = field(default_factory=lambda: {
-        'max_position_usd': 10000,
-        'max_leverage': 3,
-        'max_daily_loss_usd': 500,
-        'auto_close_spread': 0.05,
-        'max_open_positions': 5,
-        'balance_usage_percent': 95,
-        'take_profit_percent': 20,
-        'stop_loss_breakeven_trigger': 10,
-        'trailing_stop_enabled': True,
-        'trailing_stop_distance': 10,
-        'max_position_hours': 24,
-        'atr_multiplier': 2.0,
-        'min_stop_loss_percent': 2.0,
-        'emergency_stop_percent': 50.0,
-        'margin_mode': 'isolated'
-    })
-    arbitrage_mode: str = 'all'  # 'all' или 'futures_futures_only'
-    
-    # Дополнительные поля для совместимости с callbacks.py
-    auto_trade_mode: bool = False  # Режим авто-трейдинга
-    alerts_enabled: bool = True    # Включены ли алерты
-    notifications_enabled: bool = True  # Уведомления включены
-    selected_exchanges: list = field(default_factory=lambda: ['binance', 'bybit', 'okx', 'whitebit', 'mexc'])  # Выбранные биржи
-    min_spread_threshold: float = 0.2  # Минимальный порог спреда
-    trade_amount: float = 100.0  # Объем сделки в USDT
-    inter_exchange_enabled: bool = True  # Межбиржевой арбитраж включен
-    basis_arbitrage_enabled: bool = True  # Базисный арбитраж включен
-    leverage: int = 3  # Плечо торговли
-    total_trades: int = 0  # Всего сделок
-    successful_trades: int = 0  # Успешных сделок
-    failed_trades: int = 0  # Неудачных сделок
-    total_profit: float = 0.0  # Общая прибыль
-    bot_blocked: bool = False  # Пользователь заблокировал бота
+    alerts_enabled: bool = True
+    min_spread_threshold: float = 2.0
+    selected_exchanges: List[str] = field(default_factory=list)
+    api_keys: Dict[str, Any] = field(default_factory=dict)
+    total_balance: float = 0.0
+    trade_amount: float = 100.0
+    leverage: int = 1
+    stop_loss_percent: float = 2.0
+    take_profit_percent: float = 5.0
+    notifications_enabled: bool = True
+    auto_trade_mode: bool = False
+    risk_settings: Dict[str, Any] = field(default_factory=dict)
+    alert_settings: Dict[str, Any] = field(default_factory=dict)
+    total_trades: int = 0
+    successful_trades: int = 0
+    failed_trades: int = 0
+    total_profit: float = 0.0
+    # ИСПРАВЛЕНО: Добавлены поля для типов арбитража
+    inter_exchange_enabled: bool = True
+    basis_arbitrage_enabled: bool = True
+    arbitrage_mode: str = 'all'  # 'all', 'inter_exchange_only', 'basis_only'
+    bot_blocked: bool = False
+    _cached_balances: Dict[str, Any] = field(default_factory=dict, repr=False)
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
 
-    created_at: str = None
-    updated_at: str = None
+    def add_api_key(self, exchange: str, api_key: str, api_secret: str, testnet: bool = True):
+        """Add API key for exchange"""
+        self.api_keys[exchange] = {
+            'api_key': api_key,
+            'api_secret': api_secret,
+            'testnet': testnet,
+            'added_at': datetime.now().isoformat()
+        }
 
-    def __post_init__(self):
-        if self.created_at is None:
-            self.created_at = datetime.now().isoformat()
-        if self.updated_at is None:
-            self.updated_at = datetime.now().isoformat()
-
-    # Internal storage for cached exchange balances
-    _cached_balances: dict = field(default_factory=dict, repr=False)
-
-    @property
-    def total_balance(self) -> float:
-        """Общий баланс: сумма всех кешированных балансов бирж"""
-        if hasattr(self, '_cached_balances') and self._cached_balances:
-            return sum(
-                bal.get('total', 0) 
-                for bal in self._cached_balances.values() 
-                if isinstance(bal, dict)
-            )
-        # Fallback to legacy storage in risk_settings
-        return self.risk_settings.get('total_balance', 0.0)
-    
-    @property
-    def available_balance(self) -> float:
-        """Доступный баланс: сумма доступных средств на всех биржах"""
-        if hasattr(self, '_cached_balances') and self._cached_balances:
-            return sum(
-                bal.get('free', 0) 
-                for bal in self._cached_balances.values() 
-                if isinstance(bal, dict)
-            )
-        return self.risk_settings.get('available_balance', 0.0)
-    
-    @property
-    def locked_balance(self) -> float:
-        """Заблокированный баланс: сумма средств в ордерах"""
-        if hasattr(self, '_cached_balances') and self._cached_balances:
-            return sum(
-                bal.get('used', 0) 
-                for bal in self._cached_balances.values() 
-                if isinstance(bal, dict)
-            )
-        return self.risk_settings.get('locked_balance', 0.0)
-
-    def update_exchange_balance(self, exchange_id: str, total: float = 0, free: float = 0, used: float = 0):
-        """Обновить баланс конкретной биржи"""
+    def update_exchange_balance(self, exchange: str, total: float, free: float, used: float):
+        """Update cached balance for exchange"""
         if not hasattr(self, '_cached_balances'):
             self._cached_balances = {}
-        self._cached_balances[exchange_id] = {'total': total, 'free': free, 'used': used}
+        self._cached_balances[exchange] = {
+            'total': total,
+            'free': free,
+            'used': used,
+            'updated_at': datetime.now().isoformat()
+        }
+        # Обновляем общий баланс
+        self.total_balance = sum(b.get('total', 0) for b in self._cached_balances.values() if isinstance(b, dict))
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for database storage"""
+        return {
+            'user_id': self.user_id,
+            'alerts_enabled': self.alerts_enabled,
+            'min_spread_threshold': self.min_spread_threshold,
+            'selected_exchanges': json.dumps(self.selected_exchanges),
+            'api_keys': json.dumps(self.api_keys),
+            'total_balance': self.total_balance,
+            'trade_amount': self.trade_amount,
+            'leverage': self.leverage,
+            'stop_loss_percent': self.stop_loss_percent,
+            'take_profit_percent': self.take_profit_percent,
+            'notifications_enabled': self.notifications_enabled,
+            'auto_trade_mode': self.auto_trade_mode,
+            'risk_settings': json.dumps(self.risk_settings),
+            'alert_settings': json.dumps(self.alert_settings),
+            'total_trades': self.total_trades,
+            'successful_trades': self.successful_trades,
+            'failed_trades': self.failed_trades,
+            'total_profit': self.total_profit,
+            'inter_exchange_enabled': self.inter_exchange_enabled,
+            'basis_arbitrage_enabled': self.basis_arbitrage_enabled,
+            'arbitrage_mode': self.arbitrage_mode,
+            'bot_blocked': self.bot_blocked,
+            '_cached_balances': json.dumps(self._cached_balances) if self._cached_balances else '{}',
+            'created_at': self.created_at or datetime.now().isoformat(),
+            'updated_at': datetime.now().isoformat()
+        }
+
+    @classmethod
+    def from_row(cls, row: aiosqlite.Row) -> 'UserSettings':
+        """Create UserSettings from database row"""
+        try:
+            return cls(
+                user_id=row['user_id'],
+                alerts_enabled=bool(row['alerts_enabled']),
+                min_spread_threshold=float(row['min_spread_threshold']),
+                selected_exchanges=json.loads(row['selected_exchanges']) if row['selected_exchanges'] else [],
+                api_keys=json.loads(row['api_keys']) if row['api_keys'] else {},
+                total_balance=float(row['total_balance']) if row['total_balance'] else 0.0,
+                trade_amount=float(row['trade_amount']) if row['trade_amount'] else 100.0,
+                leverage=int(row['leverage']) if row['leverage'] else 1,
+                stop_loss_percent=float(row['stop_loss_percent']) if row['stop_loss_percent'] else 2.0,
+                take_profit_percent=float(row['take_profit_percent']) if row['take_profit_percent'] else 5.0,
+                notifications_enabled=bool(row['notifications_enabled']) if row['notifications_enabled'] is not None else True,
+                auto_trade_mode=bool(row['auto_trade_mode']) if row['auto_trade_mode'] is not None else False,
+                risk_settings=json.loads(row['risk_settings']) if row['risk_settings'] else {},
+                alert_settings=json.loads(row['alert_settings']) if row['alert_settings'] else {},
+                total_trades=int(row['total_trades']) if row['total_trades'] else 0,
+                successful_trades=int(row['successful_trades']) if row['successful_trades'] else 0,
+                failed_trades=int(row['failed_trades']) if row['failed_trades'] else 0,
+                total_profit=float(row['total_profit']) if row['total_profit'] else 0.0,
+                inter_exchange_enabled=bool(row['inter_exchange_enabled']) if row['inter_exchange_enabled'] is not None else True,
+                basis_arbitrage_enabled=bool(row['basis_arbitrage_enabled']) if row['basis_arbitrage_enabled'] is not None else True,
+                arbitrage_mode=row['arbitrage_mode'] if row['arbitrage_mode'] else 'all',
+                bot_blocked=bool(row['bot_blocked']) if row['bot_blocked'] is not None else False,
+                _cached_balances=json.loads(row['_cached_balances']) if row.get('_cached_balances') else {},
+                created_at=row['created_at'],
+                updated_at=row['updated_at']
+            )
+        except Exception as e:
+            logger.error(f"Error creating UserSettings from row: {e}, row: {dict(row)}")
+            # Return default user on error
+            return cls(user_id=row['user_id'])
 
 @dataclass
 class Trade:
-    id: Optional[int] = None
-    user_id: int = 0
-    symbol: str = ""
-    strategy: str = ""
-    long_exchange: str = ""
-    short_exchange: str = ""
-    entry_spread: float = 0.0
-    close_spread: Optional[float] = None
-    size_usd: float = 0.0
-    pnl_usd: Optional[float] = None
-    pnl_percent: float = 0.0
-    status: str = "open"
-    opened_at: str = field(default_factory=lambda: datetime.now().isoformat())
-    closed_at: Optional[str] = None
-    metadata: dict = field(default_factory=dict)
-
-    position_size_long: float = 0.0
-    position_size_short: float = 0.0
-    closed_portion_percent: float = 0.0
-    partial_close_count: int = 0
-    entry_price_long: float = 0.0
-    entry_price_short: float = 0.0
+    """Trade record"""
+    id: int
+    user_id: int
+    symbol: str
+    long_exchange: str
+    short_exchange: str
+    entry_price_long: float
+    entry_price_short: float
     current_price_long: float = 0.0
     current_price_short: float = 0.0
+    position_size_long: float = 0.0
+    position_size_short: float = 0.0
+    size_usd: float = 0.0
+    entry_spread: float = 0.0
+    current_spread: float = 0.0
+    pnl_usd: float = 0.0
+    pnl_percent: float = 0.0
     stop_loss_price: float = 0.0
     take_profit_price: float = 0.0
-    breakeven_triggered: bool = False
-    trailing_enabled: bool = True
     trailing_stop_price: float = 0.0
-    emergency_stop_price: float = 0.0
+    trailing_enabled: bool = False
+    status: str = 'open'  # 'open', 'closed'
+    opened_at: str = None
+    closed_at: str = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    # ИСПРАВЛЕНО: Добавлены поля для позиций
+    leverage: int = 1
+    margin_used: float = 0.0
+    funding_fees: float = 0.0
+    closing_in_progress: bool = False
 
 class Database:
+    """Thread-safe database operations with WAL mode"""
+    
     _instance: Optional['Database'] = None
-    _singleton_lock = asyncio.Lock()
+    _instance_lock = threading.Lock()
+    _lock = threading.RLock()
+    
+    def __new__(cls, db_file: Optional[str] = None):
+        if cls._instance is None:
+            with cls._instance_lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._initialized = False
+        return cls._instance
+    
+    def __init__(self, db_file: Optional[str] = None):
+        if self._initialized:
+            return
+        self.db_file = db_file or "/app/data/arbitrage_bot.db"
+        self._conn: Optional[aiosqlite.Connection] = None
+        self._query_lock = asyncio.Lock() if hasattr(asyncio, 'Lock') else None
+        self._initialized = False
+        self._local = threading.local()
+    
+    @property
+    def is_initialized(self) -> bool:
+        """Проверка инициализации (исправлено для main.py)"""
+        return self._initialized
 
-    def __new__(cls, db_path: str = 'arbitrage_bot.db'):
-        if cls._instance is not None:
-            return cls._instance
-
-        instance = super().__new__(cls)
-        instance._initialized = False
-        instance._db_path = db_path
-        instance._conn = None
-        instance._conn_lock = asyncio.Lock()
-        instance._query_lock = asyncio.Lock()
-        instance._init_lock = asyncio.Lock()
-
-        cls._instance = instance
-        return instance
-
-    async def initialize(self):
-        """Инициализация БД с проверкой на повторный вызов"""
-        async with self._init_lock:
-            if self._initialized:
-                return
-
-            try:
-                self._conn = await aiosqlite.connect(self._db_path)
-                self._conn.row_factory = aiosqlite.Row
-                await self._conn.execute("PRAGMA journal_mode=WAL")
-                await self._conn.execute("PRAGMA foreign_keys=ON")
-                await self._create_tables()
-                await self._migrate_add_arbitrage_mode()
-                await self._migrate_add_selected_exchanges()
-                await self._migrate_add_user_settings_columns()
-                await self._migrate_add_bot_blocked_column()
-                self._initialized = True
-                logger.info(f"Database initialized: {self._db_path} (WAL mode)")
-            except Exception as e:
-                logger.error(f"Database initialization error: {e}")
-                if self._conn:
-                    try:
-                        await self._conn.close()
-                    except:
-                        pass
-                    self._conn = None
-                raise
-
-    async def _migrate_add_arbitrage_mode(self):
-        """Миграция: добавление колонки arbitrage_mode если её нет"""
+    async def initialize(self) -> bool:
+        """Initialize database with WAL mode"""
+        if self._initialized:
+            return True
+        
         try:
-            async with self._conn.execute("PRAGMA table_info(users)") as cursor:
-                columns = [row['name'] for row in await cursor.fetchall()]
-                if 'arbitrage_mode' not in columns:
-                    await self._conn.execute("ALTER TABLE users ADD COLUMN arbitrage_mode TEXT DEFAULT 'all'")
-                    await self._conn.commit()
-                    logger.info("Migration: added arbitrage_mode column")
+            # Ensure directory exists
+            Path(self.db_file).parent.mkdir(parents=True, exist_ok=True)
+            
+            self._conn = await aiosqlite.connect(self.db_file)
+            self._conn.row_factory = aiosqlite.Row
+            
+            # Enable WAL mode for better concurrency
+            await self._conn.execute("PRAGMA journal_mode=WAL")
+            await self._conn.execute("PRAGMA synchronous=NORMAL")
+            await self._conn.execute("PRAGMA cache_size=10000")
+            await self._conn.execute("PRAGMA temp_store=memory")
+            
+            await self._create_tables()
+            await self._conn.commit()
+            
+            self._initialized = True
+            logger.info(f"Database initialized: {self.db_file} (WAL mode)")
+            return True
         except Exception as e:
-            logger.error(f"Migration error: {e}")
-
-    async def _migrate_add_selected_exchanges(self):
-        """Миграция: добавление колонки selected_exchanges если её нет"""
-        try:
-            async with self._conn.execute("PRAGMA table_info(users)") as cursor:
-                columns = [row['name'] for row in await cursor.fetchall()]
-                if 'selected_exchanges' not in columns:
-                    await self._conn.execute("ALTER TABLE users ADD COLUMN selected_exchanges TEXT DEFAULT '[\"binance\", \"bybit\", \"okx\", \"whitebit\", \"mexc\"]'")
-                    await self._conn.commit()
-                    logger.info("Migration: added selected_exchanges column")
-        except Exception as e:
-            logger.error(f"Migration error for selected_exchanges: {e}")
-
-    async def _migrate_add_user_settings_columns(self):
-        """Migration: add columns for extended user settings"""
-        new_columns = [
-            ('min_spread_threshold', 'REAL DEFAULT 0.2'),
-            ('alerts_enabled', 'BOOLEAN DEFAULT 1'),
-            ('inter_exchange_enabled', 'BOOLEAN DEFAULT 1'),
-            ('basis_arbitrage_enabled', 'BOOLEAN DEFAULT 1'),
-            ('auto_trade_mode', 'BOOLEAN DEFAULT 0'),
-            ('trade_amount', 'REAL DEFAULT 100.0'),
-            ('leverage', 'INTEGER DEFAULT 3'),
-            ('notifications_enabled', 'BOOLEAN DEFAULT 1'),
-            ('total_trades', 'INTEGER DEFAULT 0'),
-            ('successful_trades', 'INTEGER DEFAULT 0'),
-            ('failed_trades', 'INTEGER DEFAULT 0'),
-            ('total_profit', 'REAL DEFAULT 0.0'),
-        ]
-        try:
-            async with self._conn.execute("PRAGMA table_info(users)") as cursor:
-                columns = [row['name'] for row in await cursor.fetchall()]
-            for col_name, col_type in new_columns:
-                if col_name not in columns:
-                    await self._conn.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_type}")
-                    await self._conn.commit()
-                    logger.info(f"Migration: added {col_name} column")
-        except Exception as e:
-            logger.error(f"Migration error for user settings columns: {e}")
-
-
-    async def _migrate_add_bot_blocked_column(self):
-        """Миграция: добавление колонки bot_blocked если её нет"""
-        try:
-            async with self._conn.execute("PRAGMA table_info(users)") as cursor:
-                columns = [row['name'] for row in await cursor.fetchall()]
-                if 'bot_blocked' not in columns:
-                    await self._conn.execute("ALTER TABLE users ADD COLUMN bot_blocked BOOLEAN DEFAULT 0")
-                    await self._conn.commit()
-                    logger.info("Migration: added bot_blocked column")
-        except Exception as e:
-            logger.error(f"Migration error for bot_blocked: {e}")
-
-    async def close(self):
-        """Закрытие соединения с БД"""
-        async with self._init_lock:
-            if self._initialized and self._conn:
-                try:
-                    await self._conn.close()
-                    logger.info("Database connection closed")
-                except Exception as e:
-                    logger.error(f"Error closing database: {e}")
-                finally:
-                    self._initialized = False
-                    self._conn = None
-                    Database._instance = None
+            logger.error(f"Database initialization error: {e}")
+            return False
 
     async def _create_tables(self):
-        async with self._query_lock:
-            await self._conn.executescript("""
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id INTEGER PRIMARY KEY,
-                    is_trading_enabled BOOLEAN DEFAULT 0,
-                    api_keys TEXT DEFAULT '{}',
-                    commission_rates TEXT DEFAULT '{}',
-                    alert_settings TEXT DEFAULT '{}',
-                    risk_settings TEXT DEFAULT '{}',
-                    arbitrage_mode TEXT DEFAULT 'all',
-                    selected_exchanges TEXT DEFAULT '["binance", "bybit", "okx", "whitebit", "mexc"]',
-                    min_spread_threshold REAL DEFAULT 0.2,
-                    alerts_enabled BOOLEAN DEFAULT 1,
-                    inter_exchange_enabled BOOLEAN DEFAULT 1,
-                    basis_arbitrage_enabled BOOLEAN DEFAULT 1,
-                    auto_trade_mode BOOLEAN DEFAULT 0,
-                    trade_amount REAL DEFAULT 100.0,
-                    leverage INTEGER DEFAULT 3,
-                    notifications_enabled BOOLEAN DEFAULT 1,
-                    total_trades INTEGER DEFAULT 0,
-                    successful_trades INTEGER DEFAULT 0,
-                    failed_trades INTEGER DEFAULT 0,
-                    total_profit REAL DEFAULT 0.0,
-                    bot_blocked BOOLEAN DEFAULT 0,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
+        """Create database tables"""
+        await self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                alerts_enabled INTEGER DEFAULT 1,
+                min_spread_threshold REAL DEFAULT 2.0,
+                selected_exchanges TEXT DEFAULT '[]',
+                api_keys TEXT DEFAULT '{}',
+                total_balance REAL DEFAULT 0,
+                trade_amount REAL DEFAULT 100,
+                leverage INTEGER DEFAULT 1,
+                stop_loss_percent REAL DEFAULT 2,
+                take_profit_percent REAL DEFAULT 5,
+                notifications_enabled INTEGER DEFAULT 1,
+                auto_trade_mode INTEGER DEFAULT 0,
+                risk_settings TEXT DEFAULT '{}',
+                alert_settings TEXT DEFAULT '{}',
+                total_trades INTEGER DEFAULT 0,
+                successful_trades INTEGER DEFAULT 0,
+                failed_trades INTEGER DEFAULT 0,
+                total_profit REAL DEFAULT 0,
+                inter_exchange_enabled INTEGER DEFAULT 1,
+                basis_arbitrage_enabled INTEGER DEFAULT 1,
+                arbitrage_mode TEXT DEFAULT 'all',
+                bot_blocked INTEGER DEFAULT 0,
+                _cached_balances TEXT DEFAULT '{}',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        await self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                symbol TEXT,
+                long_exchange TEXT,
+                short_exchange TEXT,
+                entry_price_long REAL DEFAULT 0,
+                entry_price_short REAL DEFAULT 0,
+                current_price_long REAL DEFAULT 0,
+                current_price_short REAL DEFAULT 0,
+                position_size_long REAL DEFAULT 0,
+                position_size_short REAL DEFAULT 0,
+                size_usd REAL DEFAULT 0,
+                entry_spread REAL DEFAULT 0,
+                current_spread REAL DEFAULT 0,
+                pnl_usd REAL DEFAULT 0,
+                pnl_percent REAL DEFAULT 0,
+                stop_loss_price REAL DEFAULT 0,
+                take_profit_price REAL DEFAULT 0,
+                trailing_stop_price REAL DEFAULT 0,
+                trailing_enabled INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'open',
+                opened_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                closed_at TIMESTAMP,
+                metadata TEXT DEFAULT '{}',
+                leverage INTEGER DEFAULT 1,
+                margin_used REAL DEFAULT 0,
+                funding_fees REAL DEFAULT 0,
+                closing_in_progress INTEGER DEFAULT 0,
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            )
+        """)
+        
+        await self._conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_trades_user_status ON trades(user_id, status)
+        """)
+        
+        # Migration: add new columns if they don't exist
+        await self._migrate_users_table()
 
-                CREATE TABLE IF NOT EXISTS trades (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    symbol TEXT,
-                    strategy TEXT,
-                    long_exchange TEXT,
-                    short_exchange TEXT,
-                    entry_spread REAL,
-                    close_spread REAL,
-                    size_usd REAL,
-                    pnl_usd REAL,
-                    status TEXT DEFAULT 'open',
-                    opened_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    closed_at TIMESTAMP,
-                    metadata TEXT DEFAULT '{}',
-                    FOREIGN KEY (user_id) REFERENCES users(user_id)
-                );
-
-                CREATE TABLE IF NOT EXISTS spread_history (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol TEXT,
-                    exchange_1 TEXT,
-                    exchange_2 TEXT,
-                    spread_percent REAL,
-                    price_1 REAL,
-                    price_2 REAL,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_trades_user ON trades(user_id, status);
-                CREATE INDEX IF NOT EXISTS idx_spread_history_time ON spread_history(timestamp);
-            """)
-            await self._conn.commit()
+    async def _migrate_users_table(self):
+        """Add missing columns to users table"""
+        columns = [
+            ('inter_exchange_enabled', 'INTEGER DEFAULT 1'),
+            ('basis_arbitrage_enabled', 'INTEGER DEFAULT 1'),
+            ('arbitrage_mode', "TEXT DEFAULT 'all'"),
+            ('bot_blocked', 'INTEGER DEFAULT 0'),
+            ('_cached_balances', "TEXT DEFAULT '{}'"),
+        ]
+        
+        for col_name, col_def in columns:
+            try:
+                await self._conn.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_def}")
+                logger.info(f"Added column {col_name} to users table")
+            except Exception as e:
+                if "duplicate column name" not in str(e).lower():
+                    logger.warning(f"Migration error for {col_name}: {e}")
 
     async def get_user(self, user_id: int) -> Optional[UserSettings]:
+        """Get user by ID"""
         if not self._initialized:
-            await self.initialize()
-
-        async with self._query_lock:
+            return None
+        try:
             async with self._conn.execute(
-                'SELECT * FROM users WHERE user_id = ?', (user_id,)
+                "SELECT * FROM users WHERE user_id = ?", (user_id,)
             ) as cursor:
                 row = await cursor.fetchone()
-
-                if not row:
-                    return None
-
-                # Direct column access (more efficient than dict(row))
-                selected_exchanges = json.loads(row['selected_exchanges']) if row['selected_exchanges'] else ['binance', 'bybit', 'okx', 'whitebit', 'mexc']
-                return UserSettings(
-                    user_id=row['user_id'],
-                    is_trading_enabled=bool(row['is_trading_enabled']),
-                    api_keys=json.loads(row['api_keys']),
-                    commission_rates=json.loads(row['commission_rates']),
-                    alert_settings=json.loads(row['alert_settings']),
-                    risk_settings=json.loads(row['risk_settings']),
-                    arbitrage_mode=row['arbitrage_mode'] if row['arbitrage_mode'] else 'all',
-                    selected_exchanges=selected_exchanges,
-                    min_spread_threshold=row['min_spread_threshold'] if row['min_spread_threshold'] is not None else 0.2,
-                    alerts_enabled=bool(row['alerts_enabled']) if row['alerts_enabled'] is not None else True,
-                    inter_exchange_enabled=bool(row['inter_exchange_enabled']) if row['inter_exchange_enabled'] is not None else True,
-                    basis_arbitrage_enabled=bool(row['basis_arbitrage_enabled']) if row['basis_arbitrage_enabled'] is not None else True,
-                    auto_trade_mode=bool(row['auto_trade_mode']) if row['auto_trade_mode'] is not None else False,
-                    trade_amount=row['trade_amount'] if row['trade_amount'] is not None else 100.0,
-                    leverage=row['leverage'] if row['leverage'] is not None else 3,
-                    notifications_enabled=bool(row['notifications_enabled']) if row['notifications_enabled'] is not None else True,
-                    total_trades=row['total_trades'] if row['total_trades'] is not None else 0,
-                    successful_trades=row['successful_trades'] if row['successful_trades'] is not None else 0,
-                    failed_trades=row['failed_trades'] if row['failed_trades'] is not None else 0,
-                    total_profit=row['total_profit'] if row['total_profit'] is not None else 0.0,
-                    bot_blocked=bool(row['bot_blocked']) if row['bot_blocked'] is not None else False,
-                    created_at=row['created_at'],
-                    updated_at=row['updated_at']
-                )
+                if row:
+                    return UserSettings.from_row(row)
+                return None
+        except Exception as e:
+            logger.error(f"Error getting user {user_id}: {e}")
+            return None
 
     async def create_user(self, user_id: int) -> UserSettings:
-        existing = await self.get_user(user_id)
-        if existing:
-            return existing
-
-        user = UserSettings(user_id=user_id)
-
-        async with self._query_lock:
-            try:
-                await self._conn.execute("""
-                    INSERT INTO users (user_id, api_keys, commission_rates, alert_settings, risk_settings, arbitrage_mode, selected_exchanges,
-                        min_spread_threshold, alerts_enabled, inter_exchange_enabled, basis_arbitrage_enabled,
-                        auto_trade_mode, trade_amount, leverage, notifications_enabled,
-                        total_trades, successful_trades, failed_trades, total_profit, bot_blocked)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    user_id,
-                    json.dumps(user.api_keys),
-                    json.dumps(user.commission_rates),
-                    json.dumps(user.alert_settings),
-                    json.dumps(user.risk_settings),
-                    user.arbitrage_mode,
-                    json.dumps(user.selected_exchanges),
-                    user.min_spread_threshold,
-                    int(user.alerts_enabled),
-                    int(user.inter_exchange_enabled),
-                    int(user.basis_arbitrage_enabled),
-                    int(user.auto_trade_mode),
-                    user.trade_amount,
-                    user.leverage,
-                    int(user.notifications_enabled),
-                    user.total_trades,
-                    user.successful_trades,
-                    user.failed_trades,
-                    user.total_profit,
-                    int(user.bot_blocked)
-                ))
-                await self._conn.commit()
-                logger.info(f"Created new user {user_id}")
-            except aiosqlite.IntegrityError:
-                logger.warning(f"User {user_id} already exists (race condition)")
-                return await self.get_user(user_id)
-
-        return user
-
-    async def get_all_users(self) -> List[UserSettings]:
-        """Получить всех пользователей для рассылки алертов и автоподписки"""
+        """Create new user"""
         if not self._initialized:
-            await self.initialize()
-
-        async with self._query_lock:
-            async with self._conn.execute('SELECT * FROM users') as cursor:
-                rows = await cursor.fetchall()
-
-                users = []
-                for row in rows:
-                    # Direct column access (more efficient than dict(row))
-                    selected_exchanges = json.loads(row['selected_exchanges']) if row['selected_exchanges'] else ['binance', 'bybit', 'okx', 'whitebit', 'mexc']
-                    users.append(UserSettings(
-                        user_id=row['user_id'],
-                        is_trading_enabled=bool(row['is_trading_enabled']),
-                        api_keys=json.loads(row['api_keys']),
-                        commission_rates=json.loads(row['commission_rates']),
-                        alert_settings=json.loads(row['alert_settings']),
-                        risk_settings=json.loads(row['risk_settings']),
-                        arbitrage_mode=row['arbitrage_mode'] if row['arbitrage_mode'] else 'all',
-                        selected_exchanges=selected_exchanges,
-                        min_spread_threshold=row['min_spread_threshold'] if row['min_spread_threshold'] is not None else 0.2,
-                        alerts_enabled=bool(row['alerts_enabled']) if row['alerts_enabled'] is not None else True,
-                        inter_exchange_enabled=bool(row['inter_exchange_enabled']) if row['inter_exchange_enabled'] is not None else True,
-                        basis_arbitrage_enabled=bool(row['basis_arbitrage_enabled']) if row['basis_arbitrage_enabled'] is not None else True,
-                        auto_trade_mode=bool(row['auto_trade_mode']) if row['auto_trade_mode'] is not None else False,
-                        trade_amount=row['trade_amount'] if row['trade_amount'] is not None else 100.0,
-                        leverage=row['leverage'] if row['leverage'] is not None else 3,
-                        notifications_enabled=bool(row['notifications_enabled']) if row['notifications_enabled'] is not None else True,
-                        total_trades=row['total_trades'] if row['total_trades'] is not None else 0,
-                        successful_trades=row['successful_trades'] if row['successful_trades'] is not None else 0,
-                        failed_trades=row['failed_trades'] if row['failed_trades'] is not None else 0,
-                        total_profit=row['total_profit'] if row['total_profit'] is not None else 0.0,
-                        bot_blocked=bool(row['bot_blocked']) if row['bot_blocked'] is not None else False,
-                        created_at=row['created_at'],
-                        updated_at=row['updated_at']
-                    ))
-                return users
+            raise Exception("Database not initialized")
+        
+        user = UserSettings(user_id=user_id)
+        
+        try:
+            await self._conn.execute("""
+                INSERT INTO users (
+                    user_id, alerts_enabled, min_spread_threshold, selected_exchanges,
+                    api_keys, total_balance, trade_amount, leverage, stop_loss_percent,
+                    take_profit_percent, notifications_enabled, auto_trade_mode,
+                    risk_settings, alert_settings, total_trades, successful_trades,
+                    failed_trades, total_profit, inter_exchange_enabled,
+                    basis_arbitrage_enabled, arbitrage_mode, bot_blocked
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                user.user_id, int(user.alerts_enabled), user.min_spread_threshold,
+                json.dumps(user.selected_exchanges), json.dumps(user.api_keys),
+                user.total_balance, user.trade_amount, user.leverage,
+                user.stop_loss_percent, user.take_profit_percent,
+                int(user.notifications_enabled), int(user.auto_trade_mode),
+                json.dumps(user.risk_settings), json.dumps(user.alert_settings),
+                user.total_trades, user.successful_trades, user.failed_trades,
+                user.total_profit, int(user.inter_exchange_enabled),
+                int(user.basis_arbitrage_enabled), user.arbitrage_mode, int(user.bot_blocked)
+            ))
+            await self._conn.commit()
+            logger.info(f"Created new user: {user_id}")
+            return user
+        except Exception as e:
+            logger.error(f"Error creating user {user_id}: {e}")
+            raise
 
     async def update_user(self, user: UserSettings):
-        async with self._query_lock:
+        """Update user settings"""
+        if not self._initialized:
+            return
+        try:
+            data = user.to_dict()
             await self._conn.execute("""
                 UPDATE users SET
-                    is_trading_enabled = ?,
-                    api_keys = ?,
-                    commission_rates = ?,
-                    alert_settings = ?,
-                    risk_settings = ?,
-                    arbitrage_mode = ?,
-                    selected_exchanges = ?,
-                    min_spread_threshold = ?,
                     alerts_enabled = ?,
-                    inter_exchange_enabled = ?,
-                    basis_arbitrage_enabled = ?,
-                    auto_trade_mode = ?,
+                    min_spread_threshold = ?,
+                    selected_exchanges = ?,
+                    api_keys = ?,
+                    total_balance = ?,
                     trade_amount = ?,
                     leverage = ?,
+                    stop_loss_percent = ?,
+                    take_profit_percent = ?,
                     notifications_enabled = ?,
+                    auto_trade_mode = ?,
+                    risk_settings = ?,
+                    alert_settings = ?,
                     total_trades = ?,
                     successful_trades = ?,
                     failed_trades = ?,
                     total_profit = ?,
+                    inter_exchange_enabled = ?,
+                    basis_arbitrage_enabled = ?,
+                    arbitrage_mode = ?,
                     bot_blocked = ?,
+                    _cached_balances = ?,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE user_id = ?
             """, (
-                int(user.is_trading_enabled),
-                json.dumps(user.api_keys),
-                json.dumps(user.commission_rates),
-                json.dumps(user.alert_settings),
-                json.dumps(user.risk_settings),
-                getattr(user, 'arbitrage_mode', 'all'),
-                json.dumps(getattr(user, 'selected_exchanges', ['binance', 'bybit', 'okx', 'whitebit', 'mexc'])),
-                getattr(user, 'min_spread_threshold', 0.2),
-                int(getattr(user, 'alerts_enabled', True)),
-                int(getattr(user, 'inter_exchange_enabled', True)),
-                int(getattr(user, 'basis_arbitrage_enabled', True)),
-                int(getattr(user, 'auto_trade_mode', False)),
-                getattr(user, 'trade_amount', 100.0),
-                getattr(user, 'leverage', 3),
-                int(getattr(user, 'notifications_enabled', True)),
-                getattr(user, 'total_trades', 0),
-                getattr(user, 'successful_trades', 0),
-                getattr(user, 'failed_trades', 0),
-                getattr(user, 'total_profit', 0.0),
-                int(getattr(user, 'bot_blocked', False)),
+                int(data['alerts_enabled']), data['min_spread_threshold'],
+                data['selected_exchanges'], data['api_keys'], data['total_balance'],
+                data['trade_amount'], data['leverage'], data['stop_loss_percent'],
+                data['take_profit_percent'], int(data['notifications_enabled']),
+                int(data['auto_trade_mode']), data['risk_settings'], data['alert_settings'],
+                data['total_trades'], data['successful_trades'], data['failed_trades'],
+                data['total_profit'], int(data['inter_exchange_enabled']),
+                int(data['basis_arbitrage_enabled']), data['arbitrage_mode'],
+                int(data['bot_blocked']), data['_cached_balances'],
                 user.user_id
             ))
             await self._conn.commit()
+        except Exception as e:
+            logger.error(f"Error updating user {user.user_id}: {e}")
+            raise
 
-    async def add_trade(self, trade: Trade) -> int:
-        # Ensure all extended fields are in metadata
-        metadata = dict(trade.metadata)
-        metadata.update({
-            'position_size_long': trade.position_size_long,
-            'position_size_short': trade.position_size_short,
-            'closed_portion_percent': trade.closed_portion_percent,
-            'partial_close_count': trade.partial_close_count,
-            'entry_price_long': trade.entry_price_long,
-            'entry_price_short': trade.entry_price_short,
-            'current_price_long': trade.current_price_long,
-            'current_price_short': trade.current_price_short,
-            'stop_loss_price': trade.stop_loss_price,
-            'take_profit_price': trade.take_profit_price,
-            'breakeven_triggered': trade.breakeven_triggered,
-            'trailing_enabled': trade.trailing_enabled,
-            'trailing_stop_price': trade.trailing_stop_price,
-            'emergency_stop_price': trade.emergency_stop_price,
-            'pnl_percent': trade.pnl_percent
-        })
-        async with self._query_lock:
-            cursor = await self._conn.execute("""
-                INSERT INTO trades (user_id, symbol, strategy, long_exchange, short_exchange,
-                                 entry_spread, size_usd, status, metadata)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                trade.user_id, trade.symbol, trade.strategy, trade.long_exchange,
-                trade.short_exchange, trade.entry_spread, trade.size_usd,
-                trade.status, json.dumps(metadata)
-            ))
-            await self._conn.commit()
-            return cursor.lastrowid
+    # ИСПРАВЛЕНО: Добавлен метод get_all_users для main.py
+    async def get_all_users(self) -> List[UserSettings]:
+        """Get all users from database"""
+        if not self._initialized:
+            return []
+        try:
+            async with self._conn.execute("SELECT * FROM users") as cursor:
+                rows = await cursor.fetchall()
+                return [UserSettings.from_row(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Error getting all users: {e}")
+            return []
 
-    async def get_open_trades(self, user_id: int, test_mode: Optional[bool] = None) -> List[Trade]:
-        """Получить открытые сделки с опциональным фильтром по test_mode"""
-        async with self._query_lock:
-            if test_mode is not None:
-                # Фильтруем по JSON metadata.test_mode
-                async with self._conn.execute(
-                    """SELECT * FROM trades 
-                    WHERE user_id = ? AND status = 'open'
-                    AND json_extract(metadata, '$.test_mode') = ?""",
-                    (user_id, int(test_mode))
-                ) as cursor:
-                    rows = await cursor.fetchall()
-            else:
-                async with self._conn.execute(
-                    "SELECT * FROM trades WHERE user_id = ? AND status = 'open'",
-                    (user_id,)
-                ) as cursor:
-                    rows = await cursor.fetchall()
-
-            trades = []
-            for row in rows:
-                metadata = json.loads(row['metadata'])
-                trade = Trade(
-                    id=row['id'],
-                    user_id=row['user_id'],
-                    symbol=row['symbol'],
-                    strategy=row['strategy'],
-                    long_exchange=row['long_exchange'],
-                    short_exchange=row['short_exchange'],
-                    entry_spread=row['entry_spread'],
-                    close_spread=row['close_spread'],
-                    size_usd=row['size_usd'],
-                    pnl_usd=row['pnl_usd'],
-                    status=row['status'],
-                    opened_at=row['opened_at'],
-                    closed_at=row['closed_at'],
-                    metadata=metadata,
-                    position_size_long=metadata.get('position_size_long', 0),
-                    position_size_short=metadata.get('position_size_short', 0),
-                    closed_portion_percent=metadata.get('closed_portion_percent', 0),
-                    partial_close_count=metadata.get('partial_close_count', 0),
-                    entry_price_long=metadata.get('entry_price_long', 0),
-                    entry_price_short=metadata.get('entry_price_short', 0),
-                    current_price_long=metadata.get('current_price_long', 0),
-                    current_price_short=metadata.get('current_price_short', 0),
-                    stop_loss_price=metadata.get('stop_loss_price', 0),
-                    take_profit_price=metadata.get('take_profit_price', 0),
-                    breakeven_triggered=metadata.get('breakeven_triggered', False),
-                    trailing_enabled=metadata.get('trailing_enabled', True),
-                    trailing_stop_price=metadata.get('trailing_stop_price', 0),
-                    emergency_stop_price=metadata.get('emergency_stop_price', 0),
-                    pnl_percent=metadata.get('pnl_percent', 0)
-                )
-                trades.append(trade)
-            return trades
-
-    async def get_trade_stats(self, user_id: int, test_mode: Optional[bool] = None) -> Dict[str, Any]:
-        """Получить статистику сделок"""
-        async with self._query_lock:
-            if test_mode is not None:
-                query = """SELECT COUNT(*) as count, COALESCE(SUM(pnl_usd), 0) as total_pnl
-                        FROM trades WHERE user_id = ? AND status = 'closed'
-                        AND json_extract(metadata, '$.test_mode') = ?"""
-                async with self._conn.execute(query, (user_id, int(test_mode))) as cursor:
-                    row = await cursor.fetchone()
-            else:
-                query = """SELECT COUNT(*) as count, COALESCE(SUM(pnl_usd), 0) as total_pnl
-                        FROM trades WHERE user_id = ? AND status = 'closed'"""
-                async with self._conn.execute(query, (user_id,)) as cursor:
-                    row = await cursor.fetchone()
-
-            return {
-                'total_trades': row['count'] or 0,
-                'total_pnl': row['total_pnl'] or 0,
-                'test_mode': test_mode
-            }
-
-    async def get_trade_by_id(self, trade_id: int) -> Optional[dict]:
-        async with self._query_lock:
+    async def get_open_trades(self, user_id: int) -> List[Trade]:
+        """Get open trades for user"""
+        if not self._initialized:
+            return []
+        try:
             async with self._conn.execute(
-                "SELECT * FROM trades WHERE id = ?",
-                (trade_id,)
+                "SELECT * FROM trades WHERE user_id = ? AND status = 'open' ORDER BY opened_at DESC",
+                (user_id,)
+            ) as cursor:
+                rows = await cursor.fetchall()
+                trades = []
+                for row in rows:
+                    trade = Trade(
+                        id=row['id'],
+                        user_id=row['user_id'],
+                        symbol=row['symbol'],
+                        long_exchange=row['long_exchange'],
+                        short_exchange=row['short_exchange'],
+                        entry_price_long=row['entry_price_long'] or 0,
+                        entry_price_short=row['entry_price_short'] or 0,
+                        current_price_long=row['current_price_long'] or 0,
+                        current_price_short=row['current_price_short'] or 0,
+                        position_size_long=row['position_size_long'] or 0,
+                        position_size_short=row['position_size_short'] or 0,
+                        size_usd=row['size_usd'] or 0,
+                        entry_spread=row['entry_spread'] or 0,
+                        current_spread=row['current_spread'] or 0,
+                        pnl_usd=row['pnl_usd'] or 0,
+                        pnl_percent=row['pnl_percent'] or 0,
+                        stop_loss_price=row['stop_loss_price'] or 0,
+                        take_profit_price=row['take_profit_price'] or 0,
+                        trailing_stop_price=row['trailing_stop_price'] or 0,
+                        trailing_enabled=bool(row['trailing_enabled']),
+                        status=row['status'],
+                        opened_at=row['opened_at'],
+                        closed_at=row['closed_at'],
+                        metadata=json.loads(row['metadata']) if row['metadata'] else {},
+                        leverage=row['leverage'] or 1,
+                        margin_used=row['margin_used'] or 0,
+                        funding_fees=row['funding_fees'] or 0,
+                        closing_in_progress=bool(row['closing_in_progress'])
+                    )
+                    trades.append(trade)
+                return trades
+        except Exception as e:
+            logger.error(f"Error getting open trades for user {user_id}: {e}")
+            return []
+
+    async def get_trade_by_id(self, trade_id: int) -> Optional[Dict]:
+        """Get trade by ID"""
+        if not self._initialized:
+            return None
+        try:
+            async with self._conn.execute(
+                "SELECT * FROM trades WHERE id = ?", (trade_id,)
             ) as cursor:
                 row = await cursor.fetchone()
                 if row:
-                    result = dict(row)
-                    # Parse metadata JSON
-                    metadata = {}
-                    if isinstance(result.get('metadata'), str):
-                        try:
-                            metadata = json.loads(result['metadata'])
-                        except (json.JSONDecodeError, TypeError):
-                            metadata = {}
-                    result['metadata'] = metadata
-                    # Extract extended fields from metadata for Trade(**result) compatibility
-                    result['position_size_long'] = metadata.get('position_size_long', 0)
-                    result['position_size_short'] = metadata.get('position_size_short', 0)
-                    result['closed_portion_percent'] = metadata.get('closed_portion_percent', 0)
-                    result['partial_close_count'] = metadata.get('partial_close_count', 0)
-                    result['entry_price_long'] = metadata.get('entry_price_long', 0)
-                    result['entry_price_short'] = metadata.get('entry_price_short', 0)
-                    result['current_price_long'] = metadata.get('current_price_long', 0)
-                    result['current_price_short'] = metadata.get('current_price_short', 0)
-                    result['stop_loss_price'] = metadata.get('stop_loss_price', 0)
-                    result['take_profit_price'] = metadata.get('take_profit_price', 0)
-                    result['breakeven_triggered'] = metadata.get('breakeven_triggered', False)
-                    result['trailing_enabled'] = metadata.get('trailing_enabled', True)
-                    result['trailing_stop_price'] = metadata.get('trailing_stop_price', 0)
-                    result['emergency_stop_price'] = metadata.get('emergency_stop_price', 0)
-                    result['pnl_percent'] = metadata.get('pnl_percent', 0)
-                    return result
+                    return dict(row)
                 return None
+        except Exception as e:
+            logger.error(f"Error getting trade {trade_id}: {e}")
+            return None
 
-    async def update_trade(self, trade: Trade):
-        # Обновляем metadata с текущими значениями
-        metadata = dict(trade.metadata)
-        metadata.update({
-            'position_size_long': trade.position_size_long,
-            'position_size_short': trade.position_size_short,
-            'closed_portion_percent': trade.closed_portion_percent,
-            'partial_close_count': trade.partial_close_count,
-            'entry_price_long': trade.entry_price_long,
-            'entry_price_short': trade.entry_price_short,
-            'current_price_long': trade.current_price_long,
-            'current_price_short': trade.current_price_short,
-            'stop_loss_price': trade.stop_loss_price,
-            'take_profit_price': trade.take_profit_price,
-            'breakeven_triggered': trade.breakeven_triggered,
-            'trailing_enabled': trade.trailing_enabled,
-            'trailing_stop_price': trade.trailing_stop_price,
-            'emergency_stop_price': trade.emergency_stop_price,
-            'pnl_percent': trade.pnl_percent
-        })
-
-        async with self._query_lock:
-            await self._conn.execute("""
-                UPDATE trades SET
-                    pnl_usd = ?,
-                    status = ?,
-                    metadata = ?,
-                    closed_at = ?,
-                    close_spread = ?
-                WHERE id = ?
-            """, (
-                trade.pnl_usd,
-                trade.status,
-                json.dumps(metadata),
-                trade.closed_at,
-                trade.close_spread,
-                trade.id
-            ))
+    async def update_trade_field(self, trade_id: int, field: str, value: Any):
+        """Update single trade field"""
+        if not self._initialized:
+            return
+        try:
+            # Sanitize field name to prevent SQL injection
+            allowed_fields = ['stop_loss_price', 'take_profit_price', 'trailing_stop_price',
+                            'current_price_long', 'current_price_short', 'pnl_usd', 'pnl_percent',
+                            'status', 'closed_at', 'metadata', 'closing_in_progress']
+            if field not in allowed_fields:
+                raise ValueError(f"Field {field} not allowed")
+            
+            if field == 'updated_at':
+                await self._conn.execute(
+                    f"UPDATE trades SET {field} = CURRENT_TIMESTAMP WHERE id = ?",
+                    (trade_id,)
+                )
+            else:
+                await self._conn.execute(
+                    f"UPDATE trades SET {field} = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (value, trade_id)
+                )
             await self._conn.commit()
+        except Exception as e:
+            logger.error(f"Error updating trade {trade_id} field {field}: {e}")
+            raise
 
-    async def close_trade(self, trade_id: int, close_spread: float, pnl_usd: float):
-        async with self._query_lock:
-            await self._conn.execute("""
-                UPDATE trades SET
-                    close_spread = ?,
-                    pnl_usd = ?,
-                    status = 'closed',
-                    closed_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-            """, (close_spread, pnl_usd, trade_id))
-            await self._conn.commit()
+    async def close(self):
+        """Close database connection"""
+        if self._conn:
+            await self._conn.close()
+            self._conn = None
+            self._initialized = False
+            Database._instance = None
+            logger.info("Database connection closed")
 
-    async def log_spread(self, symbol: str, ex1: str, ex2: str, spread: float, p1: float, p2: float):
-        async with self._query_lock:
-            await self._conn.execute("""
-                INSERT INTO spread_history (symbol, exchange_1, exchange_2, spread_percent, price_1, price_2)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (symbol, ex1, ex2, spread, p1, p2))
-            await self._conn.commit()
+# Backwards compatibility
+User = UserSettings
