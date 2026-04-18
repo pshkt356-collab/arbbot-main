@@ -15,14 +15,16 @@ from collections import defaultdict, namedtuple, OrderedDict
 from typing import Optional, List, Dict, Callable, Any, Set, Tuple
 from dataclasses import dataclass, field
 
-from config import (
-    SPREAD_TTL_SECONDS,
-    SCAN_INTERVAL,
-    MIN_VOLUME_24H,
-    EXCHANGE_PRIORITY
-)
+# ИСПРАВЛЕНО: Правильные импорты из config (нижний регистр)
+from config import settings
 
 logger = logging.getLogger(__name__)
+
+# ИСПРАВЛЕНО: Используем значения из settings вместо констант
+SPREAD_TTL_SECONDS = settings.spread_ttl_seconds
+SCAN_INTERVAL = settings.scan_interval
+MIN_VOLUME_24H = settings.min_volume_24h
+EXCHANGE_PRIORITY = ['binance', 'bybit', 'okx', 'mexc', 'whitebit']
 
 # Named tuple для спреда
 PriceData = namedtuple('PriceData', ['last_price', 'bid', 'ask', 'volume_24h'])
