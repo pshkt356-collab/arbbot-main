@@ -168,7 +168,20 @@ async def show_active_spreads(callback: CallbackQuery, user: UserSettings, scann
                 f"  📈 {escape_html(sell_ex)}: {sell_px:.6f}\n\n"
             )
 
-        builder = InlineKeyboardBuilder()
+        # Добавляем кнопки торговли для каждого спреда (макс 5)
+        trade_count = 0
+        for spread in spreads[:5]:
+            sym = spread.get('symbol', 'N/A')
+            bex = spread.get('buy_exchange', 'N/A')
+            sex = spread.get('sell_exchange', 'N/A')
+            builder.row(
+                InlineKeyboardButton(text=f"🚀 {sym[:12]}", callback_data=f"trade:open:{sym}:{bex}:{sex}"),
+                InlineKeyboardButton(text="📈 Лонг", callback_data=f"trade:open_long:{sym}:{bex}"),
+                InlineKeyboardButton(text="📉 Шорт", callback_data=f"trade:open_short:{sym}:{sex}"),
+                InlineKeyboardButton(text="🔍", callback_data=f"trade:details:{sym}:{bex}:{sex}")
+            )
+            trade_count += 1
+
         builder.row(
             InlineKeyboardButton(text="🔄 Обновить", callback_data="spreads:active"),
             InlineKeyboardButton(text="📱 Меню", callback_data="menu:main")
@@ -372,7 +385,7 @@ async def send_spread_alert(spread_info, user_id: int):
     # Пропускаем заблокированных пользователей (кэш)
     if user_id in _blocked_users_cache:
         return
-        # Check user alert settings from DB before sending
+    # Check user alert settings from DB before sending
         try:
             db_chk = Database()
             await db_chk.initialize()
@@ -450,8 +463,27 @@ async def send_spread_alert(spread_info, user_id: int):
                 f"   {sell_px:.6f} USDT"
             )
 
+        # Создаем клавиатуру для торговли
+        trade_keyboard = InlineKeyboardBuilder()
+        trade_keyboard.row(
+            InlineKeyboardButton(text="⚡ Открыть сделку", callback_data=f"trade:open:{symbol}:{buy_ex}:{sell_ex}")
+        )
+        trade_keyboard.row(
+            InlineKeyboardButton(text=f"📈 Лонг {buy_ex[:10]}", callback_data=f"trade:open_long:{symbol}:{buy_ex}"),
+            InlineKeyboardButton(text=f"📉 Шорт {sell_ex[:10]}", callback_data=f"trade:open_short:{symbol}:{sell_ex}")
+        )
+        trade_keyboard.row(
+            InlineKeyboardButton(text="🔍 Детали", callback_data=f"trade:details:{symbol}:{buy_ex}:{sell_ex}"),
+            InlineKeyboardButton(text="❌ Пропустить", callback_data="trade:skip")
+        )
+
         # Явно конвертируем user_id в int
-        await _bot.send_message(chat_id=int(user_id), text=text, parse_mode=ParseMode.HTML)
+        await _bot.send_message(
+            chat_id=int(user_id),
+            text=text,
+            reply_markup=trade_keyboard.as_markup(),
+            parse_mode=ParseMode.HTML
+        )
 
     except TelegramForbiddenError as e:
         # Пользователь заблокировал бота — помечаем и отписываем
@@ -1178,3 +1210,524 @@ async def callback_error_handler(update: Update, exception: Exception):
             await update.message.answer("❌ Произошла ошибка. Попробуйте /start")
     except Exception as e:
         logger.error(f"Failed to send error notification: {e}")
+
+
+# ==================== TRADE EXECUTION HANDLERS ====================
+
+@callbacks_router.callback_query(F.data.startswith("trade:open:"))
+async def handle_trade_open(callback: CallbackQuery, user: UserSettings, scanner=None, db: Database = None):
+    """Открыть сделку на обеих биржах (лонг + шорт)"""
+    await callback.answer()
+    parts = callback.data.split(":")
+    if len(parts) < 5:
+        await callback.message.answer("❌ Ошибка данных сделки")
+        return
+    symbol = parts[2]
+    buy_ex = parts[3]
+    sell_ex = parts[4]
+    if not db:
+        await callback.message.answer("❌ База данных недоступна")
+        return
+    open_trades = await db.get_open_trades(user.user_id)
+    max_pos = user.risk_settings.get('max_open_positions', 5)
+    if len(open_trades) >= max_pos:
+        await callback.answer(f"❌ Лимит позиций: {max_pos}", show_alert=True)
+        return
+    size = min(user.trade_amount, user.risk_settings.get('max_position_usd', 10000))
+    if size < 10:
+        size = 100
+    keyboard = InlineKeyboardBuilder()
+    keyboard.row(
+        InlineKeyboardButton(text=f"✅ Подтвердить ${size:.0f}", callback_data=f"trade:confirm:{symbol}:{buy_ex}:{sell_ex}:{size:.0f}"),
+        InlineKeyboardButton(text="❌ Отмена", callback_data="trade:cancel")
+    )
+    keyboard.row(
+        InlineKeyboardButton(text="$50", callback_data=f"trade:confirm:{symbol}:{buy_ex}:{sell_ex}:50"),
+        InlineKeyboardButton(text="$100", callback_data=f"trade:confirm:{symbol}:{buy_ex}:{sell_ex}:100"),
+        InlineKeyboardButton(text="$500", callback_data=f"trade:confirm:{symbol}:{buy_ex}:{sell_ex}:500"),
+        InlineKeyboardButton(text="$1000", callback_data=f"trade:confirm:{symbol}:{buy_ex}:{sell_ex}:1000")
+    )
+    await callback.message.answer(
+        f"⚡ **Открытие арбитражной сделки**\n\n"
+        f"💎 **{escape_html(symbol)}**\n"
+        f"📈 Лонг: {escape_html(buy_ex)}\n"
+        f"📉 Шорт: {escape_html(sell_ex)}\n"
+        f"💰 Размер: ${size:.0f} (плечо {user.leverage}x)\n\n"
+        f"Подтвердите открытие:",
+        reply_markup=keyboard.as_markup()
+    )
+
+@callbacks_router.callback_query(F.data.startswith("trade:open_long:"))
+async def handle_trade_open_long(callback: CallbackQuery, user: UserSettings, scanner=None, db: Database = None):
+    """Открыть только лонг позицию на одной бирже"""
+    await callback.answer()
+    parts = callback.data.split(":")
+    if len(parts) < 4:
+        await callback.message.answer("❌ Ошибка данных")
+        return
+    symbol = parts[2]
+    exchange = parts[3]
+    if not db:
+        await callback.message.answer("❌ База данных недоступна")
+        return
+    open_trades = await db.get_open_trades(user.user_id)
+    max_pos = user.risk_settings.get('max_open_positions', 5)
+    if len(open_trades) >= max_pos:
+        await callback.answer(f"❌ Лимит позиций: {max_pos}", show_alert=True)
+        return
+    size = min(user.trade_amount, user.risk_settings.get('max_position_usd', 10000))
+    if size < 10:
+        size = 100
+    keyboard = InlineKeyboardBuilder()
+    keyboard.row(
+        InlineKeyboardButton(text=f"✅ Лонг ${size:.0f}", callback_data=f"trade:confirm_long:{symbol}:{exchange}:{size:.0f}"),
+        InlineKeyboardButton(text="❌ Отмена", callback_data="trade:cancel")
+    )
+    keyboard.row(
+        InlineKeyboardButton(text="$50", callback_data=f"trade:confirm_long:{symbol}:{exchange}:50"),
+        InlineKeyboardButton(text="$100", callback_data=f"trade:confirm_long:{symbol}:{exchange}:100"),
+        InlineKeyboardButton(text="$500", callback_data=f"trade:confirm_long:{symbol}:{exchange}:500")
+    )
+    await callback.message.answer(
+        f"📈 **Открытие ЛОНГ позиции**\n\n"
+        f"💎 **{escape_html(symbol)}**\n"
+        f"🏦 Биржа: {escape_html(exchange)}\n"
+        f"💰 Размер: ${size:.0f} (плечо {user.leverage}x)\n\n"
+        f"Подтвердите открытие:",
+        reply_markup=keyboard.as_markup()
+    )
+
+@callbacks_router.callback_query(F.data.startswith("trade:open_short:"))
+async def handle_trade_open_short(callback: CallbackQuery, user: UserSettings, scanner=None, db: Database = None):
+    """Открыть только шорт позицию на одной бирже"""
+    await callback.answer()
+    parts = callback.data.split(":")
+    if len(parts) < 4:
+        await callback.message.answer("❌ Ошибка данных")
+        return
+    symbol = parts[2]
+    exchange = parts[3]
+    if not db:
+        await callback.message.answer("❌ База данных недоступна")
+        return
+    open_trades = await db.get_open_trades(user.user_id)
+    max_pos = user.risk_settings.get('max_open_positions', 5)
+    if len(open_trades) >= max_pos:
+        await callback.answer(f"❌ Лимит позиций: {max_pos}", show_alert=True)
+        return
+    size = min(user.trade_amount, user.risk_settings.get('max_position_usd', 10000))
+    if size < 10:
+        size = 100
+    keyboard = InlineKeyboardBuilder()
+    keyboard.row(
+        InlineKeyboardButton(text=f"✅ Шорт ${size:.0f}", callback_data=f"trade:confirm_short:{symbol}:{exchange}:{size:.0f}"),
+        InlineKeyboardButton(text="❌ Отмена", callback_data="trade:cancel")
+    )
+    keyboard.row(
+        InlineKeyboardButton(text="$50", callback_data=f"trade:confirm_short:{symbol}:{exchange}:50"),
+        InlineKeyboardButton(text="$100", callback_data=f"trade:confirm_short:{symbol}:{exchange}:100"),
+        InlineKeyboardButton(text="$500", callback_data=f"trade:confirm_short:{symbol}:{exchange}:500")
+    )
+    await callback.message.answer(
+        f"📉 **Открытие ШОРТ позиции**\n\n"
+        f"💎 **{escape_html(symbol)}**\n"
+        f"🏦 Биржа: {escape_html(exchange)}\n"
+        f"💰 Размер: ${size:.0f} (плечо {user.leverage}x)\n\n"
+        f"Подтвердите открытие:",
+        reply_markup=keyboard.as_markup()
+    )
+
+@callbacks_router.callback_query(F.data.startswith("trade:confirm:"))
+async def handle_trade_confirm(callback: CallbackQuery, user: UserSettings, scanner=None, db: Database = None):
+    """Подтверждение открытия сделки"""
+    await callback.answer("⏳ Открываю сделку...")
+    parts = callback.data.split(":")
+    if len(parts) < 6:
+        await callback.message.answer("❌ Ошибка подтверждения")
+        return
+    symbol = parts[2]
+    buy_ex = parts[3]
+    sell_ex = parts[4]
+    try:
+        size = float(parts[5])
+    except ValueError:
+        size = 100
+    if not db:
+        await callback.message.answer("❌ База данных недоступна")
+        return
+    try:
+        from services.trading_engine import trading_engine
+        spread_key = f"{symbol}:{buy_ex}:{sell_ex}"
+        scanner_prices = scanner.prices if scanner and hasattr(scanner, 'prices') else {}
+        result = await trading_engine.validate_and_open(
+            user=user, spread_key=spread_key, scanner_prices=scanner_prices,
+            test_mode=user.alert_settings.get('test_mode', True)
+        )
+        if result.success:
+            user.total_trades += 1
+            await db.update_user(user)
+            await callback.message.answer(
+                f"✅ **Сделка #{result.trade_id} открыта!**\n\n"
+                f"💎 {escape_html(symbol)}\n"
+                f"📈 Лонг: {escape_html(buy_ex)}\n"
+                f"📉 Шорт: {escape_html(sell_ex)}\n"
+                f"💰 Размер: ${size:.0f}\n\n"
+                f"📊 Отслеживание активировано"
+            )
+        else:
+            await callback.message.answer(
+                f"❌ **Не удалось открыть сделку**\n\n"
+                f"Причина: {escape_html(result.error or 'Неизвестная ошибка')}"
+            )
+    except Exception as e:
+        logger.error(f"Trade confirm error: {e}")
+        await callback.message.answer(f"❌ Ошибка: {escape_html(str(e))[:200]}")
+
+@callbacks_router.callback_query(F.data.startswith("trade:confirm_long:"))
+async def handle_trade_confirm_long(callback: CallbackQuery, user: UserSettings, scanner=None, db: Database = None):
+    """Подтверждение лонг сделки"""
+    await callback.answer("⏳ Открываю лонг...")
+    parts = callback.data.split(":")
+    if len(parts) < 5:
+        await callback.message.answer("❌ Ошибка данных")
+        return
+    symbol = parts[2]
+    exchange = parts[3]
+    try:
+        size = float(parts[4])
+    except ValueError:
+        size = 100
+    if not db:
+        await callback.message.answer("❌ База данных недоступна")
+        return
+    try:
+        from services.trading_engine import trading_engine
+        result = await trading_engine.open_single_exchange_trade(
+            user=user, symbol=symbol, exchange_id=exchange,
+            side='long', size_usd=size,
+            test_mode=user.alert_settings.get('test_mode', True)
+        )
+        if result.success:
+            user.total_trades += 1
+            await db.update_user(user)
+            await callback.message.answer(
+                f"✅ **Лонг #{result.trade_id} открыт!**\n\n"
+                f"💎 {escape_html(symbol)} @ {escape_html(exchange)}\n"
+                f"💰 Размер: ${size:.0f}"
+            )
+        else:
+            await callback.message.answer(f"❌ Ошибка: {escape_html(result.error or 'Не удалось открыть')}")
+    except Exception as e:
+        logger.error(f"Long confirm error: {e}")
+        await callback.message.answer(f"❌ Ошибка: {escape_html(str(e))[:200]}")
+
+@callbacks_router.callback_query(F.data.startswith("trade:confirm_short:"))
+async def handle_trade_confirm_short(callback: CallbackQuery, user: UserSettings, scanner=None, db: Database = None):
+    """Подтверждение шорт сделки"""
+    await callback.answer("⏳ Открываю шорт...")
+    parts = callback.data.split(":")
+    if len(parts) < 5:
+        await callback.message.answer("❌ Ошибка данных")
+        return
+    symbol = parts[2]
+    exchange = parts[3]
+    try:
+        size = float(parts[4])
+    except ValueError:
+        size = 100
+    if not db:
+        await callback.message.answer("❌ База данных недоступна")
+        return
+    try:
+        from services.trading_engine import trading_engine
+        result = await trading_engine.open_single_exchange_trade(
+            user=user, symbol=symbol, exchange_id=exchange,
+            side='short', size_usd=size,
+            test_mode=user.alert_settings.get('test_mode', True)
+        )
+        if result.success:
+            user.total_trades += 1
+            await db.update_user(user)
+            await callback.message.answer(
+                f"✅ **Шорт #{result.trade_id} открыт!**\n\n"
+                f"💎 {escape_html(symbol)} @ {escape_html(exchange)}\n"
+                f"💰 Размер: ${size:.0f}"
+            )
+        else:
+            await callback.message.answer(f"❌ Ошибка: {escape_html(result.error or 'Не удалось открыть')}")
+    except Exception as e:
+        logger.error(f"Short confirm error: {e}")
+        await callback.message.answer(f"❌ Ошибка: {escape_html(str(e))[:200]}")
+
+@callbacks_router.callback_query(F.data == "trade:cancel")
+async def handle_trade_cancel(callback: CallbackQuery):
+    """Отмена торговой операции"""
+    await callback.answer("❌ Отменено")
+    try:
+        await callback.message.edit_text(f"{callback.message.text}\n\n_❌ Отменено пользователем_")
+    except:
+        pass
+
+@callbacks_router.callback_query(F.data.startswith("trade:details:"))
+async def handle_trade_details(callback: CallbackQuery, scanner=None):
+    """Показать детали спреда"""
+    await callback.answer()
+    parts = callback.data.split(":")
+    if len(parts) < 5:
+        return
+    symbol = parts[2]
+    buy_ex = parts[3]
+    sell_ex = parts[4]
+    keyboard = InlineKeyboardBuilder()
+    keyboard.row(
+        InlineKeyboardButton(text="⚡ Открыть сделку", callback_data=f"trade:open:{symbol}:{buy_ex}:{sell_ex}"),
+        InlineKeyboardButton(text="📱 Меню", callback_data="menu:main")
+    )
+    await callback.message.answer(
+        f"📊 **Детали спреда**\n\n"
+        f"💎 {escape_html(symbol)}\n"
+        f"📉 Покупка: {escape_html(buy_ex)}\n"
+        f"📈 Продажа: {escape_html(sell_ex)}\n\n"
+        f"Выберите действие:",
+        reply_markup=keyboard.as_markup()
+    )
+
+@callbacks_router.callback_query(F.data == "trade:skip")
+async def handle_trade_skip(callback: CallbackQuery):
+    """Пропустить алерт"""
+    await callback.answer("⏭ Пропущено")
+
+
+# ==================== POSITION MANAGEMENT MENU ====================
+
+@callbacks_router.callback_query(F.data == "positions:menu")
+async def show_positions_menu(callback: CallbackQuery, user: UserSettings, db: Database = None):
+    """Меню управления позициями — как в MetaTrader"""
+    await callback.answer()
+    if not db:
+        await callback.message.edit_text(
+            "❌ База данных недоступна",
+            reply_markup=InlineKeyboardBuilder().button(text="📱 Меню", callback_data="menu:main").as_markup()
+        )
+        return
+    try:
+        open_trades = await db.get_open_trades(user.user_id)
+        if not open_trades:
+            await callback.message.edit_text(
+                "📊 **Нет открытых позиций**\n\n"
+                "Откройте сделку через меню Спреды или дождитесь алерта.",
+                reply_markup=InlineKeyboardBuilder().button(text="📱 Меню", callback_data="menu:main").as_markup()
+            )
+            return
+        builder = InlineKeyboardBuilder()
+        text = f"📊 **Открытые позиции ({len(open_trades)})**\n\n"
+        for i, trade in enumerate(open_trades[:10], 1):
+            side_emoji = "📈" if trade.position_size_long > 0 else "📉" if trade.position_size_short > 0 else "⚡"
+            pnl_emoji = "🟢" if (trade.pnl_usd or 0) > 0 else "🔴" if (trade.pnl_usd or 0) < 0 else "⚪"
+            pnl_str = f"{pnl_emoji} ${trade.pnl_usd:.2f}" if trade.pnl_usd else "⚪ $0.00"
+            text += (
+                f"{i}. {side_emoji} **{escape_html(trade.symbol)}** #{trade.id}\n"
+                f"   💰 ${trade.size_usd:.0f} | {pnl_str}\n"
+                f"   SL: {trade.stop_loss_price:.4f} | TP: {trade.take_profit_price:.4f}\n\n"
+            )
+            builder.row(
+                InlineKeyboardButton(text=f"{side_emoji} #{trade.id}", callback_data=f"position:details:{trade.id}"),
+                InlineKeyboardButton(text="🔄 Обновить", callback_data="positions:menu")
+            )
+        builder.row(
+            InlineKeyboardButton(text="📱 Меню", callback_data="menu:main")
+        )
+        await callback.message.edit_text(text[:4000], reply_markup=builder.as_markup())
+    except Exception as e:
+        logger.error(f"Positions menu error: {e}")
+        await callback.message.edit_text(
+            f"❌ Ошибка: {escape_html(str(e))[:100]}",
+            reply_markup=InlineKeyboardBuilder().button(text="📱 Меню", callback_data="menu:main").as_markup()
+        )
+
+@callbacks_router.callback_query(F.data.startswith("position:details:"))
+async def show_position_details(callback: CallbackQuery, user: UserSettings, db: Database = None):
+    """Детальная карточка позиции с управлением (как в MetaTrader)"""
+    await callback.answer()
+    if not db:
+        return
+    try:
+        trade_id = int(callback.data.split(":")[2])
+        trade_data = await db.get_trade_by_id(trade_id)
+        if not trade_data or trade_data['user_id'] != user.user_id:
+            await callback.answer("❌ Позиция не найдена", show_alert=True)
+            return
+        from database.models import Trade
+        trade = Trade(**trade_data)
+        if trade.status != "open":
+            await callback.answer("❌ Позиция уже закрыта", show_alert=True)
+            return
+        side = trade.metadata.get('side', 'both')
+        side_emoji = "📈 ЛОНГ" if side == 'long' else "📉 ШОРТ" if side == 'short' else "⚡ АРБИТРАЖ"
+        pnl_emoji = "🟢" if (trade.pnl_usd or 0) > 0 else "🔴" if (trade.pnl_usd or 0) < 0 else "⚪"
+        try:
+            from datetime import datetime, timezone
+            opened = datetime.fromisoformat(trade.opened_at.replace('Z', '+00:00'))
+            hours_open = (datetime.now(timezone.utc) - opened).total_seconds() / 3600
+            time_str = f"{hours_open:.1f}ч"
+        except:
+            time_str = "N/A"
+        text = (
+            f"{'='*30}\n"
+            f"{side_emoji} **#{trade.id} {escape_html(trade.symbol)}**\n"
+            f"{'='*30}\n\n"
+            f"💰 **Размер:** ${trade.size_usd:.2f}\n"
+            f"{pnl_emoji} **P&L:** ${trade.pnl_usd:.2f} ({trade.pnl_percent:.2f}%)\n"
+            f"⏱ **В позиции:** {time_str}\n\n"
+            f"📊 **Входные цены:**\n"
+        )
+        if trade.entry_price_long > 0:
+            text += f"   📈 Лонг: {trade.entry_price_long:.6f}\n"
+            text += f"   Текущий: {trade.current_price_long:.6f}\n"
+        if trade.entry_price_short > 0:
+            text += f"   📉 Шорт: {trade.entry_price_short:.6f}\n"
+            text += f"   Текущий: {trade.current_price_short:.6f}\n"
+        text += (
+            f"\n🛡 **Защита:**\n"
+            f"   SL: {trade.stop_loss_price:.6f}\n"
+            f"   TP: {trade.take_profit_price:.6f}\n"
+        )
+        if trade.trailing_enabled:
+            text += f"   📊 Trailing: {trade.trailing_stop_price:.6f}\n"
+        text += f"\n🔧 **Действия:**"
+        builder = InlineKeyboardBuilder()
+        builder.row(
+            InlineKeyboardButton(text="❌ Закрыть", callback_data=f"position:close:{trade.id}"),
+            InlineKeyboardButton(text="💰 50%", callback_data=f"position:partial:{trade.id}:50")
+        )
+        builder.row(
+            InlineKeyboardButton(text="🛡 SL", callback_data=f"position:mod_sl:{trade.id}"),
+            InlineKeyboardButton(text="🎯 TP", callback_data=f"position:mod_tp:{trade.id}")
+        )
+        builder.row(
+            InlineKeyboardButton(text="25%", callback_data=f"position:partial:{trade.id}:25"),
+            InlineKeyboardButton(text="50%", callback_data=f"position:partial:{trade.id}:50"),
+            InlineKeyboardButton(text="75%", callback_data=f"position:partial:{trade.id}:75")
+        )
+        builder.row(
+            InlineKeyboardButton(text="🔄 Обновить", callback_data=f"position:details:{trade.id}"),
+            InlineKeyboardButton(text="📊 Все позиции", callback_data="positions:menu"),
+            InlineKeyboardButton(text="📱 Меню", callback_data="menu:main")
+        )
+        await callback.message.edit_text(text, reply_markup=builder.as_markup())
+    except Exception as e:
+        logger.error(f"Position details error: {e}")
+        await callback.answer("❌ Ошибка", show_alert=True)
+
+@callbacks_router.callback_query(F.data.startswith("position:close:"))
+async def handle_position_close(callback: CallbackQuery, user: UserSettings, db: Database = None):
+    """Закрыть позицию полностью"""
+    trade_id = int(callback.data.split(":")[2])
+    await callback.answer("⏳ Закрываю позицию...")
+    try:
+        from services.trading_engine import trading_engine
+        result = await trading_engine.close_trade_manually(trade_id, user)
+        if result.success:
+            pnl = result.metadata.get('pnl', 0) if result.metadata else 0
+            pnl_emoji = "🟢" if pnl > 0 else "🔴" if pnl < 0 else "⚪"
+            await callback.message.answer(
+                f"✅ **Позиция #{trade_id} закрыта!**\n\n"
+                f"{pnl_emoji} P&L: ${pnl:.2f}\n\n"
+                f"📊 Статистика обновлена."
+            )
+            if pnl > 0:
+                user.successful_trades += 1
+                user.total_profit += pnl
+            elif pnl < 0:
+                user.failed_trades += 1
+            if db:
+                await db.update_user(user)
+        else:
+            await callback.message.answer(
+                f"❌ **Не удалось закрыть позицию #{trade_id}**\n\n"
+                f"{escape_html(result.error or 'Неизвестная ошибка')}"
+            )
+    except Exception as e:
+        logger.error(f"Close position error: {e}")
+        await callback.answer("❌ Ошибка закрытия", show_alert=True)
+
+@callbacks_router.callback_query(F.data.startswith("position:partial:"))
+async def handle_position_partial(callback: CallbackQuery, user: UserSettings, db: Database = None):
+    """Частичное закрытие позиции"""
+    parts = callback.data.split(":")
+    trade_id = int(parts[2])
+    percentage = int(parts[3])
+    await callback.answer(f"⏳ Закрываю {percentage}%...")
+    try:
+        from services.trading_engine import trading_engine
+        result = await trading_engine.partial_close(trade_id, user, float(percentage))
+        if result.success:
+            metadata = result.metadata or {}
+            await callback.message.answer(
+                f"✅ **Закрыто {percentage}% позиции #{trade_id}**\n\n"
+                f"💰 P&L: ${metadata.get('partial_pnl', 0):.2f}\n"
+                f"📊 Остаток: ${metadata.get('remaining_size', 0):.2f}"
+            )
+        else:
+            await callback.message.answer(
+                f"❌ Ошибка: {escape_html(result.error or 'Не удалось закрыть')}"
+            )
+    except Exception as e:
+        logger.error(f"Partial close error: {e}")
+        await callback.answer("❌ Ошибка", show_alert=True)
+
+@callbacks_router.callback_query(F.data.startswith("position:mod_sl:"))
+async def handle_modify_sl(callback: CallbackQuery, state: FSMContext, db: Database = None):
+    """Начать изменение стоп-лосса"""
+    await callback.answer()
+    trade_id = int(callback.data.split(":")[2])
+    if not db:
+        await callback.message.answer("❌ База данных недоступна")
+        return
+    try:
+        trade_data = await db.get_trade_by_id(trade_id)
+        if not trade_data:
+            await callback.answer("❌ Позиция не найдена", show_alert=True)
+            return
+        current_sl = trade_data.get('stop_loss_price', 0)
+        await state.set_state(SetupStates.waiting_for_sl_price)
+        await state.update_data(modify_trade_id=trade_id, new_sl_price=None)
+        keyboard = InlineKeyboardBuilder()
+        keyboard.button(text="❌ Отмена", callback_data=f"position:details:{trade_id}")
+        await callback.message.answer(
+            f"🛡 **Изменение Stop-Loss для #{trade_id}**\n\n"
+            f"Текущий SL: {current_sl:.6f}\n\n"
+            f"Введите новую цену SL (или /cancel для отмены):",
+            reply_markup=keyboard.as_markup()
+        )
+    except Exception as e:
+        logger.error(f"Modify SL error: {e}")
+        await callback.answer("❌ Ошибка", show_alert=True)
+
+@callbacks_router.callback_query(F.data.startswith("position:mod_tp:"))
+async def handle_modify_tp(callback: CallbackQuery, state: FSMContext, db: Database = None):
+    """Начать изменение тейк-профита"""
+    await callback.answer()
+    trade_id = int(callback.data.split(":")[2])
+    if not db:
+        await callback.message.answer("❌ База данных недоступна")
+        return
+    try:
+        trade_data = await db.get_trade_by_id(trade_id)
+        if not trade_data:
+            await callback.answer("❌ Позиция не найдена", show_alert=True)
+            return
+        current_tp = trade_data.get('take_profit_price', 0)
+        await state.set_state(SetupStates.waiting_for_tp_price)
+        await state.update_data(modify_trade_id=trade_id, new_tp_price=None)
+        keyboard = InlineKeyboardBuilder()
+        keyboard.button(text="❌ Отмена", callback_data=f"position:details:{trade_id}")
+        await callback.message.answer(
+            f"🎯 **Изменение Take-Profit для #{trade_id}**\n\n"
+            f"Текущий TP: {current_tp:.6f}\n\n"
+            f"Введите новую цену TP (или /cancel для отмены):",
+            reply_markup=keyboard.as_markup()
+        )
+    except Exception as e:
+        logger.error(f"Modify TP error: {e}")
+        await callback.answer("❌ Ошибка", show_alert=True)

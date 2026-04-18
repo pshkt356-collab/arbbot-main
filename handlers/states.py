@@ -30,6 +30,11 @@ class SetupStates(StatesGroup):
     waiting_for_custom_leverage = State()
     waiting_for_balance_usage = State()
     waiting_for_trade_amount = State()
+    # Торговые состояния
+    waiting_for_trade_size = State()
+    waiting_for_sl_price = State()
+    waiting_for_tp_price = State()
+    waiting_for_partial_percent = State()
 
 @states_router.message(SetupStates.waiting_for_api_key)
 async def process_api_key(message: Message, state: FSMContext, user: UserSettings):
@@ -480,3 +485,205 @@ async def process_partial_close(message: Message, state: FSMContext, user: UserS
 
     except ValueError:
         await message.answer("❌ Введите число (например: 50):")
+
+
+# ==================== TRADE SIZE HANDLER ====================
+
+@states_router.message(SetupStates.waiting_for_trade_size)
+async def process_trade_size_input(message: Message, state: FSMContext, user: UserSettings, db: Database):
+    """Обработка ввода размера сделки"""
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Отменено")
+        return
+    try:
+        size = float(message.text.strip())
+        if size < 10 or size > 100000:
+            await message.answer("❌ Допустимый диапазон: $10 - $100000. Введите сумму:")
+            return
+        data = await state.get_data()
+        symbol = data.get('trade_symbol')
+        exchange = data.get('trade_exchange')
+        side = data.get('trade_side', 'long')
+        if not symbol:
+            await message.answer("❌ Ошибка: не найден символ. Начните заново.")
+            await state.clear()
+            return
+        from services.trading_engine import trading_engine
+        await message.answer(f"⏳ Открываю сделку {symbol} на ${size:.0f}...")
+        if side == 'long' and exchange:
+            result = await trading_engine.open_single_exchange_trade(
+                user=user, symbol=symbol, exchange_id=exchange,
+                side='long', size_usd=size, test_mode=user.alert_settings.get('test_mode', True)
+            )
+        elif side == 'short' and exchange:
+            result = await trading_engine.open_single_exchange_trade(
+                user=user, symbol=symbol, exchange_id=exchange,
+                side='short', size_usd=size, test_mode=user.alert_settings.get('test_mode', True)
+            )
+        else:
+            await message.answer("❌ Ошибка параметров сделки. Начните заново.")
+            await state.clear()
+            return
+        await state.clear()
+        if result.success:
+            user.total_trades += 1
+            if db:
+                await db.update_user(user)
+            keyboard = InlineKeyboardBuilder()
+            keyboard.button(text="📊 Мои позиции", callback_data="positions:menu")
+            keyboard.button(text="📱 Меню", callback_data="menu:main")
+            await message.answer(
+                f"✅ **Сделка #{result.trade_id} открыта!**\n\n"
+                f"💎 {html.escape(symbol)}\n"
+                f"💰 Размер: ${size:.0f}\n"
+                f"📊 SL: {result.stop_loss:.4f if result.stop_loss else 'авто'}\n"
+                f"📊 TP: {result.take_profit:.4f if result.take_profit else 'авто'}",
+                reply_markup=keyboard.as_markup()
+            )
+        else:
+            await message.answer(
+                f"❌ **Ошибка открытия сделки**\n\n"
+                f"{html.escape(result.error or 'Неизвестная ошибка')}"
+            )
+    except ValueError:
+        await message.answer("❌ Введите число (например: 100):")
+    except Exception as e:
+        logger.error(f"Trade size error: {e}")
+        await message.answer(f"❌ Ошибка: {html.escape(str(e))[:200]}")
+        await state.clear()
+
+# ==================== SL/TP MODIFICATION HANDLERS ====================
+
+@states_router.message(SetupStates.waiting_for_sl_price)
+async def process_sl_price(message: Message, state: FSMContext, user: UserSettings, db: Database):
+    """Обработка ввода цены стоп-лосса"""
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Отменено")
+        return
+    try:
+        sl_price = float(message.text.strip())
+        if sl_price <= 0:
+            await message.answer("❌ Цена должна быть положительной. Введите цену SL:")
+            return
+        data = await state.get_data()
+        trade_id = data.get('modify_trade_id')
+        if not trade_id:
+            await message.answer("❌ Ошибка: не найден ID сделки.")
+            await state.clear()
+            return
+        from services.trading_engine import trading_engine
+        tp_price = data.get('new_tp_price')
+        result = await trading_engine.modify_sl_tp(
+            trade_id=trade_id, user=user,
+            stop_loss=sl_price, take_profit=tp_price
+        )
+        await state.clear()
+        if result.success:
+            keyboard = InlineKeyboardBuilder()
+            keyboard.button(text="📊 К позиции", callback_data=f"position:details:{trade_id}")
+            keyboard.button(text="📱 Меню", callback_data="menu:main")
+            await message.answer(
+                f"✅ **Стоп-лосс обновлён!**\n\n"
+                f"📊 SL: {sl_price:.4f}\n"
+                f"📊 TP: {tp_price:.4f if tp_price else 'без изменений'}",
+                reply_markup=keyboard.as_markup()
+            )
+        else:
+            await message.answer(f"❌ Ошибка: {html.escape(result.error or 'Не удалось изменить SL')}")
+    except ValueError:
+        await message.answer("❌ Введите числовое значение цены:")
+    except Exception as e:
+        logger.error(f"SL modification error: {e}")
+        await message.answer(f"❌ Ошибка: {html.escape(str(e))[:200]}")
+        await state.clear()
+
+@states_router.message(SetupStates.waiting_for_tp_price)
+async def process_tp_price(message: Message, state: FSMContext, user: UserSettings, db: Database):
+    """Обработка ввода цены тейк-профита"""
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Отменено")
+        return
+    try:
+        tp_price = float(message.text.strip())
+        if tp_price <= 0:
+            await message.answer("❌ Цена должна быть положительной. Введите цену TP:")
+            return
+        data = await state.get_data()
+        trade_id = data.get('modify_trade_id')
+        if not trade_id:
+            await message.answer("❌ Ошибка: не найден ID сделки.")
+            await state.clear()
+            return
+        from services.trading_engine import trading_engine
+        sl_price = data.get('new_sl_price')
+        result = await trading_engine.modify_sl_tp(
+            trade_id=trade_id, user=user,
+            stop_loss=sl_price, take_profit=tp_price
+        )
+        await state.clear()
+        if result.success:
+            keyboard = InlineKeyboardBuilder()
+            keyboard.button(text="📊 К позиции", callback_data=f"position:details:{trade_id}")
+            keyboard.button(text="📱 Меню", callback_data="menu:main")
+            await message.answer(
+                f"✅ **Тейк-профит обновлён!**\n\n"
+                f"📊 SL: {sl_price:.4f if sl_price else 'без изменений'}\n"
+                f"📊 TP: {tp_price:.4f}",
+                reply_markup=keyboard.as_markup()
+            )
+        else:
+            await message.answer(f"❌ Ошибка: {html.escape(result.error or 'Не удалось изменить TP')}")
+    except ValueError:
+        await message.answer("❌ Введите числовое значение цены:")
+    except Exception as e:
+        logger.error(f"TP modification error: {e}")
+        await message.answer(f"❌ Ошибка: {html.escape(str(e))[:200]}")
+        await state.clear()
+
+# ==================== PARTIAL CLOSE HANDLER ====================
+
+@states_router.message(SetupStates.waiting_for_partial_percent)
+async def process_partial_percent(message: Message, state: FSMContext, user: UserSettings, db: Database):
+    """Обработка ввода процента частичного закрытия"""
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Отменено")
+        return
+    try:
+        text = message.text.strip().replace('%', '')
+        percentage = float(text)
+        if percentage <= 0 or percentage > 100:
+            await message.answer("❌ Допустимый диапазон: 1% - 100%. Введите процент:")
+            return
+        data = await state.get_data()
+        trade_id = data.get('partial_trade_id')
+        if not trade_id:
+            await message.answer("❌ Ошибка: не найден ID сделки.")
+            await state.clear()
+            return
+        from services.trading_engine import trading_engine
+        await message.answer(f"⏳ Закрываю {percentage:.0f}% позиции #{trade_id}...")
+        result = await trading_engine.partial_close(trade_id=trade_id, user=user, percentage=percentage)
+        await state.clear()
+        if result.success:
+            metadata = result.metadata or {}
+            keyboard = InlineKeyboardBuilder()
+            keyboard.button(text="📊 Мои позиции", callback_data="positions:menu")
+            keyboard.button(text="📱 Меню", callback_data="menu:main")
+            await message.answer(
+                f"✅ **Частичное закрытие выполнено!**\n\n"
+                f"💰 P&L: ${metadata.get('partial_pnl', 0):.2f}\n"
+                f"📊 Остаток: ${metadata.get('remaining_size', 0):.2f}",
+                reply_markup=keyboard.as_markup()
+            )
+        else:
+            await message.answer(f"❌ Ошибка: {html.escape(result.error or 'Не удалось закрыть часть')}")
+    except ValueError:
+        await message.answer("❌ Введите число от 1 до 100:")
+    except Exception as e:
+        logger.error(f"Partial close error: {e}")
+        await message.answer(f"❌ Ошибка: {html.escape(str(e))[:200]}")
+        await state.clear()

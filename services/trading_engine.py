@@ -788,6 +788,8 @@ class PositionMonitor:
         self.last_update = time.time()
         self.update_interval = 5
         self.closing_in_progress = False
+        self._max_price_seen = trade.entry_price_long if trade.entry_price_long > 0 else 0
+        self._min_price_seen_short = trade.entry_price_short if trade.entry_price_short > 0 else float('inf')
 
     async def run(self):
         logger.info(f"Monitor started for trade {self.trade.id}")
@@ -828,6 +830,12 @@ class PositionMonitor:
                 except Exception as e:
                     logger.warning(f"Price fetch error for trade {self.trade.id}: {e}")
 
+            # Обновляем максимумы для trailing stop
+            if self.trade.current_price_long > self._max_price_seen:
+                self._max_price_seen = self.trade.current_price_long
+            if self.trade.current_price_short > 0 and self.trade.current_price_short < self._min_price_seen_short:
+                self._min_price_seen_short = self.trade.current_price_short
+
             if self.trade.current_price_long > 0 and self.trade.current_price_short > 0:
                 long_pnl = (self.trade.current_price_long - self.trade.entry_price_long) / self.trade.entry_price_long * 100
                 short_pnl = (self.trade.entry_price_short - self.trade.current_price_short) / self.trade.entry_price_short * 100
@@ -849,9 +857,19 @@ class PositionMonitor:
             await self._close_position("take_profit")
             return
 
-        if self.trade.trailing_enabled and self.trade.trailing_stop_price > 0:
-            long_drawdown = (self.trade.current_price_long - self.trade.entry_price_long) / self.trade.entry_price_long * 100
-            if long_drawdown <= -self.user.risk_settings.get('trailing_stop_distance', 10):
+        # Trailing stop logic - откат от максимума
+        if self.trade.trailing_enabled and self._max_price_seen > self.trade.entry_price_long:
+            trailing_dist = self.user.risk_settings.get('trailing_stop_distance', 10)
+            long_runup = (self._max_price_seen - self.trade.entry_price_long) / self.trade.entry_price_long * 100
+            if long_runup > trailing_dist:
+                # Активируем trailing stop
+                trail_distance = self._max_price_seen * trailing_dist / 100
+                new_stop = self._max_price_seen - trail_distance
+                if new_stop > self.trade.trailing_stop_price:
+                    self.trade.trailing_stop_price = new_stop
+                    await self.db.update_trade(self.trade)
+                    logger.info(f"Trailing stop moved to {new_stop:.4f} for trade {self.trade.id}")
+            if self.trade.trailing_stop_price > 0 and self.trade.current_price_long <= self.trade.trailing_stop_price:
                 await self._close_position("trailing_stop")
                 return
 
@@ -890,6 +908,347 @@ class PositionMonitor:
             logger.error(f"Error closing trade {self.trade.id}: {e}")
         finally:
             self.running = False
+
+
+    # ==================== SINGLE EXCHANGE TRADE ====================
+
+    async def open_single_exchange_trade(self, user: UserSettings, symbol: str, exchange_id: str,
+                                         side: str, size_usd: float, test_mode: bool = True) -> TradeResult:
+        """Открыть позицию только на одной бирже (лонг или шорт)"""
+        correlation_id = str(uuid.uuid4())[:8]
+        db = Database(settings.db_file)
+        await db.initialize()
+        try:
+            if not test_mode:
+                if exchange_id not in user.api_keys or not user.api_keys[exchange_id].get('api_key'):
+                    return TradeResult(success=False, error=f"No API keys for {exchange_id}", correlation_id=correlation_id)
+                open_trades = await db.get_open_trades(user.user_id, test_mode=False)
+                if len(open_trades) >= user.risk_settings.get('max_open_positions', 5):
+                    return TradeResult(success=False, error="Max positions limit reached", correlation_id=correlation_id)
+            if test_mode:
+                return await self._open_single_test_trade(user, symbol, exchange_id, side, size_usd, db, correlation_id)
+            else:
+                return await self._open_single_real_trade(user, symbol, exchange_id, side, size_usd, db, correlation_id)
+        finally:
+            await db.close()
+
+    async def _open_single_test_trade(self, user, symbol, exchange_id, side, size_usd, db, correlation_id):
+        import random
+        size = min(size_usd, user.risk_settings.get('max_position_usd', 10000))
+        if size < 10:
+            size = 100
+        slippage = random.uniform(0.0001, 0.001)
+        base_price = 50000.0 if 'BTC' in symbol else 3000.0 if 'ETH' in symbol else 100.0
+        actual_price = base_price * (1 + slippage)
+        commission_rate = 0.00055
+        commission = size * commission_rate
+        position_size = size / actual_price if actual_price > 0 else 0
+        atr = actual_price * 0.02
+        stop_distance = atr * user.risk_settings.get('atr_multiplier', 2.0)
+        min_stop_pct = user.risk_settings.get('min_stop_loss_percent', 2.0)
+        if side == 'long':
+            stop_loss_price = actual_price - stop_distance
+            stop_pct = (actual_price - stop_loss_price) / actual_price * 100
+            if stop_pct < min_stop_pct:
+                stop_loss_price = actual_price * (1 - min_stop_pct / 100)
+            take_profit_pct = user.risk_settings.get('take_profit_percent', 20.0)
+            take_profit_price = actual_price * (1 + take_profit_pct / 100)
+            entry_price_long = actual_price
+            entry_price_short = 0
+            pos_long = position_size
+            pos_short = 0
+            long_ex = exchange_id
+            short_ex = ""
+        else:
+            stop_loss_price = actual_price + stop_distance
+            stop_pct = (stop_loss_price - actual_price) / actual_price * 100
+            if stop_pct < min_stop_pct:
+                stop_loss_price = actual_price * (1 + min_stop_pct / 100)
+            take_profit_pct = user.risk_settings.get('take_profit_percent', 20.0)
+            take_profit_price = actual_price * (1 - take_profit_pct / 100)
+            entry_price_long = 0
+            entry_price_short = actual_price
+            pos_long = 0
+            pos_short = position_size
+            long_ex = ""
+            short_ex = exchange_id
+        emergency_stop = user.risk_settings.get('emergency_stop_percent', 50.0)
+        emergency_price = actual_price * (1 - emergency_stop / 100) if side == 'long' else actual_price * (1 + emergency_stop / 100)
+        trade = Trade(
+            user_id=user.user_id, symbol=symbol, strategy=f"single_{side}",
+            long_exchange=long_ex, short_exchange=short_ex,
+            entry_spread=0, size_usd=size,
+            position_size_long=pos_long, position_size_short=pos_short,
+            entry_price_long=entry_price_long, entry_price_short=entry_price_short,
+            current_price_long=entry_price_long, current_price_short=entry_price_short,
+            stop_loss_price=stop_loss_price, take_profit_price=take_profit_price,
+            emergency_stop_price=emergency_price,
+            trailing_enabled=user.risk_settings.get('trailing_stop_enabled', True),
+            trailing_stop_price=stop_loss_price, status="open",
+            metadata={
+                'test_mode': True, 'side': side, 'opened_by': 'manual',
+                'correlation_id': correlation_id, 'exchange': exchange_id,
+                'slippage': slippage, 'commission': commission,
+                'entry_time': datetime.now(timezone.utc).isoformat(), 'emulation': True
+            }
+        )
+        trade_id = await db.add_trade(trade)
+        trade.id = trade_id
+        await self._start_monitor(trade, user, db)
+        logger.info(f"[{correlation_id}] Single {side} test trade opened: {symbol} #{trade_id} on {exchange_id}")
+        return TradeResult(
+            success=True, trade_id=trade_id,
+            entry_price_long=entry_price_long if side == 'long' else None,
+            entry_price_short=entry_price_short if side == 'short' else None,
+            position_size=size, stop_loss=stop_loss_price, take_profit=take_profit_price,
+            commission_paid=commission, correlation_id=correlation_id,
+            metadata={'test_mode': True, 'side': side, 'emulated': True}
+        )
+
+    async def _open_single_real_trade(self, user, symbol, exchange_id, side, size_usd, db, correlation_id):
+        try:
+            if not await self._check_circuit_breaker(exchange_id):
+                return TradeResult(success=False, error="Circuit breaker active", correlation_id=correlation_id)
+            size = min(size_usd, user.risk_settings.get('max_position_usd', 10000))
+            exchange = await self._get_exchange(exchange_id,
+                user.api_keys[exchange_id]['api_key'],
+                user.api_keys[exchange_id]['api_secret'],
+                user.api_keys[exchange_id].get('password'),
+                user.api_keys[exchange_id].get('testnet', True))
+            try:
+                balance = await exchange.fetch_balance()
+                usdt = self._get_usdt_balance(balance)
+                required = size * 1.2
+                if usdt < required:
+                    await exchange.close()
+                    return TradeResult(success=False, error=f"Insufficient balance: ${usdt:.2f} < ${required:.2f}", correlation_id=correlation_id)
+            except Exception as e:
+                await exchange.close()
+                return TradeResult(success=False, error=f"Balance check failed: {str(e)}", correlation_id=correlation_id)
+            ticker = await exchange.fetch_ticker(f"{symbol.replace('/', '')}:USDT")
+            actual_price = ticker['last'] if ticker and ticker.get('last') else 0
+            if actual_price <= 0:
+                await exchange.close()
+                return TradeResult(success=False, error="Could not get valid price", correlation_id=correlation_id)
+            position_size = size / actual_price
+            try:
+                market = exchange.market(f"{symbol.replace('/', '')}:USDT")
+                min_amount = market['limits']['amount']['min'] if market['limits']['amount']['min'] else 0
+                if position_size < min_amount:
+                    await exchange.close()
+                    return TradeResult(success=False, error=f"Amount {position_size} < min {min_amount}", correlation_id=correlation_id)
+                amount_precision = market['precision']['amount']
+                position_size = float(Decimal(str(position_size)).quantize(Decimal(str(amount_precision)), rounding=ROUND_DOWN))
+            except Exception as e:
+                logger.warning(f"Precision check error: {e}")
+            leverage = user.risk_settings.get('max_leverage', 3)
+            try:
+                await exchange.set_leverage(leverage, f"{symbol.replace('/', '')}:USDT")
+            except Exception as e:
+                logger.warning(f"Leverage setting error: {e}")
+            order = None
+            try:
+                if side == 'long':
+                    order = await exchange.create_market_buy_order(f"{symbol.replace('/', '')}:USDT", position_size)
+                else:
+                    order = await exchange.create_market_sell_order(f"{symbol.replace('/', '')}:USDT", position_size)
+                actual_price = order['average'] if order['average'] else order['price']
+                commission = order['fee']['cost'] if order.get('fee') else (size * 0.00055)
+            except Exception as e:
+                await exchange.close()
+                await self._record_failure(exchange_id)
+                return TradeResult(success=False, error=f"Order failed: {str(e)}", correlation_id=correlation_id)
+            atr = actual_price * 0.02
+            stop_distance = atr * user.risk_settings.get('atr_multiplier', 2.0)
+            min_stop_pct = user.risk_settings.get('min_stop_loss_percent', 2.0)
+            if side == 'long':
+                stop_loss_price = actual_price - stop_distance
+                stop_pct = (actual_price - stop_loss_price) / actual_price * 100
+                if stop_pct < min_stop_pct:
+                    stop_loss_price = actual_price * (1 - min_stop_pct / 100)
+                take_profit_price = actual_price * (1 + user.risk_settings.get('take_profit_percent', 20.0) / 100)
+                entry_price_long = actual_price
+                entry_price_short = 0
+                pos_long = position_size
+                pos_short = 0
+                long_ex = exchange_id
+                short_ex = ""
+            else:
+                stop_loss_price = actual_price + stop_distance
+                stop_pct = (stop_loss_price - actual_price) / actual_price * 100
+                if stop_pct < min_stop_pct:
+                    stop_loss_price = actual_price * (1 + min_stop_pct / 100)
+                take_profit_price = actual_price * (1 - user.risk_settings.get('take_profit_percent', 20.0) / 100)
+                entry_price_long = 0
+                entry_price_short = actual_price
+                pos_long = 0
+                pos_short = position_size
+                long_ex = ""
+                short_ex = exchange_id
+            emergency_price = actual_price * (1 - user.risk_settings.get('emergency_stop_percent', 50.0) / 100) if side == 'long' else actual_price * (1 + user.risk_settings.get('emergency_stop_percent', 50.0) / 100)
+            trade = Trade(
+                user_id=user.user_id, symbol=symbol, strategy=f"single_{side}",
+                long_exchange=long_ex, short_exchange=short_ex,
+                entry_spread=0, size_usd=size,
+                position_size_long=pos_long, position_size_short=pos_short,
+                entry_price_long=entry_price_long, entry_price_short=entry_price_short,
+                current_price_long=entry_price_long, current_price_short=entry_price_short,
+                stop_loss_price=stop_loss_price, take_profit_price=take_profit_price,
+                emergency_stop_price=emergency_price,
+                trailing_enabled=user.risk_settings.get('trailing_stop_enabled', True),
+                trailing_stop_price=stop_loss_price, status="open",
+                metadata={
+                    'test_mode': False, 'side': side, 'opened_by': 'manual',
+                    'correlation_id': correlation_id, 'order_id': order['id'],
+                    'commission': commission, 'entry_time': datetime.now(timezone.utc).isoformat(),
+                    'leverage': leverage, 'exchange': exchange_id
+                }
+            )
+            trade_id = await db.add_trade(trade)
+            trade.id = trade_id
+            await exchange.close()
+            await self._start_monitor(trade, user, db)
+            return TradeResult(
+                success=True, trade_id=trade_id,
+                entry_price_long=entry_price_long if side == 'long' else None,
+                entry_price_short=entry_price_short if side == 'short' else None,
+                position_size=size, stop_loss=stop_loss_price, take_profit=take_profit_price,
+                commission_paid=commission, correlation_id=correlation_id,
+                metadata={'test_mode': False, 'side': side, 'leverage': leverage}
+            )
+        except Exception as e:
+            logger.error(f"Single trade error: {e}")
+            return TradeResult(success=False, error=f"Unexpected error: {str(e)}", correlation_id=correlation_id)
+
+    # ==================== MODIFY SL/TP ====================
+
+    async def modify_sl_tp(self, trade_id: int, user: UserSettings, stop_loss: float = None, take_profit: float = None) -> TradeResult:
+        """Изменить стоп-лосс и/или тейк-профит для сделки"""
+        correlation_id = str(uuid.uuid4())[:8]
+        db = Database(settings.db_file)
+        await db.initialize()
+        try:
+            trade_data = await db.get_trade_by_id(trade_id)
+            if not trade_data or trade_data['user_id'] != user.user_id:
+                return TradeResult(success=False, error="Trade not found", correlation_id=correlation_id)
+            trade = Trade(**trade_data)
+            if trade.status != "open":
+                return TradeResult(success=False, error="Trade already closed", correlation_id=correlation_id)
+            modified = []
+            if stop_loss is not None and stop_loss > 0:
+                trade.stop_loss_price = stop_loss
+                modified.append(f"SL={stop_loss:.4f}")
+            if take_profit is not None and take_profit > 0:
+                trade.take_profit_price = take_profit
+                modified.append(f"TP={take_profit:.4f}")
+            if not modified:
+                return TradeResult(success=False, error="No valid SL/TP provided", correlation_id=correlation_id)
+            trade.metadata['sl_tp_modified'] = trade.metadata.get('sl_tp_modified', []) + [{
+                'stop_loss': trade.stop_loss_price, 'take_profit': trade.take_profit_price,
+                'timestamp': datetime.now(timezone.utc).isoformat(), 'correlation_id': correlation_id
+            }]
+            await db.update_trade(trade)
+            monitor_key = f"{user.user_id}:{trade_id}"
+            async with self.monitors_lock:
+                if monitor_key in self.active_monitors:
+                    self.active_monitors[monitor_key].trade = trade
+            return TradeResult(
+                success=True, trade_id=trade_id, correlation_id=correlation_id,
+                stop_loss=trade.stop_loss_price, take_profit=trade.take_profit_price,
+                message=f"Modified: {', '.join(modified)}"
+            )
+        except Exception as e:
+            logger.error(f"[{correlation_id}] Modify SL/TP error: {e}")
+            return TradeResult(success=False, error=f"Modify failed: {str(e)}", correlation_id=correlation_id)
+        finally:
+            await db.close()
+
+    # ==================== PARTIAL CLOSE ====================
+
+    async def partial_close(self, trade_id: int, user: UserSettings, percentage: float) -> TradeResult:
+        """Частичное закрытие позиции"""
+        correlation_id = str(uuid.uuid4())[:8]
+        if percentage <= 0 or percentage > 100:
+            return TradeResult(success=False, error="Percentage must be between 1 and 100", correlation_id=correlation_id)
+        db = Database(settings.db_file)
+        await db.initialize()
+        try:
+            trade_data = await db.get_trade_by_id(trade_id)
+            if not trade_data or trade_data['user_id'] != user.user_id:
+                return TradeResult(success=False, error="Trade not found", correlation_id=correlation_id)
+            trade = Trade(**trade_data)
+            if trade.status != "open":
+                return TradeResult(success=False, error="Trade already closed", correlation_id=correlation_id)
+            close_fraction = percentage / 100
+            if trade.metadata.get('test_mode', True):
+                trade.closed_portion_percent += percentage
+                trade.partial_close_count += 1
+                if trade.closed_portion_percent >= 100:
+                    return await self.close_trade_manually(trade_id, user)
+                partial_pnl_usd = (trade.pnl_usd or 0) * close_fraction
+                if trade.position_size_long > 0:
+                    trade.position_size_long *= (1 - close_fraction)
+                if trade.position_size_short > 0:
+                    trade.position_size_short *= (1 - close_fraction)
+                trade.size_usd *= (1 - close_fraction)
+                trade.metadata['partial_closes'] = trade.metadata.get('partial_closes', []) + [{
+                    'percentage': percentage, 'pnl_usd': partial_pnl_usd,
+                    'timestamp': datetime.now(timezone.utc).isoformat(), 'correlation_id': correlation_id
+                }]
+                await db.update_trade(trade)
+                return TradeResult(
+                    success=True, trade_id=trade_id, correlation_id=correlation_id,
+                    message=f"Partial close {percentage}% completed",
+                    metadata={'partial_pnl': partial_pnl_usd, 'remaining_size': trade.size_usd}
+                )
+            else:
+                if trade.position_size_long > 0 and trade.long_exchange:
+                    close_size = trade.position_size_long * close_fraction
+                    ex = await self._get_exchange(trade.long_exchange,
+                        user.api_keys[trade.long_exchange]['api_key'],
+                        user.api_keys[trade.long_exchange]['api_secret'],
+                        user.api_keys[trade.long_exchange].get('password'),
+                        user.api_keys[trade.long_exchange].get('testnet', True))
+                    try:
+                        await ex.create_market_sell_order(f"{trade.symbol.replace('/', '')}:USDT", close_size)
+                    finally:
+                        await ex.close()
+                if trade.position_size_short > 0 and trade.short_exchange:
+                    close_size = trade.position_size_short * close_fraction
+                    ex = await self._get_exchange(trade.short_exchange,
+                        user.api_keys[trade.short_exchange]['api_key'],
+                        user.api_keys[trade.short_exchange]['api_secret'],
+                        user.api_keys[trade.short_exchange].get('password'),
+                        user.api_keys[trade.short_exchange].get('testnet', True))
+                    try:
+                        await ex.create_market_buy_order(f"{trade.symbol.replace('/', '')}:USDT", close_size)
+                    finally:
+                        await ex.close()
+                trade.closed_portion_percent += percentage
+                trade.partial_close_count += 1
+                if trade.closed_portion_percent >= 100:
+                    return await self.close_trade_manually(trade_id, user)
+                partial_pnl_usd = (trade.pnl_usd or 0) * close_fraction
+                if trade.position_size_long > 0:
+                    trade.position_size_long *= (1 - close_fraction)
+                if trade.position_size_short > 0:
+                    trade.position_size_short *= (1 - close_fraction)
+                trade.size_usd *= (1 - close_fraction)
+                trade.metadata['partial_closes'] = trade.metadata.get('partial_closes', []) + [{
+                    'percentage': percentage, 'pnl_usd': partial_pnl_usd,
+                    'timestamp': datetime.now(timezone.utc).isoformat(), 'correlation_id': correlation_id
+                }]
+                await db.update_trade(trade)
+                return TradeResult(
+                    success=True, trade_id=trade_id, correlation_id=correlation_id,
+                    message=f"Partial close {percentage}% executed on exchange",
+                    metadata={'partial_pnl': partial_pnl_usd, 'remaining_size': trade.size_usd}
+                )
+        except Exception as e:
+            logger.error(f"[{correlation_id}] Partial close error: {e}")
+            return TradeResult(success=False, error=f"Partial close failed: {str(e)}", correlation_id=correlation_id)
+        finally:
+            await db.close()
 
 # Глобальный экземпляр
 trading_engine = TradingEngine()
