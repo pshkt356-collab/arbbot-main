@@ -966,8 +966,8 @@ class Database:
                     min_price_movement_pct=row['min_price_movement_pct'] if row['min_price_movement_pct'] is not None else 0.01,
                     close_on_reverse=bool(row['close_on_reverse']) if row['close_on_reverse'] is not None else True,
                     test_mode=bool(row['test_mode']) if row['test_mode'] is not None else True,
-                    mexc_api_key=row.get('mexc_api_key', '') if 'mexc_api_key' in row.keys() else '',
-                    mexc_api_secret=row.get('mexc_api_secret', '') if 'mexc_api_secret' in row.keys() else '',
+                    mexc_api_key=row['mexc_api_key'] if 'mexc_api_key' in row.keys() and row['mexc_api_key'] is not None else '',
+                    mexc_api_secret=row['mexc_api_secret'] if 'mexc_api_secret' in row.keys() and row['mexc_api_secret'] is not None else '',
                     created_at=row['created_at'],
                     updated_at=row['updated_at']
                 )
