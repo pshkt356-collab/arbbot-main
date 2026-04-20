@@ -244,7 +244,7 @@ class BinancePriceTracker:
 
 
 class MexcAPI:
-    """Обёртка для MEXC API (асинхронная)"""
+    """Обёртка для MEXC Contract API (асинхронная)"""
 
     BASE_URL = "https://contract.mexc.com"
 
@@ -260,13 +260,29 @@ class MexcAPI:
         return self._session
 
     def _generate_signature(self, params: dict) -> str:
-        """Генерация подписи для MEXC API"""
+        """Генерация подписи для MEXC API — params отсортированы по ключу"""
         query_string = "&".join([f"{k}={v}" for k, v in sorted(params.items())])
         return hmac.new(
             self.api_secret.encode('utf-8'),
             query_string.encode('utf-8'),
             hashlib.sha256
         ).hexdigest()
+
+    def _build_signed_url(self, endpoint: str, params: dict) -> str:
+        """Формирует URL с подписью для GET запроса (порядок параметров фиксирован)"""
+        # Сначала создаем подпись из отсортированных параметров
+        sign = self._generate_signature(params)
+        # Затем формируем query string в том же отсортированном порядке + sign в конце
+        query_string = "&".join([f"{k}={v}" for k, v in sorted(params.items())])
+        query_string += f"&sign={sign}"
+        return f"{self.BASE_URL}{endpoint}?{query_string}"
+
+    def _build_signed_body(self, params: dict) -> str:
+        """Формирует form-encoded тело с подписью для POST запроса"""
+        sign = self._generate_signature(params)
+        sorted_params = dict(sorted(params.items()))
+        sorted_params["sign"] = sign
+        return "&".join([f"{k}={v}" for k, v in sorted_params.items()])
 
     async def close(self):
         if self._session and not self._session.closed:
@@ -329,11 +345,12 @@ class MexcAPI:
                 "timestamp": timestamp,
                 "api_key": self.api_key
             }
-            params["sign"] = self._generate_signature(params)
+            body = self._build_signed_body(params)
 
             async with session.post(
                 f"{self.BASE_URL}/api/v1/private/position/change_leverage",
-                data=params
+                data=body,
+                headers={'Content-Type': 'application/x-www-form-urlencoded'}
             ) as resp:
                 data = await resp.json()
                 if data.get('success') or data.get('code') == 200:
@@ -364,11 +381,12 @@ class MexcAPI:
                 "timestamp": timestamp,
                 "api_key": self.api_key
             }
-            params["sign"] = self._generate_signature(params)
+            body = self._build_signed_body(params)
 
             async with session.post(
                 f"{self.BASE_URL}/api/v1/private/order/submit",
-                data=params
+                data=body,
+                headers={'Content-Type': 'application/x-www-form-urlencoded'}
             ) as resp:
                 data = await resp.json()
                 if data.get('success') or data.get('code') == 200:
@@ -405,11 +423,12 @@ class MexcAPI:
                 "timestamp": timestamp,
                 "api_key": self.api_key
             }
-            params["sign"] = self._generate_signature(params)
+            body = self._build_signed_body(params)
 
             async with session.post(
                 f"{self.BASE_URL}/api/v1/private/order/submit",
-                data=params
+                data=body,
+                headers={'Content-Type': 'application/x-www-form-urlencoded'}
             ) as resp:
                 data = await resp.json()
                 if data.get('success') or data.get('code') == 200:
@@ -442,12 +461,9 @@ class MexcAPI:
                 "timestamp": timestamp,
                 "api_key": self.api_key
             }
-            params["sign"] = self._generate_signature(params)
+            url = self._build_signed_url("/api/v1/private/position/open_positions", params)
 
-            async with session.get(
-                f"{self.BASE_URL}/api/v1/private/position/open_positions",
-                params=params
-            ) as resp:
+            async with session.get(url) as resp:
                 data = await resp.json()
                 if data.get('success') or data.get('code') == 200:
                     positions = data.get('data', [])
@@ -484,12 +500,9 @@ class MexcAPI:
                 "timestamp": timestamp,
                 "api_key": self.api_key
             }
-            params["sign"] = self._generate_signature(params)
+            url = self._build_signed_url("/api/v1/private/account/assets", params)
 
-            async with session.get(
-                f"{self.BASE_URL}/api/v1/private/account/assets",
-                params=params
-            ) as resp:
+            async with session.get(url) as resp:
                 data = await resp.json()
                 if data.get('success') or data.get('code') == 200:
                     assets = data.get('data', [])
