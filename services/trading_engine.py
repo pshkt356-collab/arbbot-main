@@ -778,6 +778,25 @@ class TradingEngine:
             logger.error(f"Zombie check error: {e}")
 
 # ===== КЛАСС PositionMonitor (отдельно, без recover_positions) =====
+    # ==================== PROXY METHODS (delegates to PositionMonitor) ====================
+
+    async def open_single_exchange_trade(self, user: UserSettings, symbol: str, exchange_id: str,
+                                         side: str, size_usd: float, test_mode: bool = True) -> TradeResult:
+        """Открыть позицию только на одной бирже (лонг или шорт) — прокси на PositionMonitor"""
+        pm = PositionMonitor(self)
+        return await pm.open_single_exchange_trade(user, symbol, exchange_id, side, size_usd, test_mode)
+
+    async def modify_sl_tp(self, trade_id: int, user: UserSettings, stop_loss: float = None, take_profit: float = None) -> TradeResult:
+        """Изменить стоп-лосс и/или тейк-профит — прокси на PositionMonitor"""
+        pm = PositionMonitor(self)
+        return await pm.modify_sl_tp(trade_id, user, stop_loss, take_profit)
+
+    async def partial_close(self, trade_id: int, user: UserSettings, percentage: float) -> TradeResult:
+        """Частичное закрытие позиции — прокси на PositionMonitor"""
+        pm = PositionMonitor(self)
+        return await pm.partial_close(trade_id, user, percentage)
+
+
 class PositionMonitor:
     def __init__(self, trade: Trade, user: UserSettings, db: Database, engine: TradingEngine):
         self.trade = trade

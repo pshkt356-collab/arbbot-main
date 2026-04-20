@@ -18,6 +18,7 @@ class ArbitrageType(Enum):
     INTER_EXCHANGE_FUTURES = "inter_exchange_futures"
     BASIS_SPOT_FUTURES = "basis_spot_futures"
     CROSS_EXCHANGE_BASIS = "cross_exchange_basis"
+    FUNDING_RATE = "funding_rate"
 
 @dataclass
 class PriceData:
@@ -68,6 +69,14 @@ class SpreadAlert:
     @property
     def is_basis(self) -> bool:
         return self.arbitrage_type in [ArbitrageType.BASIS_SPOT_FUTURES, ArbitrageType.CROSS_EXCHANGE_BASIS]
+
+    @property
+    def is_funding(self) -> bool:
+        return self.arbitrage_type == ArbitrageType.FUNDING_RATE
+
+    @property
+    def is_inter_exchange(self) -> bool:
+        return self.arbitrage_type == ArbitrageType.INTER_EXCHANGE_FUTURES
 
 @dataclass
 class CachedSpread:
@@ -126,6 +135,10 @@ class SpreadScanner:
         self.user_settings: Dict[int, float] = {}
         self.user_basis_settings: Dict[int, float] = {}
         self.user_alerts_enabled: Dict[int, bool] = {}  # user_id -> alerts_enabled
+        self.user_inter_settings: Dict[int, bool] = {}   # user_id -> inter_exchange_enabled
+        self.user_basis_alert_settings: Dict[int, bool] = {}  # user_id -> basis_arbitrage_enabled
+        self.user_funding_settings: Dict[int, bool] = {}  # user_id -> funding_arbitrage_enabled
+        self.user_scan_type: Dict[int, str] = {}  # user_id -> scan_type ('all', 'inter', 'basis', 'funding')
         self.default_min_spread = min_spread
 
         self.exchange_symbols: Dict[str, Set[str]] = {
@@ -180,7 +193,19 @@ class SpreadScanner:
         else:
             self.user_settings[user_id] = threshold
 
-    def get_user_threshold(self, user_id: int, for_basis: bool = False) -> float:
+    def set_user_alert_preferences(self, user_id: int, inter_enabled: bool = True, 
+                                    basis_enabled: bool = True, funding_enabled: bool = True,
+                                    scan_type: str = 'all'):
+        """Set user alert type preferences"""
+        self.user_inter_settings[user_id] = inter_enabled
+        self.user_basis_alert_settings[user_id] = basis_enabled
+        self.user_funding_settings[user_id] = funding_enabled
+        self.user_scan_type[user_id] = scan_type
+        logger.info(f"User {user_id} alert preferences: inter={inter_enabled}, basis={basis_enabled}, funding={funding_enabled}, scan={scan_type}")
+
+    def get_user_threshold(self, user_id: int, for_basis: bool = False, for_funding: bool = False) -> float:
+        if for_funding:
+            return self.user_settings.get(user_id, self.default_min_spread)
         if for_basis:
             return self.user_basis_settings.get(user_id, self.basis_threshold)
         return self.user_settings.get(user_id, self.default_min_spread)
@@ -198,6 +223,14 @@ class SpreadScanner:
                 self.user_basis_settings[user_id] = self.basis_threshold
             if user_id not in self.user_alerts_enabled:
                 self.user_alerts_enabled[user_id] = True
+            if user_id not in self.user_inter_settings:
+                self.user_inter_settings[user_id] = True
+            if user_id not in self.user_basis_alert_settings:
+                self.user_basis_alert_settings[user_id] = True
+            if user_id not in self.user_funding_settings:
+                self.user_funding_settings[user_id] = True
+            if user_id not in self.user_scan_type:
+                self.user_scan_type[user_id] = 'all'
         else:
             self.subscribers.append(callback)
 
@@ -206,6 +239,10 @@ class SpreadScanner:
                           if not (isinstance(s, tuple) and s[1] == user_id)]
         self.user_settings.pop(user_id, None)
         self.user_basis_settings.pop(user_id, None)
+        self.user_inter_settings.pop(user_id, None)
+        self.user_basis_alert_settings.pop(user_id, None)
+        self.user_funding_settings.pop(user_id, None)
+        self.user_scan_type.pop(user_id, None)
 
     def get_active_spreads(self, min_spread: float = 0.1) -> Dict[str, CachedSpread]:
         now = time.time()
@@ -289,20 +326,23 @@ class SpreadScanner:
         return available
 
     async def notify_subscribers(self, alert: SpreadAlert):
+        # Update stats by type
         if alert.is_basis:
             self.stats['basis_found'] += 1
+        elif alert.is_funding:
+            self.stats['basis_found'] += 1  # Funding counted with basis for stats
         else:
             self.stats['spreads_found'] += 1
 
-        arb_type = "БАЗИС" if alert.is_basis else "МЕЖБИРЖЕВОЙ"
+        arb_type = "БАЗИС" if alert.is_basis else "ФАНДИНГ" if alert.is_funding else "МЕЖБИРЖЕВОЙ"
         if alert.spread_percent >= 0.2:
             logger.info(f"🚨 {arb_type}: {alert.symbol} | {alert.buy_exchange} → {alert.sell_exchange} | {alert.spread_percent:.2f}%")
 
         key = f"{alert.symbol}:{alert.buy_exchange}:{alert.sell_exchange}"
-        
+
         if len(self.active_spreads) >= self.max_spread_cache:
             self.active_spreads.popitem(last=False)
-            
+
         self.active_spreads[key] = CachedSpread(
             symbol=alert.symbol,
             spread_percent=alert.spread_percent,
@@ -315,7 +355,7 @@ class SpreadScanner:
             timestamp=time.time(),
             arbitrage_type=alert.arbitrage_type
         )
-        
+
         self.active_spreads.move_to_end(key)
 
         if settings.auto_trading_default and alert.spread_percent >= settings.min_spread_auto:
@@ -329,13 +369,37 @@ class SpreadScanner:
                     # Пропускаем заблокированных пользователей
                     if user_id in self._blocked_subscribers:
                         continue
-                    user_threshold = self.get_user_threshold(user_id, for_basis=alert.is_basis)
 
                     # skip if alerts disabled for this user
                     if not self.user_alerts_enabled.get(user_id, True):
                         continue
-                    if alert.spread_percent >= user_threshold:
-                        await callback(alert, user_id)
+
+                    # Check alert type filter - NEW: proper type filtering
+                    scan_type = self.user_scan_type.get(user_id, 'all')
+                    if alert.is_basis:
+                        if not self.user_basis_alert_settings.get(user_id, True):
+                            continue
+                        if scan_type not in ('all', 'basis'):
+                            continue
+                        user_threshold = self.get_user_threshold(user_id, for_basis=True)
+                    elif alert.is_funding:
+                        if not self.user_funding_settings.get(user_id, True):
+                            continue
+                        if scan_type not in ('all', 'funding'):
+                            continue
+                        user_threshold = self.get_user_threshold(user_id, for_funding=True)
+                    else:  # inter_exchange
+                        if not self.user_inter_settings.get(user_id, True):
+                            continue
+                        if scan_type not in ('all', 'inter'):
+                            continue
+                        user_threshold = self.get_user_threshold(user_id, for_basis=False)
+
+                    # Check spread threshold - must pass user threshold
+                    if alert.spread_percent < user_threshold:
+                        continue
+
+                    await callback(alert, user_id)
                 else:
                     default_thresh = self.basis_threshold if alert.is_basis else self.default_min_spread
                     if alert.spread_percent >= default_thresh:
@@ -355,7 +419,6 @@ class SpreadScanner:
         if subscribers_to_remove:
             for sub in subscribers_to_remove:
                 self.unsubscribe(sub[1])
-
     async def _trigger_auto_trade(self, alert: SpreadAlert):
         """Триггер авто-трейдинга для всех пользователей с включенным авто-трейдингом"""
         try:
@@ -1422,26 +1485,35 @@ class SpreadScanner:
                     await self.notify_subscribers(alert)
 
     async def _evaluate_funding_arbitrage(self, symbol: str, ex1: str, pd1: PriceData, ex2: str, pd2: PriceData):
+        """Evaluate funding rate arbitrage between two futures exchanges"""
         if pd1.funding_rate == 0 and pd2.funding_rate == 0:
             return
 
-        funding_diff = abs(pd1.funding_rate - pd2.funding_rate) * 100
-        min_funding_diff = settings.min_funding_diff_percent
+        # Funding rates are decimals (e.g., 0.0001 = 0.01%), compute diff in percent
+        funding_diff_pct = abs(pd1.funding_rate - pd2.funding_rate) * 100
 
-        if funding_diff < min_funding_diff:
+        # Use configurable minimum - default much lower for realistic funding detection
+        # Convert settings value: if still at old default 1.0, use 0.01 instead
+        min_funding_diff = settings.min_funding_diff_percent
+        if min_funding_diff >= 1.0:
+            min_funding_diff = 0.01  # Realistic default: 0.01% diff
+
+        if funding_diff_pct < min_funding_diff:
             return
 
+        # Determine which exchange pays more funding (short there, long on the other)
         if pd1.funding_rate < pd2.funding_rate:
+            long_ex, long_pd = ex1, pd1  # lower/negative funding = better for long
+            short_ex, short_pd = ex2, pd2  # higher/positive funding = better for short
+            long_funding = pd1.funding_rate
+            short_funding = pd2.funding_rate
+        else:
             long_ex, long_pd = ex2, pd2
             short_ex, short_pd = ex1, pd1
             long_funding = pd2.funding_rate
             short_funding = pd1.funding_rate
-        else:
-            long_ex, long_pd = ex1, pd1
-            short_ex, short_pd = ex2, pd2
-            long_funding = pd1.funding_rate
-            short_funding = pd2.funding_rate
 
+        # Check hours to next funding
         max_hours = settings.max_funding_hours
         hours_to_funding = self._get_hours_to_funding(long_pd)
         if hours_to_funding is None:
@@ -1451,6 +1523,7 @@ class SpreadScanner:
             if hours_to_funding > max_hours:
                 return
 
+        # Price spread between exchanges
         price_spread = abs(long_pd.effective_price - short_pd.effective_price) / min(long_pd.effective_price, short_pd.effective_price) * 100
 
         min_vol = min(long_pd.volume_24h, short_pd.volume_24h)
@@ -1464,23 +1537,24 @@ class SpreadScanner:
             if (now - self.sent_alerts[alert_key]).seconds < 300:
                 return
             self.sent_alerts.move_to_end(alert_key)
-        
+
         self._cleanup_old_alerts()
 
-        level = 'high' if funding_diff >= 2.0 else ('medium' if funding_diff >= 1.0 else 'low')
+        level = 'high' if funding_diff_pct >= 0.1 else ('medium' if funding_diff_pct >= 0.05 else 'low')
 
+        # Create alert with FUNDING_RATE type for proper filtering
         alert = SpreadAlert(
             symbol=symbol,
-            spread_percent=funding_diff,
-            buy_exchange=short_ex,
-            sell_exchange=long_ex,
-            buy_price=short_pd,
-            sell_price=long_pd,
+            spread_percent=funding_diff_pct,
+            buy_exchange=long_ex,
+            sell_exchange=short_ex,
+            buy_price=long_pd,
+            sell_price=short_pd,
             volume_24h=min_vol,
             funding_diff=long_funding - short_funding,
             timestamp=now,
             alert_level=level,
-            arbitrage_type=ArbitrageType.INTER_EXCHANGE_FUTURES,
+            arbitrage_type=ArbitrageType.FUNDING_RATE,
             hours_to_funding=hours_to_funding,
             basis_info={
                 'funding_strategy': True,
@@ -1488,7 +1562,7 @@ class SpreadScanner:
                 'short_exchange': short_ex,
                 'long_funding_rate': long_funding,
                 'short_funding_rate': short_funding,
-                'funding_diff': funding_diff,
+                'funding_diff': funding_diff_pct,
                 'hours_to_funding': hours_to_funding,
                 'price_spread': price_spread,
                 'annual_funding_long': long_funding * 3 * 365,
@@ -1498,7 +1572,6 @@ class SpreadScanner:
 
         self.sent_alerts[alert_key] = now
         await self.notify_subscribers(alert)
-
     def _get_hours_to_funding(self, pd: PriceData) -> Optional[float]:
         funding_times = [0, 8, 16]
 

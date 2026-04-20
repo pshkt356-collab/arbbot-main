@@ -52,6 +52,8 @@ class UserSettings:
         'margin_mode': 'isolated'
     })
     arbitrage_mode: str = 'all'  # 'all' или 'futures_futures_only'
+    scan_type: str = 'all'  # 'all', 'inter', 'basis', 'funding'
+    funding_arbitrage_enabled: bool = True  # Фандинг арбитраж включен
     
     # Дополнительные поля для совместимости с callbacks.py
     auto_trade_mode: bool = False  # Режим авто-трейдинга
@@ -189,6 +191,7 @@ class Database:
                 await self._migrate_add_selected_exchanges()
                 await self._migrate_add_user_settings_columns()
                 await self._migrate_add_bot_blocked_column()
+                await self._migrate_add_scan_type_column()
                 self._initialized = True
                 logger.info(f"Database initialized: {self._db_path} (WAL mode)")
             except Exception as e:
@@ -265,6 +268,22 @@ class Database:
         except Exception as e:
             logger.error(f"Migration error for bot_blocked: {e}")
 
+    async def _migrate_add_scan_type_column(self):
+        """Миграция: добавление колонок scan_type и funding_arbitrage_enabled"""
+        try:
+            async with self._conn.execute("PRAGMA table_info(users)") as cursor:
+                columns = [row['name'] for row in await cursor.fetchall()]
+                if 'scan_type' not in columns:
+                    await self._conn.execute("ALTER TABLE users ADD COLUMN scan_type TEXT DEFAULT 'all'")
+                    await self._conn.commit()
+                    logger.info("Migration: added scan_type column")
+                if 'funding_arbitrage_enabled' not in columns:
+                    await self._conn.execute("ALTER TABLE users ADD COLUMN funding_arbitrage_enabled BOOLEAN DEFAULT 1")
+                    await self._conn.commit()
+                    logger.info("Migration: added funding_arbitrage_enabled column")
+        except Exception as e:
+            logger.error(f"Migration error for scan_type/funding: {e}")
+
     async def close(self):
         """Закрытие соединения с БД"""
         async with self._init_lock:
@@ -290,6 +309,8 @@ class Database:
                     alert_settings TEXT DEFAULT '{}',
                     risk_settings TEXT DEFAULT '{}',
                     arbitrage_mode TEXT DEFAULT 'all',
+                    scan_type TEXT DEFAULT 'all',
+                    funding_arbitrage_enabled BOOLEAN DEFAULT 1,
                     selected_exchanges TEXT DEFAULT '["binance", "bybit", "okx", "whitebit", "mexc"]',
                     min_spread_threshold REAL DEFAULT 0.2,
                     alerts_enabled BOOLEAN DEFAULT 1,
@@ -365,6 +386,8 @@ class Database:
                     alert_settings=json.loads(row['alert_settings']),
                     risk_settings=json.loads(row['risk_settings']),
                     arbitrage_mode=row['arbitrage_mode'] if row['arbitrage_mode'] else 'all',
+                    scan_type=row['scan_type'] if row['scan_type'] is not None else 'all',
+                    funding_arbitrage_enabled=bool(row['funding_arbitrage_enabled']) if row['funding_arbitrage_enabled'] is not None else True,
                     selected_exchanges=selected_exchanges,
                     min_spread_threshold=row['min_spread_threshold'] if row['min_spread_threshold'] is not None else 0.2,
                     alerts_enabled=bool(row['alerts_enabled']) if row['alerts_enabled'] is not None else True,
@@ -396,8 +419,9 @@ class Database:
                     INSERT INTO users (user_id, api_keys, commission_rates, alert_settings, risk_settings, arbitrage_mode, selected_exchanges,
                         min_spread_threshold, alerts_enabled, inter_exchange_enabled, basis_arbitrage_enabled,
                         auto_trade_mode, trade_amount, leverage, notifications_enabled,
-                        total_trades, successful_trades, failed_trades, total_profit, bot_blocked)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        total_trades, successful_trades, failed_trades, total_profit, bot_blocked,
+                        scan_type, funding_arbitrage_enabled)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     user_id,
                     json.dumps(user.api_keys),
@@ -418,7 +442,9 @@ class Database:
                     user.successful_trades,
                     user.failed_trades,
                     user.total_profit,
-                    int(user.bot_blocked)
+                    int(user.bot_blocked),
+                    user.scan_type,
+                    int(user.funding_arbitrage_enabled)
                 ))
                 await self._conn.commit()
                 logger.info(f"Created new user {user_id}")
@@ -492,6 +518,8 @@ class Database:
                     failed_trades = ?,
                     total_profit = ?,
                     bot_blocked = ?,
+                    scan_type = ?,
+                    funding_arbitrage_enabled = ?,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE user_id = ?
             """, (
@@ -515,6 +543,8 @@ class Database:
                 getattr(user, 'failed_trades', 0),
                 getattr(user, 'total_profit', 0.0),
                 int(getattr(user, 'bot_blocked', False)),
+                getattr(user, 'scan_type', 'all'),
+                int(getattr(user, 'funding_arbitrage_enabled', True)),
                 user.user_id
             ))
             await self._conn.commit()

@@ -12,6 +12,7 @@ from aiogram.exceptions import TelegramForbiddenError
 import logging
 import html
 import threading
+import time
 
 # Используем существующие импорты из оригинальной структуры
 from database.models import UserSettings, Database
@@ -58,9 +59,22 @@ def validate_exchange(exchange_id: str) -> bool:
 # ==================== MENU CALLBACKS ====================
 
 @callbacks_router.callback_query(F.data == "menu:main")
-async def show_main_menu(callback: CallbackQuery, user: UserSettings):
+async def show_main_menu(callback: CallbackQuery, user: UserSettings, scanner=None):
     """Главное меню"""
     await callback.answer()
+
+    # Sync user alert preferences to scanner
+    if scanner:
+        try:
+            scanner.set_user_alert_preferences(
+                user.user_id,
+                inter_enabled=getattr(user, 'inter_exchange_enabled', True),
+                basis_enabled=getattr(user, 'basis_arbitrage_enabled', True),
+                funding_enabled=getattr(user, 'funding_arbitrage_enabled', True),
+                scan_type=getattr(user, 'scan_type', 'all')
+            )
+        except Exception as e:
+            logger.debug(f"Failed to sync alert preferences: {e}")
 
     builder = InlineKeyboardBuilder()
 
@@ -82,18 +96,21 @@ async def show_main_menu(callback: CallbackQuery, user: UserSettings):
         InlineKeyboardButton(text="🔧 Настройки", callback_data="settings:menu")
     )
 
+    test_status = "🧪 Тест" if user.test_mode else "💰 Реал"
+
     text = (
         f"👋 **Привет, {escape_html(callback.from_user.first_name)}!**\n\n"
         f"🤖 **Arbitrage Bot** — отслеживай и торгуй арбитражными спредами.\n\n"
         f"📊 **Режим:** {'🟢 Активен' if user.auto_trade_mode else '🔴 Выключен'}\n"
         f"💰 **Баланс:** {user.total_balance:.2f} USDT\n"
-        f"🔔 **Алерты:** {'🟢 Вкл' if user.alerts_enabled else '🔴 Выкл'}\n\n"
+        f"🔔 **Алерты:** {'🟢 Вкл' if user.alerts_enabled else '🔴 Выкл'}\n"
+        f"🧪 **Торговля:** {test_status}\n\n"
         f"Выбери раздел:"
     )
 
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
 
-@callbacks_router.callback_query(F.data == "menu:back")
+
 async def back_to_main(callback: CallbackQuery, user: UserSettings):
     """Назад в главное меню"""
     await show_main_menu(callback, user)
@@ -233,13 +250,17 @@ async def show_alert_settings(callback: CallbackQuery, user: UserSettings):
         InlineKeyboardButton(
             text=f"🔄 Межбиржевой: {'🟢' if user.inter_exchange_enabled else '🔴'}",
             callback_data="alerts:toggle_inter"
-        )
-    )
-    builder.row(
+        ),
         InlineKeyboardButton(
             text=f"📊 Базис: {'🟢' if user.basis_arbitrage_enabled else '🔴'}",
             callback_data="alerts:toggle_basis"
-        )
+        ),
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text=f"💸 Фандинг: {'🟢' if getattr(user, 'funding_arbitrage_enabled', True) else '🔴'}",
+            callback_data="alerts:toggle_funding"
+        ),
     )
 
     builder.row(
@@ -248,17 +269,18 @@ async def show_alert_settings(callback: CallbackQuery, user: UserSettings):
     )
 
     text = (
-        "**⚙️ Настройки алертов**\n\n"
+        f"**⚙️ Настройки алертов**\n\n"
         f"🔔 **Статус:** {'🟢 Вкл' if user.alerts_enabled else '🔴 Выкл'}\n"
         f"🎯 **Порог:** {user.min_spread_threshold:.1f}%\n"
         f"🔄 **Межбиржевой:** {'🟢 Вкл' if user.inter_exchange_enabled else '🔴 Выкл'}\n"
-        f"📊 **Базис:** {'🟢 Вкл' if user.basis_arbitrage_enabled else '🔴 Выкл'}\n\n"
+        f"📊 **Базис:** {'🟢 Вкл' if user.basis_arbitrage_enabled else '🔴 Выкл'}\n"
+        f"💸 **Фандинг:** {'🟢 Вкл' if getattr(user, 'funding_arbitrage_enabled', True) else '🔴 Выкл'}\n\n"
         f"Выбери настройки:"
     )
 
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
 
-@callbacks_router.callback_query(F.data == "alerts:toggle")
+
 async def toggle_alerts(callback: CallbackQuery, user: UserSettings, db: Database = None):
     """Вкл/выкл алерты"""
     user.alerts_enabled = not user.alerts_enabled
@@ -298,15 +320,23 @@ async def toggle_basis_arbitrage(callback: CallbackQuery, user: UserSettings, db
 
 @callbacks_router.callback_query(F.data == "alerts:save")
 async def save_alert_settings(callback: CallbackQuery, user: UserSettings, db: Database = None, scanner=None):
-    """Сохранить настройки алертов"""
+    """Сохранить настройки алертов и синхронизировать со сканером"""
     await callback.answer("✅ Сохранено!", show_alert=True)
 
-    # Обновляем порог в сканере если есть
+    # Синхронизируем все настройки со сканером
     if scanner and user.user_id:
         scanner.set_user_threshold(user.user_id, user.min_spread_threshold)
-        logger.info(f"Updated threshold for user {user.user_id}: {user.min_spread_threshold}%")
+        scanner.set_user_alert_preferences(
+            user.user_id,
+            inter_enabled=getattr(user, 'inter_exchange_enabled', True),
+            basis_enabled=getattr(user, 'basis_arbitrage_enabled', True),
+            funding_enabled=getattr(user, 'funding_arbitrage_enabled', True),
+            scan_type=getattr(user, 'scan_type', 'all')
+        )
+        logger.info(f"Updated alert preferences for user {user.user_id}: threshold={user.min_spread_threshold}%, inter={getattr(user, 'inter_exchange_enabled', True)}, basis={getattr(user, 'basis_arbitrage_enabled', True)}, funding={getattr(user, 'funding_arbitrage_enabled', True)}, scan={getattr(user, 'scan_type', 'all')}")
 
     await show_spreads_menu(callback, user)
+
 
 async def subscribe_user_to_alerts(user_id: int, scanner, db: Database = None):
     """Подписка пользователя на алерты с загрузкой порога из БД"""
@@ -386,31 +416,40 @@ async def send_spread_alert(spread_info, user_id: int):
     if user_id in _blocked_users_cache:
         return
     # Check user alert settings from DB before sending
+    try:
+        db_chk = Database()
+        await db_chk.initialize()
         try:
-            db_chk = Database()
-            await db_chk.initialize()
-            try:
-                alert_user = await db_chk.get_user(user_id)
-                if not alert_user or not alert_user.alerts_enabled:
-                    return
-                if hasattr(spread_info, 'symbol'):
-                    chk_spread = spread_info.spread_percent
-                    chk_type = 'basis' if 'basis' in str(getattr(spread_info, 'arbitrage_type', '')).lower() else 'inter'
+            alert_user = await db_chk.get_user(user_id)
+            if not alert_user or not alert_user.alerts_enabled:
+                return
+            if hasattr(spread_info, 'symbol'):
+                chk_spread = spread_info.spread_percent
+                # Proper type detection including funding
+                arb_type_str = str(getattr(spread_info, 'arbitrage_type', '')).lower()
+                if 'funding' in arb_type_str:
+                    chk_type = 'funding'
+                elif 'basis' in arb_type_str:
+                    chk_type = 'basis'
                 else:
-                    chk_spread = spread_info.get('spread', 0)
-                    chk_type = spread_info.get('type', 'inter')
-                if chk_spread < alert_user.min_spread_threshold:
-                    return
-                if chk_type == 'basis' and not alert_user.basis_arbitrage_enabled:
-                    return
-                if chk_type == 'inter' and not alert_user.inter_exchange_enabled:
-                    return
-            finally:
-                await db_chk.close()
-        except Exception as e:
-            logger.error(f"Alert settings check error: {e}")
-            return
+                    chk_type = 'inter'
+            else:
+                chk_spread = spread_info.get('spread', 0)
+                chk_type = spread_info.get('type', 'inter')
 
+            if chk_spread < alert_user.min_spread_threshold:
+                return
+            if chk_type == 'basis' and not alert_user.basis_arbitrage_enabled:
+                return
+            if chk_type == 'inter' and not alert_user.inter_exchange_enabled:
+                return
+            if chk_type == 'funding' and not getattr(alert_user, 'funding_arbitrage_enabled', True):
+                return
+        finally:
+            await db_chk.close()
+    except Exception as e:
+        logger.error(f"Alert settings check error: {e}")
+        return
 
     try:
         global _bot
@@ -430,8 +469,14 @@ async def send_spread_alert(spread_info, user_id: int):
             buy_px = spread_info.buy_price.last_price if spread_info.buy_price else 0
             sell_px = spread_info.sell_price.last_price if spread_info.sell_price else 0
 
-            # Определяем тип по arbitrage_type
-            spread_type = 'basis' if 'basis' in str(spread_info.arbitrage_type).lower() else 'inter'
+            # Proper type detection including funding
+            arb_type_str = str(spread_info.arbitrage_type).lower()
+            if 'funding' in arb_type_str:
+                spread_type = 'funding'
+            elif 'basis' in arb_type_str:
+                spread_type = 'basis'
+            else:
+                spread_type = 'inter'
         else:
             # Это dict
             symbol = spread_info.get('symbol', 'N/A')
@@ -442,7 +487,17 @@ async def send_spread_alert(spread_info, user_id: int):
             sell_px = spread_info.get('sell_price', 0)
             spread_type = spread_info.get('type', 'inter')
 
-        if spread_type == 'basis':
+        if spread_type == 'funding':
+            funding_diff = getattr(spread_info, 'funding_diff', 0)
+            text = (
+                f"💸 **ФАНДИНГ-АРБИТРАЖ**\n\n"
+                f"💎 **{escape_html(symbol)}**\n"
+                f"📈 **Разница фандинга:** {spread:.4f}%\n"
+                f"💰 **Ценовой спред:** {funding_diff:.4f}%\n\n"
+                f"📉 **Лонг на:** {escape_html(buy_ex)}\n"
+                f"📈 **Шорт на:** {escape_html(sell_ex)}"
+            )
+        elif spread_type == 'basis':
             text = (
                 f"📊 **БАЗИСНЫЙ АРБИТРАЖ**\n\n"
                 f"💎 **{escape_html(symbol)}**\n"
@@ -502,7 +557,7 @@ async def send_spread_alert(spread_info, user_id: int):
         else:
             logger.error(f"Error sending alert to user {user_id}: {e}")
 
-@callbacks_router.callback_query(F.data == "alerts:list")
+
 async def show_user_alerts(callback: CallbackQuery, user: UserSettings):
     """Показать список алертов пользователя"""
     await callback.answer()
@@ -527,9 +582,23 @@ async def show_user_alerts(callback: CallbackQuery, user: UserSettings):
 # ==================== PROFILE MENU ====================
 
 @callbacks_router.callback_query(F.data == "profile:menu")
-async def show_profile_menu(callback: CallbackQuery, user: UserSettings):
+async def show_profile_menu(callback: CallbackQuery, user: UserSettings, scanner=None, db: Database = None):
     """Меню профиля"""
     await callback.answer()
+
+    # Refresh balance from scanner cached balances if available
+    balance_display = f"{user.total_balance:.2f}"
+    if scanner and scanner._cached_balances:
+        total = sum(scanner._cached_balances.values())
+        if total > 0:
+            balance_display = f"{total:.2f}"
+            # Update user in DB
+            user.total_balance = total
+            if db:
+                try:
+                    await db.update_user(user)
+                except Exception:
+                    pass
 
     builder = InlineKeyboardBuilder()
     builder.row(
@@ -543,13 +612,15 @@ async def show_profile_menu(callback: CallbackQuery, user: UserSettings):
 
     exchanges = ', '.join(user.selected_exchanges) if user.selected_exchanges else 'Не выбраны'
     api_count = len(user.api_keys) if user.api_keys else 0
+    test_status = "✅ Тестовый" if user.test_mode else "❌ Реальный"
 
     text = (
         f"**⚙️ Профиль**\n\n"
         f"👤 **ID:** `{user.user_id}`\n"
-        f"💰 **Баланс:** {user.total_balance:.2f} USDT\n"
+        f"💰 **Баланс:** {balance_display} USDT\n"
         f"🏦 **Биржи:** {escape_html(exchanges)}\n"
-        f"🔑 **API ключей:** {api_count}\n\n"
+        f"🔑 **API ключей:** {api_count}\n"
+        f"🧪 **Режим:** {test_status}\n\n"
         f"Выбери действие:"
     )
 
@@ -764,22 +835,25 @@ async def show_settings_menu(callback: CallbackQuery, user: UserSettings):
         InlineKeyboardButton(text="🔔 Уведомления", callback_data="settings:notifications")
     )
     builder.row(
-        InlineKeyboardButton(text="⚙️ Расширенные", callback_data="settings:advanced"),
+        InlineKeyboardButton(text="🧪 Режим торговли", callback_data="settings:test_mode"),
+        InlineKeyboardButton(text="⚙️ Расширенные", callback_data="settings:advanced")
+    )
+    builder.row(
         InlineKeyboardButton(text="📱 Меню", callback_data="menu:main")
     )
 
+    test_status = "✅ Тестовый" if user.test_mode else "❌ Реальный"
     text = (
-        "**⚙️ Настройки**\n\n"
+        f"**⚙️ Настройки**\n\n"
         f"🌐 **Язык:** Русский\n"
-        f"🔔 **Уведомления:** {'🟢 Вкл' if user.notifications_enabled else '🔴 Выкл'}\n\n"
+        f"🔔 **Уведомления:** {'🟢 Вкл' if user.notifications_enabled else '🔴 Выкл'}\n"
+        f"🧪 **Режим торговли:** {test_status}\n\n"
         f"Выбери раздел:"
     )
 
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
 
-# ==================== MONITORING MENU ====================
 
-@callbacks_router.callback_query(F.data == "monitoring:menu")
 async def show_monitoring_menu(callback: CallbackQuery, user: UserSettings):
     """Меню мониторинга"""
     await callback.answer()
@@ -1130,91 +1204,6 @@ async def show_monitoring_spreads(callback: CallbackQuery, user: UserSettings, s
         await callback.message.edit_text(f"**❌ Error:** {escape_html(str(e))[:100]}", reply_markup=InlineKeyboardBuilder().button(text="🔙 Back", callback_data="monitoring:menu").as_markup())
 
 @callbacks_router.callback_query(F.data.startswith("trade:open:"))
-async def handle_trade_open(callback: CallbackQuery, user: UserSettings, scanner=None, db=None):
-    """Open trade from monitoring spreads"""
-    await callback.answer()
-    if not scanner:
-        await callback.answer("❌ Scanner not ready", show_alert=True)
-        return
-    parts = callback.data.split(":")
-    if len(parts) < 6:
-        await callback.answer("❌ Invalid parameters", show_alert=True)
-        return
-    symbol = parts[2]
-    buy_ex = parts[3]
-    sell_ex = parts[4]
-    try:
-        spread_val = float(parts[5])
-    except ValueError:
-        spread_val = 0
-    if not user.api_keys:
-        await callback.answer("❌ Add API keys in Profile first", show_alert=True)
-        return
-    if not user.is_trading_enabled:
-        await callback.answer("❌ Trading is disabled. Enable in settings.", show_alert=True)
-        return
-    await callback.message.edit_text(f"**⏳ Opening trade...**\n\nPair: {escape_html(symbol)}\nSpread: {spread_val:.2f}%\nLong: {escape_html(buy_ex)}\nShort: {escape_html(sell_ex)}")
-    try:
-        from services.trading_engine import trading_engine
-        spread_key = f"{symbol}:{buy_ex}:{sell_ex}"
-        result = await trading_engine.validate_and_open(user, spread_key, scanner.prices, test_mode=user.alert_settings.get('test_mode', True))
-        if result.success:
-            await callback.message.edit_text(f"**✅ Trade #{result.trade_id} opened!**\n\nPair: {escape_html(symbol)}\nEntry spread: {result.entry_spread:.2f}%\nSize: ${result.position_size:,.2f}\n\nBot is monitoring automatically.",
-                reply_markup=InlineKeyboardBuilder().row(InlineKeyboardButton(text="📊 My Positions", callback_data="positions:open"), InlineKeyboardButton(text="📱 Menu", callback_data="menu:main")).as_markup())
-        else:
-            await callback.message.edit_text(f"**❌ Open error:**\n{escape_html(result.error)}\n\nTry again later.",
-                reply_markup=InlineKeyboardBuilder().row(InlineKeyboardButton(text="🔄 Retry", callback_data=callback.data), InlineKeyboardButton(text="🔙 Back", callback_data="monitoring:spreads")).as_markup())
-    except Exception as e:
-        logger.error(f"Error opening trade: {e}")
-        await callback.message.edit_text(f"**❌ Error:** {escape_html(str(e))[:200]}", reply_markup=InlineKeyboardBuilder().button(text="🔙 Back", callback_data="monitoring:spreads").as_markup())
-
-@callbacks_router.callback_query(F.data.startswith("trade:close:"))
-async def handle_trade_close(callback: CallbackQuery, user: UserSettings, db=None):
-    """Close position by ID"""
-    await callback.answer()
-    try:
-        trade_id = int(callback.data.split(":")[2])
-    except (ValueError, IndexError):
-        await callback.answer("❌ Invalid trade ID", show_alert=True)
-        return
-    await callback.message.edit_text(f"**⏳ Closing trade #{trade_id}...**")
-    try:
-        from services.trading_engine import trading_engine
-        result = await trading_engine.close_trade_manually(trade_id, user)
-        if result.success:
-            pnl_str = ""
-            if result.metadata and 'pnl' in result.metadata:
-                pnl = result.metadata['pnl']
-                pnl_str = f"\nPnL: {'🟢 +' if pnl >= 0 else '🔴 '}${pnl:.2f}"
-            await callback.message.edit_text(f"**✅ Trade #{trade_id} closed!**{pnl_str}\n\nPosition closed successfully.",
-                reply_markup=InlineKeyboardBuilder().row(InlineKeyboardButton(text="📊 Positions", callback_data="positions:open"), InlineKeyboardButton(text="📱 Menu", callback_data="menu:main")).as_markup())
-        else:
-            await callback.message.edit_text(f"**❌ Close error #{trade_id}:**\n{escape_html(result.error)}\n\nIf error persists, position may already be closed.",
-                reply_markup=InlineKeyboardBuilder().row(InlineKeyboardButton(text="🔄 Retry", callback_data=callback.data), InlineKeyboardButton(text="📊 Positions", callback_data="positions:open")).as_markup())
-    except Exception as e:
-        logger.error(f"Error closing trade: {e}")
-        await callback.message.edit_text(f"**❌ Error:** {escape_html(str(e))[:200]}", reply_markup=InlineKeyboardBuilder().button(text="📱 Menu", callback_data="menu:main").as_markup())
-
-# ==================== ERROR HANDLING ====================
-
-# ИСПРАВЛЕНО: Правильная сигнатура для aiogram 3.x
-@callbacks_router.errors()
-async def callback_error_handler(update: Update, exception: Exception):
-    """Обработка ошибок колбэков"""
-    logger.error(f"Callback error: {exception}")
-    # Пытаемся отправить уведомление пользователю
-    try:
-        if hasattr(update, 'callback_query') and update.callback_query:
-            await update.callback_query.answer("❌ Ошибка обработки", show_alert=True)
-        elif hasattr(update, 'message') and update.message:
-            await update.message.answer("❌ Произошла ошибка. Попробуйте /start")
-    except Exception as e:
-        logger.error(f"Failed to send error notification: {e}")
-
-
-# ==================== TRADE EXECUTION HANDLERS ====================
-
-@callbacks_router.callback_query(F.data.startswith("trade:open:"))
 async def handle_trade_open(callback: CallbackQuery, user: UserSettings, scanner=None, db: Database = None):
     """Открыть сделку на обеих биржах (лонг + шорт)"""
     await callback.answer()
@@ -1470,7 +1459,7 @@ async def handle_trade_cancel(callback: CallbackQuery):
 
 @callbacks_router.callback_query(F.data.startswith("trade:details:"))
 async def handle_trade_details(callback: CallbackQuery, scanner=None):
-    """Показать детали спреда"""
+    """Показать детали спреда с реальными данными из сканера"""
     await callback.answer()
     parts = callback.data.split(":")
     if len(parts) < 5:
@@ -1478,21 +1467,82 @@ async def handle_trade_details(callback: CallbackQuery, scanner=None):
     symbol = parts[2]
     buy_ex = parts[3]
     sell_ex = parts[4]
+
+    # Try to get real spread data from scanner
+    spread_data = None
+    if scanner and scanner.active_spreads:
+        # Try exact key match
+        key = f"{symbol}:{buy_ex}:{sell_ex}"
+        spread_data = scanner.active_spreads.get(key)
+
+        # If not found, try reverse direction
+        if not spread_data:
+            reverse_key = f"{symbol}:{sell_ex}:{buy_ex}"
+            spread_data = scanner.active_spreads.get(reverse_key)
+
+        # If still not found, search by symbol
+        if not spread_data:
+            for k, v in scanner.active_spreads.items():
+                if v.symbol == symbol:
+                    spread_data = v
+                    break
+
     keyboard = InlineKeyboardBuilder()
     keyboard.row(
         InlineKeyboardButton(text="⚡ Открыть сделку", callback_data=f"trade:open:{symbol}:{buy_ex}:{sell_ex}"),
         InlineKeyboardButton(text="📱 Меню", callback_data="menu:main")
     )
-    await callback.message.answer(
-        f"📊 **Детали спреда**\n\n"
-        f"💎 {escape_html(symbol)}\n"
-        f"📉 Покупка: {escape_html(buy_ex)}\n"
-        f"📈 Продажа: {escape_html(sell_ex)}\n\n"
-        f"Выберите действие:",
-        reply_markup=keyboard.as_markup()
-    )
 
-@callbacks_router.callback_query(F.data == "trade:skip")
+    if spread_data:
+        # Build detailed message with real data
+        arb_type_label = "Межбиржевой"
+        if hasattr(spread_data, 'arbitrage_type'):
+            arb_map = {
+                'basis_spot_futures': 'Базис (спот-фьючерс)',
+                'cross_exchange_basis': 'Базис (кросс-биржа)',
+                'funding_rate': 'Фандинг-арбитраж',
+                'inter_exchange_futures': 'Межбиржевой'
+            }
+            type_key = str(spread_data.arbitrage_type.value) if hasattr(spread_data.arbitrage_type, 'value') else str(spread_data.arbitrage_type)
+            arb_type_label = arb_map.get(type_key, 'Межбиржевой')
+
+        spread_pct = spread_data.spread_percent
+        spread_emoji = "🟢" if spread_pct >= 2.0 else ("🟡" if spread_pct >= 1.0 else "⚪")
+
+        text = (
+            f"📊 **Детали спреда**\n\n"
+            f"💎 {escape_html(symbol)}\n"
+            f"🏷️ Тип: {arb_type_label}\n"
+            f"{spread_emoji} **Спред: {spread_pct:.2f}%**\n\n"
+            f"💰 Цены:\n"
+            f"├ Покупка ({escape_html(buy_ex)}): {spread_data.buy_price:.4f}\n"
+            f"└ Продажа ({escape_html(sell_ex)}): {spread_data.sell_price:.4f}\n\n"
+            f"📊 Объём 24ч: {spread_data.volume_24h:,.0f} USDT\n"
+        )
+
+        if spread_data.funding_diff and spread_data.funding_diff != 0:
+            text += f"💸 Разница фандинга: {spread_data.funding_diff:.4f}%\n"
+
+        if hasattr(spread_data, 'timestamp'):
+            age_sec = time.time() - spread_data.timestamp
+            text += f"⏱️ Возраст данных: {age_sec:.0f}с\n"
+
+        text += "\nВыберите действие:"
+    else:
+        # Fallback if no data in scanner
+        text = (
+            f"📊 **Детали спреда**\n\n"
+            f"💎 {escape_html(symbol)}\n"
+            f"📉 Покупка: {escape_html(buy_ex)}\n"
+            f"📈 Продажа: {escape_html(sell_ex)}\n\n"
+            f"⚠️ Детальные данные недоступны — спред может быть устаревшим.\n"
+            f"Обновите список спредов для актуальной информации.\n\n"
+            f"Выберите действие:"
+        )
+
+    await callback.message.answer(text, reply_markup=keyboard.as_markup())
+
+
 async def handle_trade_skip(callback: CallbackQuery):
     """Пропустить алерт"""
     await callback.answer("⏭ Пропущено")
@@ -1546,7 +1596,7 @@ async def show_positions_menu(callback: CallbackQuery, user: UserSettings, db: D
         )
 
 @callbacks_router.callback_query(F.data.startswith("position:details:"))
-async def show_position_details(callback: CallbackQuery, user: UserSettings, db: Database = None):
+async def show_position_details(callback: CallbackQuery, user: UserSettings, db: Database = None, scanner=None):
     """Детальная карточка позиции с управлением (как в MetaTrader)"""
     await callback.answer()
     if not db:
@@ -1562,9 +1612,44 @@ async def show_position_details(callback: CallbackQuery, user: UserSettings, db:
         if trade.status != "open":
             await callback.answer("❌ Позиция уже закрыта", show_alert=True)
             return
+
         side = trade.metadata.get('side', 'both')
         side_emoji = "📈 ЛОНГ" if side == 'long' else "📉 ШОРТ" if side == 'short' else "⚡ АРБИТРАЖ"
-        pnl_emoji = "🟢" if (trade.pnl_usd or 0) > 0 else "🔴" if (trade.pnl_usd or 0) < 0 else "⚪"
+
+        # Update current prices from scanner if available
+        current_long = trade.current_price_long or trade.entry_price_long
+        current_short = trade.current_price_short or trade.entry_price_short
+
+        if scanner and trade.symbol in scanner.prices:
+            for ex_name, p_data in scanner.prices[trade.symbol].items():
+                if isinstance(p_data, dict) and p_data.get('last_price'):
+                    price = p_data['last_price']
+                elif hasattr(p_data, 'last_price'):
+                    price = p_data.last_price
+                else:
+                    continue
+
+                # Determine which side this exchange belongs to
+                ex_lower = ex_name.lower()
+                if trade.entry_price_long > 0 and ex_lower == (trade.metadata.get('long_exchange') or '').lower():
+                    current_long = price
+                elif trade.entry_price_short > 0 and ex_lower == (trade.metadata.get('short_exchange') or '').lower():
+                    current_short = price
+
+        # Recalculate P&L with current prices
+        pnl_usd = trade.pnl_usd or 0
+        pnl_pct = trade.pnl_percent or 0
+        if trade.entry_price_long > 0 and trade.entry_price_long > 0 and current_long > 0:
+            long_pnl = (current_long - trade.entry_price_long) / trade.entry_price_long * trade.size_usd * 0.5
+            pnl_usd = long_pnl
+        if trade.entry_price_short > 0 and trade.entry_price_short > 0 and current_short > 0:
+            short_pnl = (trade.entry_price_short - current_short) / trade.entry_price_short * trade.size_usd * 0.5
+            pnl_usd += short_pnl
+        if trade.size_usd and trade.size_usd > 0:
+            pnl_pct = (pnl_usd / trade.size_usd) * 100
+
+        pnl_emoji = "🟢" if pnl_usd > 0 else "🔴" if pnl_usd < 0 else "⚪"
+
         try:
             from datetime import datetime, timezone
             opened = datetime.fromisoformat(trade.opened_at.replace('Z', '+00:00'))
@@ -1572,29 +1657,36 @@ async def show_position_details(callback: CallbackQuery, user: UserSettings, db:
             time_str = f"{hours_open:.1f}ч"
         except:
             time_str = "N/A"
+
         text = (
             f"{'='*30}\n"
             f"{side_emoji} **#{trade.id} {escape_html(trade.symbol)}**\n"
             f"{'='*30}\n\n"
             f"💰 **Размер:** ${trade.size_usd:.2f}\n"
-            f"{pnl_emoji} **P&L:** ${trade.pnl_usd:.2f} ({trade.pnl_percent:.2f}%)\n"
+            f"{pnl_emoji} **P&L:** ${pnl_usd:.2f} ({pnl_pct:.2f}%)\n"
             f"⏱ **В позиции:** {time_str}\n\n"
-            f"📊 **Входные цены:**\n"
+            f"📊 **Цены:**\n"
         )
+
         if trade.entry_price_long > 0:
-            text += f"   📈 Лонг: {trade.entry_price_long:.6f}\n"
-            text += f"   Текущий: {trade.current_price_long:.6f}\n"
+            long_change = ((current_long - trade.entry_price_long) / trade.entry_price_long * 100) if trade.entry_price_long > 0 else 0
+            text += f"   📈 Лонг вход: {trade.entry_price_long:.6f} | Текущий: {current_long:.6f} ({long_change:+.2f}%)\n"
+
         if trade.entry_price_short > 0:
-            text += f"   📉 Шорт: {trade.entry_price_short:.6f}\n"
-            text += f"   Текущий: {trade.current_price_short:.6f}\n"
+            short_change = ((trade.entry_price_short - current_short) / trade.entry_price_short * 100) if trade.entry_price_short > 0 else 0
+            text += f"   📉 Шорт вход: {trade.entry_price_short:.6f} | Текущий: {current_short:.6f} ({short_change:+.2f}%)\n"
+
         text += (
             f"\n🛡 **Защита:**\n"
             f"   SL: {trade.stop_loss_price:.6f}\n"
             f"   TP: {trade.take_profit_price:.6f}\n"
         )
+
         if trade.trailing_enabled:
             text += f"   📊 Trailing: {trade.trailing_stop_price:.6f}\n"
+
         text += f"\n🔧 **Действия:**"
+
         builder = InlineKeyboardBuilder()
         builder.row(
             InlineKeyboardButton(text="❌ Закрыть", callback_data=f"position:close:{trade.id}"),
@@ -1619,7 +1711,7 @@ async def show_position_details(callback: CallbackQuery, user: UserSettings, db:
         logger.error(f"Position details error: {e}")
         await callback.answer("❌ Ошибка", show_alert=True)
 
-@callbacks_router.callback_query(F.data.startswith("position:close:"))
+
 async def handle_position_close(callback: CallbackQuery, user: UserSettings, db: Database = None):
     """Закрыть позицию полностью"""
     trade_id = int(callback.data.split(":")[2])
@@ -1731,3 +1823,171 @@ async def handle_modify_tp(callback: CallbackQuery, state: FSMContext, db: Datab
     except Exception as e:
         logger.error(f"Modify TP error: {e}")
         await callback.answer("❌ Ошибка", show_alert=True)
+
+
+# ==================== TEST MODE TOGGLE ====================
+
+@callbacks_router.callback_query(F.data == "settings:test_mode")
+async def toggle_test_mode(callback: CallbackQuery, user: UserSettings, db: Database = None):
+    """Переключение тестового режима торговли"""
+    await callback.answer()
+    if not db:
+        await callback.answer("❌ База данных недоступна", show_alert=True)
+        return
+
+    # Toggle test mode
+    user.test_mode = not user.test_mode
+    await db.update_user(user)
+
+    status = "✅ Тестовый" if user.test_mode else "❌ Реальный"
+    await callback.answer(f"Режим: {status}", show_alert=True)
+
+    # Refresh settings menu
+    await show_settings_menu(callback, user)
+
+
+# ==================== ADVANCED SETTINGS ====================
+
+@callbacks_router.callback_query(F.data == "settings:advanced")
+async def show_advanced_settings(callback: CallbackQuery, user: UserSettings, db: Database = None, scanner=None):
+    """Расширенные настройки — выбор типа поиска и типов арбитража"""
+    await callback.answer()
+
+    builder = InlineKeyboardBuilder()
+
+    # Scan type selection
+    scan_type = user.scan_type if hasattr(user, 'scan_type') else 'all'
+    builder.row(InlineKeyboardButton(text=f"🔍 Тип поиска: {scan_type}", callback_data="scan:type_info"))
+
+    builder.row(
+        InlineKeyboardButton(text="🔍 Все спреды", callback_data="alerts:scan_type_all"),
+        InlineKeyboardButton(text="📊 Межбиржевой", callback_data="alerts:scan_type_inter"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="📈 Базис", callback_data="alerts:scan_type_basis"),
+        InlineKeyboardButton(text="💸 Фандинг", callback_data="alerts:scan_type_funding"),
+    )
+
+    # Arbitrage type toggles
+    inter_enabled = getattr(user, 'inter_exchange_enabled', True)
+    basis_enabled = getattr(user, 'basis_arbitrage_enabled', True)
+    funding_enabled = getattr(user, 'funding_arbitrage_enabled', True)
+
+    builder.row(InlineKeyboardButton(text="🔔 Типы алертов:", callback_data="alerts:type_info"))
+    builder.row(
+        InlineKeyboardButton(
+            text=f"{'🟢' if inter_enabled else '🔴'} Межбиржевой",
+            callback_data="alerts:toggle_inter"
+        ),
+        InlineKeyboardButton(
+            text=f"{'🟢' if basis_enabled else '🔴'} Базис",
+            callback_data="alerts:toggle_basis"
+        ),
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text=f"{'🟢' if funding_enabled else '🔴'} Фандинг",
+            callback_data="alerts:toggle_funding"
+        ),
+    )
+
+    builder.row(
+        InlineKeyboardButton(text="💾 Сохранить", callback_data="alerts:save"),
+        InlineKeyboardButton(text="📱 Меню", callback_data="menu:main")
+    )
+
+    text = (
+        f"⚙️ **Расширенные настройки**\n\n"
+        f"🔍 **Тип поиска:** {scan_type}\n"
+        f"   • all — все типы спредов\n"
+        f"   • inter — только межбиржевой\n"
+        f"   • basis — только базис\n"
+        f"   • funding — только фандинг\n\n"
+        f"🔔 **Типы алертов:**\n"
+        f"   • Межбиржевой: {'🟢 Вкл' if inter_enabled else '🔴 Выкл'}\n"
+        f"   • Базис: {'🟢 Вкл' if basis_enabled else '🔴 Выкл'}\n"
+        f"   • Фандинг: {'🟢 Вкл' if funding_enabled else '🔴 Выкл'}\n"
+    )
+
+    await callback.message.edit_text(text, reply_markup=builder.as_markup())
+
+
+@callbacks_router.callback_query(F.data == "alerts:scan_type_all")
+async def set_scan_type_all(callback: CallbackQuery, user: UserSettings, db: Database = None, scanner=None):
+    """Установить тип поиска: все"""
+    await callback.answer("Тип поиска: Все спреды")
+    user.scan_type = 'all'
+    await db.update_user(user)
+    if scanner:
+        scanner.set_user_alert_preferences(user.user_id, scan_type='all')
+    await show_advanced_settings(callback, user, db, scanner)
+
+@callbacks_router.callback_query(F.data == "alerts:scan_type_inter")
+async def set_scan_type_inter(callback: CallbackQuery, user: UserSettings, db: Database = None, scanner=None):
+    """Установить тип поиска: межбиржевой"""
+    await callback.answer("Тип поиска: Межбиржевой")
+    user.scan_type = 'inter'
+    await db.update_user(user)
+    if scanner:
+        scanner.set_user_alert_preferences(user.user_id, scan_type='inter')
+    await show_advanced_settings(callback, user, db, scanner)
+
+@callbacks_router.callback_query(F.data == "alerts:scan_type_basis")
+async def set_scan_type_basis(callback: CallbackQuery, user: UserSettings, db: Database = None, scanner=None):
+    """Установить тип поиска: базис"""
+    await callback.answer("Тип поиска: Базис")
+    user.scan_type = 'basis'
+    await db.update_user(user)
+    if scanner:
+        scanner.set_user_alert_preferences(user.user_id, scan_type='basis')
+    await show_advanced_settings(callback, user, db, scanner)
+
+@callbacks_router.callback_query(F.data == "alerts:scan_type_funding")
+async def set_scan_type_funding(callback: CallbackQuery, user: UserSettings, db: Database = None, scanner=None):
+    """Установить тип поиска: фандинг"""
+    await callback.answer("Тип поиска: Фандинг")
+    user.scan_type = 'funding'
+    await db.update_user(user)
+    if scanner:
+        scanner.set_user_alert_preferences(user.user_id, scan_type='funding')
+    await show_advanced_settings(callback, user, db, scanner)
+
+
+@callbacks_router.callback_query(F.data == "alerts:toggle_basis")
+async def toggle_basis(callback: CallbackQuery, user: UserSettings, db: Database = None, scanner=None):
+    """Переключение базисных алертов"""
+    await callback.answer()
+    user.basis_arbitrage_enabled = not getattr(user, 'basis_arbitrage_enabled', True)
+    await db.update_user(user)
+    if scanner:
+        scanner.set_user_alert_preferences(
+            user.user_id,
+            basis_enabled=user.basis_arbitrage_enabled
+        )
+    await show_advanced_settings(callback, user, db, scanner)
+
+@callbacks_router.callback_query(F.data == "alerts:toggle_inter")
+async def toggle_inter(callback: CallbackQuery, user: UserSettings, db: Database = None, scanner=None):
+    """Переключение межбиржевых алертов"""
+    await callback.answer()
+    user.inter_exchange_enabled = not getattr(user, 'inter_exchange_enabled', True)
+    await db.update_user(user)
+    if scanner:
+        scanner.set_user_alert_preferences(
+            user.user_id,
+            inter_enabled=user.inter_exchange_enabled
+        )
+    await show_advanced_settings(callback, user, db, scanner)
+
+@callbacks_router.callback_query(F.data == "alerts:toggle_funding")
+async def toggle_funding(callback: CallbackQuery, user: UserSettings, db: Database = None, scanner=None):
+    """Переключение фандинг алертов"""
+    await callback.answer()
+    user.funding_arbitrage_enabled = not getattr(user, 'funding_arbitrage_enabled', True)
+    await db.update_user(user)
+    if scanner:
+        scanner.set_user_alert_preferences(
+            user.user_id,
+            funding_enabled=user.funding_arbitrage_enabled
+        )
+    await show_advanced_settings(callback, user, db, scanner)
