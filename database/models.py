@@ -255,6 +255,7 @@ class Database:
                 await self._migrate_add_bot_blocked_column()
                 await self._migrate_add_scan_type_column()
                 await self._migrate_add_flip_tables()
+                await self._migrate_add_flip_api_columns()
                 self._initialized = True
                 logger.info(f"Database initialized: {self._db_path} (WAL mode)")
             except Exception as e:
@@ -403,6 +404,31 @@ class Database:
                     logger.info("Migration: created flip_settings and flip_trades tables")
         except Exception as e:
             logger.error(f"Migration error for flip tables: {e}")
+
+    async def _migrate_add_flip_api_columns(self):
+        """Миграция: добавление колонок mexc_api_key/secret в существующую flip_settings"""
+        try:
+            # Проверяем существование таблицы
+            async with self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='flip_settings'"
+            ) as cursor:
+                if not await cursor.fetchone():
+                    return  # Таблицы нет - будет создана полностью другой миграцией
+
+            # Проверяем существование колонки mexc_api_key
+            async with self._conn.execute("PRAGMA table_info(flip_settings)") as cursor:
+                columns = [row['name'] for row in await cursor.fetchall()]
+
+            if 'mexc_api_key' not in columns:
+                await self._conn.execute("ALTER TABLE flip_settings ADD COLUMN mexc_api_key TEXT DEFAULT ''")
+                logger.info("Migration: added mexc_api_key column to flip_settings")
+            if 'mexc_api_secret' not in columns:
+                await self._conn.execute("ALTER TABLE flip_settings ADD COLUMN mexc_api_secret TEXT DEFAULT ''")
+                logger.info("Migration: added mexc_api_secret column to flip_settings")
+
+            await self._conn.commit()
+        except Exception as e:
+            logger.error(f"Migration error for flip API columns: {e}")
 
     async def close(self):
         """Закрытие соединения с БД"""
@@ -940,8 +966,8 @@ class Database:
                     min_price_movement_pct=row['min_price_movement_pct'] if row['min_price_movement_pct'] is not None else 0.01,
                     close_on_reverse=bool(row['close_on_reverse']) if row['close_on_reverse'] is not None else True,
                     test_mode=bool(row['test_mode']) if row['test_mode'] is not None else True,
-                    mexc_api_key=row['mexc_api_key'] if row['mexc_api_key'] is not None else '',
-                    mexc_api_secret=row['mexc_api_secret'] if row['mexc_api_secret'] is not None else '',
+                    mexc_api_key=row.get('mexc_api_key', '') if 'mexc_api_key' in row.keys() else '',
+                    mexc_api_secret=row.get('mexc_api_secret', '') if 'mexc_api_secret' in row.keys() else '',
                     created_at=row['created_at'],
                     updated_at=row['updated_at']
                 )

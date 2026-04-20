@@ -1,4 +1,5 @@
 import logging
+import html
 from datetime import datetime
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery

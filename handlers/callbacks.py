@@ -7,8 +7,16 @@ from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardBut
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.filters import StateFilter
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramForbiddenError
+
+# Хелпер для безопасного edit_text (игнорирует "message is not modified")
+async def safe_edit_text(callback: CallbackQuery, text: str, reply_markup=None, **kwargs):
+    """Безопасно редактирует сообщение, игнорируя ошибку когда контент не изменился"""
+    try:
+        await callback.message.edit_text(text, reply_markup=reply_markup, **kwargs)
+    except TelegramBadRequest:
+        pass
 import logging
 import html
 import threading
@@ -2388,14 +2396,14 @@ async def show_flip_stats(callback: CallbackQuery, user: UserSettings, db: Datab
             f"  PnL: ${session_status.get('today_pnl', 0):.2f}\n\n"
             f"_Статистика с момента начала использования._"
         )
-        
+
         builder = InlineKeyboardBuilder()
         builder.row(
             InlineKeyboardButton(text="🔄 Обновить", callback_data="flip:stats"),
             InlineKeyboardButton(text="🔙 Назад", callback_data="flip:menu")
         )
-        
-        await callback.message.edit_text(text, reply_markup=builder.as_markup())
+
+        await safe_edit_text(callback, text, reply_markup=builder.as_markup())
         
     except Exception as e:
         logger.error(f"Flip stats error: {e}")
