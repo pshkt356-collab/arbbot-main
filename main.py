@@ -20,6 +20,7 @@ from services.trading_engine import trading_engine
 from services.circuit_breaker import circuit_breaker
 from services.notification import init_alert_manager, alert_manager
 from services.exchange_status import status_checker
+from services.mexc_flip_trader import flip_trader
 from handlers.commands import commands_router
 from handlers.callbacks import callbacks_router, send_spread_alert, subscribe_user_to_alerts, set_bot
 from handlers.states import states_router
@@ -121,6 +122,18 @@ async def health_handler(request):
     except:
         pass
 
+    try:
+        if flip_trader and flip_trader.running:
+            active_sessions = len(flip_trader.active_sessions)
+            health_status["services"]["flip_trader"] = {
+                "status": "running",
+                "active_sessions": active_sessions
+            }
+        else:
+            health_status["services"]["flip_trader"] = "stopped"
+    except Exception as e:
+        health_status["services"]["flip_trader"] = f"error: {str(e)}"
+
     status_code = 200 if health_status["status"] == "healthy" else 503
     return web.json_response(health_status, status=status_code)
 
@@ -202,6 +215,11 @@ async def shutdown(signal_name=None):
                 logger.info("Trading engine stopped")
             except Exception as e:
                 logger.error(f"Trading engine stop error: {e}")
+
+        try:
+            await _stop_with_timeout(flip_trader.stop, "Flip trader", timeout=2.0)
+        except Exception as e:
+            logger.error(f"Flip trader stop error: {e}")
         
         try:
             circuit_breaker.stop()
@@ -330,6 +348,7 @@ async def main():
     scanner_task = asyncio.create_task(scanner.start(), name="scanner")
     cleanup_task = asyncio.create_task(trading_engine._cleanup_cache(), name="cache_cleanup")
     health_task = asyncio.create_task(start_health_server(), name="health")
+    flip_task = asyncio.create_task(flip_trader.start(), name="flip_trader")
 
     await subscribe_existing_users()
 

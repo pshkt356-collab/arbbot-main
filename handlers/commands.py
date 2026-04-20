@@ -65,10 +65,12 @@ async def cmd_help(message: Message):
         "/settings — Настройки алертов\n"
         "/balance — Твой баланс\n"
         "/testapi — Проверка API ключей\n"
+        "/flip — MEXC Flip Trading\n"
         "/stop — Остановить бота\n\n"
         "**🔥 Основные функции:**\n"
         "• Авто-торговля спредами\n"
         "• Алерты на межбиржевой арбитраж\n"
+        "• MEXC Flip Trading (лонг флипы)\n"
         "• Мониторинг позиций\n\n"
         "Вопросы? Пиши в поддержку."
     )
@@ -186,6 +188,30 @@ async def cmd_test_api(message: Message, user: UserSettings):
     keyboard = InlineKeyboardBuilder()
     keyboard.button(text="📱 Меню", callback_data="menu:main")
     await message.answer(text, reply_markup=keyboard.as_markup())
+
+
+@commands_router.message(Command("flip"))
+async def cmd_flip(message: Message, user: UserSettings, db: Database = None):
+    """Команда /flip — MEXC Flip Trading меню"""
+    from handlers.callbacks import show_flip_menu
+
+    class FakeCallback:
+        def __init__(self, msg):
+            self.from_user = msg.from_user
+            self.message = FakeMessage(msg)
+        async def answer(self, **kwargs):
+            pass
+
+    class FakeMessage:
+        def __init__(self, msg):
+            self._msg = msg
+        async def edit_text(self, text, **kwargs):
+            await self._msg.answer(text, **kwargs)
+        async def answer(self, text, **kwargs):
+            await self._msg.answer(text, **kwargs)
+
+    fake_callback = FakeCallback(message)
+    await show_flip_menu(fake_callback, user, db)
 
 # ==================== STATE HANDLERS ====================
 

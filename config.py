@@ -51,4 +51,25 @@ class Settings(BaseSettings):
     proxy_url: Optional[str] = None
     binance_proxy_url: Optional[str] = None
 
+    # MEXC API (для Flip Trading)
+    mexc_api_key: Optional[str] = None
+    mexc_api_secret: Optional[str] = None
+    
+    # MEXC Flip Trading defaults
+    flip_leverage_default: int = 200  # Плечо по умолчанию (50-300)
+    flip_position_size_default: float = 100.0  # Размер позиции в USDT
+    flip_max_daily_flips: int = 300  # Максимум сделок в день
+    flip_max_daily_loss_usd: float = 50.0  # Макс дневной убыток
+    flip_min_price_movement_pct: float = 0.01  # Минимальное движение цены % для входа
+    flip_close_on_reverse: bool = True  # Закрывать при развороте
+    
+    # WebSocket endpoints (не менять через env, встроенные)
+    binance_ws_futures: str = "wss://fstream.binance.com/stream?streams=!ticker@arr/!markPrice@arr"
+    mexc_ws_futures: str = "wss://contract.mexc.com/ws"
+    
+    # Flip Trading execution
+    flip_price_history_window: int = 20  # Количество тиков для определения направления
+    flip_tick_interval_ms: int = 100  # Интервал между тиками (мс)
+    flip_order_timeout_ms: int = 5000  # Таймаут на исполнение ордера
+
 settings = Settings()

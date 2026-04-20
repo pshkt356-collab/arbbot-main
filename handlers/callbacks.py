@@ -96,6 +96,11 @@ async def show_main_menu(callback: CallbackQuery, user: UserSettings, scanner=No
         InlineKeyboardButton(text="🔧 Настройки", callback_data="settings:menu")
     )
 
+    # Четвертый ряд - MEXC Flip Trading
+    builder.row(
+        InlineKeyboardButton(text="🔥 MEXC Flip", callback_data="flip:menu")
+    )
+
     test_status = "🧪 Тест" if user.test_mode else "💰 Реал"
 
     text = (
@@ -1980,3 +1985,375 @@ async def toggle_funding(callback: CallbackQuery, user: UserSettings, db: Databa
             funding_enabled=user.funding_arbitrage_enabled
         )
     await show_advanced_settings(callback, user, db, scanner)
+
+
+# ==================== MEXC FLIP TRADING MENU ====================
+
+@callbacks_router.callback_query(F.data == "flip:menu")
+async def show_flip_menu(callback: CallbackQuery, user: UserSettings, db: Database = None):
+    """Главное меню MEXC Flip Trading"""
+    await callback.answer()
+    
+    # Получаем настройки flip
+    flip_settings = None
+    if db:
+        try:
+            flip_settings = await db.get_flip_settings(user.user_id)
+            if not flip_settings:
+                flip_settings = await db.create_flip_settings(user.user_id)
+        except Exception as e:
+            logger.error(f"Error getting flip settings: {e}")
+    
+    if not flip_settings:
+        # Создаем дефолтные настройки если БД недоступна
+        from database.models import FlipSettings
+        flip_settings = FlipSettings(user_id=user.user_id)
+    
+    status = "🟢 Активен" if flip_settings.enabled else "🔴 Выключен"
+    test_status = "🧪 Тест" if flip_settings.test_mode else "💰 Реал"
+    symbols_str = ", ".join(flip_settings.selected_symbols) if flip_settings.selected_symbols else "Не выбраны"
+    
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(
+            text=f"{'🔴 Выкл' if flip_settings.enabled else '🟢 Вкл'} Флип-торговлю",
+            callback_data="flip:toggle"
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(text="💎 Выбрать пары", callback_data="flip:symbols"),
+        InlineKeyboardButton(text="⚡ Плечо", callback_data="flip:leverage")
+    )
+    builder.row(
+        InlineKeyboardButton(text="💰 Размер позиции", callback_data="flip:position_size"),
+        InlineKeyboardButton(text="🧪 Режим", callback_data="flip:test_mode")
+    )
+    builder.row(
+        InlineKeyboardButton(text="📊 Статистика", callback_data="flip:stats"),
+        InlineKeyboardButton(text="📱 Меню", callback_data="menu:main")
+    )
+    
+    text = (
+        f"**🔥 MEXC Flip Trading**\n\n"
+        f"Автоматическая торговля лонгами на MEXC по сигналам Binance.\n\n"
+        f"📍 **Статус:** {status}\n"
+        f"💎 **Пары:** {escape_html(symbols_str)}\n"
+        f"⚡ **Плечо:** {flip_settings.leverage}x\n"
+        f"💰 **Позиция:** ${flip_settings.position_size_usd:.0f}\n"
+        f"🧪 **Режим:** {test_status}\n\n"
+        f"**Как работает:**\n"
+        f"• Следит за ценами Binance\n"
+        f"• При росте → открывает лонг на MEXC\n"
+        f"• При падении → моментально закрывает\n"
+        f"• Множество быстрых сделок = прибыль\n\n"
+        f"_MEXC фьючерсы: нулевая комиссия_"
+    )
+    
+    await callback.message.edit_text(text, reply_markup=builder.as_markup())
+
+
+@callbacks_router.callback_query(F.data == "flip:toggle")
+async def toggle_flip_trading(callback: CallbackQuery, user: UserSettings, db: Database = None):
+    """Вкл/выкл flip trading"""
+    if not db:
+        await callback.answer("❌ База данных недоступна", show_alert=True)
+        return
+    
+    try:
+        flip_settings = await db.get_flip_settings(user.user_id)
+        if not flip_settings:
+            flip_settings = await db.create_flip_settings(user.user_id)
+        
+        # Инвертируем статус
+        flip_settings.enabled = not flip_settings.enabled
+        await db.update_flip_settings(flip_settings)
+        
+        from services.mexc_flip_trader import flip_trader
+        
+        if flip_settings.enabled:
+            # Запускаем сессию
+            result = await flip_trader.start_user_session(user.user_id, flip_settings)
+            if result.get('success'):
+                await callback.answer(f"🚀 Flip Trading АКТИВИРОВАН!", show_alert=True)
+            else:
+                # Откатываем если не удалось запустить
+                flip_settings.enabled = False
+                await db.update_flip_settings(flip_settings)
+                await callback.answer(f"❌ Ошибка запуска: {result.get('error', 'Unknown')}", show_alert=True)
+        else:
+            # Останавливаем сессию
+            await flip_trader.stop_user_session(user.user_id)
+            await callback.answer(f"🔴 Flip Trading ОСТАНОВЛЕН", show_alert=True)
+        
+        # Обновляем меню
+        await show_flip_menu(callback, user, db)
+        
+    except Exception as e:
+        logger.error(f"Toggle flip error: {e}")
+        await callback.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
+
+
+@callbacks_router.callback_query(F.data == "flip:symbols")
+async def show_flip_symbols(callback: CallbackQuery, user: UserSettings, db: Database = None):
+    """Выбор пар для flip trading"""
+    await callback.answer()
+    
+    if not db:
+        await callback.message.edit_text("❌ База данных недоступна",
+            reply_markup=InlineKeyboardBuilder().button(text="📱 Меню", callback_data="menu:main").as_markup())
+        return
+    
+    try:
+        flip_settings = await db.get_flip_settings(user.user_id)
+        if not flip_settings:
+            flip_settings = await db.create_flip_settings(user.user_id)
+        
+        # Доступные популярные пары
+        available_symbols = ['BTC', 'ETH', 'SOL', 'XRP', 'BNB', 'DOGE', 'ADA', 'TRX', 'AVAX', 'LINK', 'LTC', 'DOT']
+        
+        builder = InlineKeyboardBuilder()
+        
+        for symbol in available_symbols:
+            is_selected = symbol in flip_settings.selected_symbols
+            emoji = "✅" if is_selected else "⬜"
+            builder.button(
+                text=f"{emoji} {symbol}",
+                callback_data=f"flip:symbol_toggle:{symbol}"
+            )
+        
+        builder.adjust(3)  # 3 кнопки в ряд
+        
+        builder.row(
+            InlineKeyboardButton(text="💾 Сохранить", callback_data="flip:symbol_save"),
+            InlineKeyboardButton(text="📱 Меню", callback_data="menu:main")
+        )
+        
+        selected = ", ".join(flip_settings.selected_symbols) if flip_settings.selected_symbols else "Не выбраны"
+        
+        text = (
+            f"**💎 Выбор пар для Flip Trading**\n\n"
+            f"Выбрано: **{escape_html(selected)}**\n\n"
+            f"Нажми на пару чтобы добавить/убрать:"
+        )
+        
+        await callback.message.edit_text(text, reply_markup=builder.as_markup())
+        
+    except Exception as e:
+        logger.error(f"Flip symbols error: {e}")
+        await callback.message.edit_text(f"❌ Ошибка: {escape_html(str(e))[:100]}",
+            reply_markup=InlineKeyboardBuilder().button(text="📱 Меню", callback_data="menu:main").as_markup())
+
+
+@callbacks_router.callback_query(F.data.startswith("flip:symbol_toggle:"))
+async def toggle_flip_symbol(callback: CallbackQuery, user: UserSettings, db: Database = None):
+    """Добавить/убрать пару из выбранных"""
+    if not db:
+        await callback.answer("❌ База данных недоступна", show_alert=True)
+        return
+    
+    try:
+        symbol = callback.data.split(":")[2]
+        flip_settings = await db.get_flip_settings(user.user_id)
+        if not flip_settings:
+            flip_settings = await db.create_flip_settings(user.user_id)
+        
+        if symbol in flip_settings.selected_symbols:
+            flip_settings.selected_symbols.remove(symbol)
+        else:
+            flip_settings.selected_symbols.append(symbol)
+        
+        await db.update_flip_settings(flip_settings)
+        
+        # Обновляем отображение
+        await show_flip_symbols(callback, user, db)
+        
+    except Exception as e:
+        logger.error(f"Toggle symbol error: {e}")
+        await callback.answer("❌ Ошибка", show_alert=True)
+
+
+@callbacks_router.callback_query(F.data == "flip:symbol_save")
+async def save_flip_symbols(callback: CallbackQuery, user: UserSettings, db: Database = None):
+    """Сохранить выбор пар и вернуться в меню"""
+    await callback.answer("✅ Пары сохранены!", show_alert=True)
+    await show_flip_menu(callback, user, db)
+
+
+@callbacks_router.callback_query(F.data == "flip:leverage")
+async def show_flip_leverage(callback: CallbackQuery, user: UserSettings, db: Database = None):
+    """Выбор плеча для flip trading"""
+    await callback.answer()
+    
+    if not db:
+        await callback.message.edit_text("❌ База данных недоступна",
+            reply_markup=InlineKeyboardBuilder().button(text="📱 Меню", callback_data="menu:main").as_markup())
+        return
+    
+    try:
+        flip_settings = await db.get_flip_settings(user.user_id)
+        if not flip_settings:
+            flip_settings = await db.create_flip_settings(user.user_id)
+        
+        builder = InlineKeyboardBuilder()
+        
+        leverage_options = [50, 100, 150, 200, 250, 300]
+        row = []
+        for lev in leverage_options:
+            emoji = "✅" if flip_settings.leverage == lev else ""
+            row.append(InlineKeyboardButton(
+                text=f"{emoji} {lev}x",
+                callback_data=f"flip:leverage_set:{lev}"
+            ))
+            if len(row) == 3:
+                builder.row(*row)
+                row = []
+        if row:
+            builder.row(*row)
+        
+        builder.row(
+            InlineKeyboardButton(text="📐 Свое значение", callback_data="flip:leverage_custom"),
+            InlineKeyboardButton(text="🔙 Назад", callback_data="flip:menu")
+        )
+        
+        text = (
+            f"**⚡ Плечо MEXC Flip Trading**\n\n"
+            f"Текущее: **{flip_settings.leverage}x**\n\n"
+            f"⚠️ **Внимание:** Высокое плечо увеличивает прибыль,\n"
+            f"но и риск ликвидации. Рекомендуется 200x.\n\n"
+            f"Выбери плечо:"
+        )
+        
+        await callback.message.edit_text(text, reply_markup=builder.as_markup())
+        
+    except Exception as e:
+        logger.error(f"Flip leverage error: {e}")
+        await callback.message.edit_text(f"❌ Ошибка: {escape_html(str(e))[:100]}",
+            reply_markup=InlineKeyboardBuilder().button(text="📱 Меню", callback_data="menu:main").as_markup())
+
+
+@callbacks_router.callback_query(F.data.startswith("flip:leverage_set:"))
+async def set_flip_leverage(callback: CallbackQuery, user: UserSettings, db: Database = None):
+    """Установить плечо"""
+    if not db:
+        await callback.answer("❌ База данных недоступна", show_alert=True)
+        return
+    
+    try:
+        leverage = int(callback.data.split(":")[2])
+        flip_settings = await db.get_flip_settings(user.user_id)
+        if not flip_settings:
+            flip_settings = await db.create_flip_settings(user.user_id)
+        
+        flip_settings.leverage = leverage
+        await db.update_flip_settings(flip_settings)
+        
+        await callback.answer(f"⚡ Плечо установлено: {leverage}x", show_alert=True)
+        await show_flip_leverage(callback, user, db)
+        
+    except Exception as e:
+        logger.error(f"Set leverage error: {e}")
+        await callback.answer("❌ Ошибка", show_alert=True)
+
+
+@callbacks_router.callback_query(F.data == "flip:leverage_custom")
+async def set_custom_leverage(callback: CallbackQuery, state: FSMContext):
+    """Ввод произвольного плеча"""
+    await callback.answer()
+    from handlers.states import SetupStates
+    await state.set_state(SetupStates.waiting_for_flip_leverage)
+    await callback.message.edit_text(
+        "**⚡ Введи плечо (1-300):**\n\n"
+        "Например: 200\n\n"
+        "_(Отправь /cancel для отмены)_",
+        reply_markup=InlineKeyboardBuilder().button(text="🔙 Назад", callback_data="flip:leverage").as_markup()
+    )
+
+
+@callbacks_router.callback_query(F.data == "flip:position_size")
+async def show_flip_position_size(callback: CallbackQuery, user: UserSettings, state: FSMContext, db: Database = None):
+    """Установить размер позиции"""
+    await callback.answer()
+    from handlers.states import SetupStates
+    await state.set_state(SetupStates.waiting_for_flip_position_size)
+    await callback.message.edit_text(
+        "**💰 Введи размер позиции (USDT):**\n\n"
+        "Например: 100\n\n"
+        "Рекомендуется начинать с $50-100.\n\n"
+        "_(Отправь /cancel для отмены)_",
+        reply_markup=InlineKeyboardBuilder().button(text="🔙 Назад", callback_data="flip:menu").as_markup()
+    )
+
+
+@callbacks_router.callback_query(F.data == "flip:test_mode")
+async def toggle_flip_test_mode(callback: CallbackQuery, user: UserSettings, db: Database = None):
+    """Переключить тестовый режим"""
+    if not db:
+        await callback.answer("❌ База данных недоступна", show_alert=True)
+        return
+    
+    try:
+        flip_settings = await db.get_flip_settings(user.user_id)
+        if not flip_settings:
+            flip_settings = await db.create_flip_settings(user.user_id)
+        
+        flip_settings.test_mode = not flip_settings.test_mode
+        await db.update_flip_settings(flip_settings)
+        
+        status = "🧪 ТЕСТОВЫЙ" if flip_settings.test_mode else "💰 РЕАЛЬНЫЙ"
+        await callback.answer(f"Режим: {status}", show_alert=True)
+        await show_flip_menu(callback, user, db)
+        
+    except Exception as e:
+        logger.error(f"Toggle test mode error: {e}")
+        await callback.answer("❌ Ошибка", show_alert=True)
+
+
+@callbacks_router.callback_query(F.data == "flip:stats")
+async def show_flip_stats(callback: CallbackQuery, user: UserSettings, db: Database = None):
+    """Показать статистику flip trading"""
+    await callback.answer()
+    
+    if not db:
+        await callback.message.edit_text("❌ База данных недоступна",
+            reply_markup=InlineKeyboardBuilder().button(text="📱 Меню", callback_data="menu:main").as_markup())
+        return
+    
+    try:
+        stats = await db.get_flip_trade_stats(user.user_id)
+        
+        from services.mexc_flip_trader import flip_trader
+        session_status = await flip_trader.get_session_status(user.user_id)
+        
+        win_rate = stats.get('win_rate', 0)
+        win_emoji = "🟢" if win_rate >= 50 else "🔴"
+        
+        pnl = stats.get('total_pnl', 0)
+        pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+        
+        text = (
+            f"**📊 MEXC Flip Trading - Статистика**\n\n"
+            f"📈 **Сессия:** {'🟢 Активна' if session_status.get('active') else '🔴 Неактивна'}\n"
+            f"🎯 **Всего сделок:** {stats.get('total_trades', 0)}\n"
+            f"✅ **Прибыльных:** {stats.get('wins', 0)}\n"
+            f"❌ **Убыточных:** {stats.get('losses', 0)}\n"
+            f"{win_emoji} **Винрейт:** {win_rate:.1f}%\n\n"
+            f"{pnl_emoji} **Общий PnL:** ${pnl:.2f}\n"
+            f"⏱ **Среднее время:** {stats.get('avg_duration_ms', 0):.0f}мс\n\n"
+            f"📊 **Сегодня:**\n"
+            f"  Сделок: {session_status.get('today_count', 0)}\n"
+            f"  PnL: ${session_status.get('today_pnl', 0):.2f}\n\n"
+            f"_Статистика с момента начала использования._"
+        )
+        
+        builder = InlineKeyboardBuilder()
+        builder.row(
+            InlineKeyboardButton(text="🔄 Обновить", callback_data="flip:stats"),
+            InlineKeyboardButton(text="🔙 Назад", callback_data="flip:menu")
+        )
+        
+        await callback.message.edit_text(text, reply_markup=builder.as_markup())
+        
+    except Exception as e:
+        logger.error(f"Flip stats error: {e}")
+        await callback.message.edit_text(f"❌ Ошибка: {escape_html(str(e))[:100]}",
+            reply_markup=InlineKeyboardBuilder().button(text="📱 Меню", callback_data="menu:main").as_markup())

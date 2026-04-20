@@ -493,6 +493,16 @@ class ArbitrageBot:
         # Здесь логика отписки от алертов
         await message.answer("🛑 Алерты приостановлены. Используйте /start для возобновления.")
 
+
+    async def cmd_flip(self, message: Message):
+        """MEXC Flip Trading меню (legacy)"""
+        text = (
+            "🔥 <b>MEXC Flip Trading</b>\n\n"
+            "Для управления Flip Trading используйте новую версию бота "
+            "с inline меню. Нажмите /start и выберите 🔥 MEXC Flip."
+        )
+        await message.answer(text)
+
     def _get_active_users(self):
         """Получение списка активных пользователей (заглушка)"""
         # В реальности — из БД или кэша

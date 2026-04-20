@@ -35,6 +35,10 @@ class SetupStates(StatesGroup):
     waiting_for_sl_price = State()
     waiting_for_tp_price = State()
     waiting_for_partial_percent = State()
+    # MEXC Flip Trading states
+    waiting_for_flip_leverage = State()
+    waiting_for_flip_position_size = State()
+    waiting_for_flip_symbols = State()
 
 @states_router.message(SetupStates.waiting_for_api_key)
 async def process_api_key(message: Message, state: FSMContext, user: UserSettings):
@@ -685,5 +689,89 @@ async def process_partial_percent(message: Message, state: FSMContext, user: Use
         await message.answer("❌ Введите число от 1 до 100:")
     except Exception as e:
         logger.error(f"Partial close error: {e}")
+        await message.answer(f"❌ Ошибка: {html.escape(str(e))[:200]}")
+        await state.clear()
+
+
+# ==================== MEXC FLIP TRADING STATE HANDLERS ====================
+
+@states_router.message(SetupStates.waiting_for_flip_leverage)
+async def process_flip_leverage(message: Message, state: FSMContext, user: UserSettings, db: Database):
+    """Обработка ввода плеча для flip trading"""
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Отменено")
+        return
+
+    try:
+        leverage = int(message.text.strip())
+        if leverage < 1 or leverage > 300:
+            await message.answer("❌ Плечо должно быть от 1 до 300. Попробуй снова:")
+            return
+
+        if db:
+            flip_settings = await db.get_flip_settings(user.user_id)
+            if not flip_settings:
+                flip_settings = await db.create_flip_settings(user.user_id)
+            flip_settings.leverage = leverage
+            await db.update_flip_settings(flip_settings)
+
+        await state.clear()
+
+        keyboard = InlineKeyboardBuilder()
+        keyboard.button(text="⚡ К плечу", callback_data="flip:leverage")
+        keyboard.button(text="🔥 Flip меню", callback_data="flip:menu")
+        keyboard.adjust(1)
+
+        await message.answer(
+            f"✅ **Плечо установлено: {leverage}x**",
+            reply_markup=keyboard.as_markup()
+        )
+
+    except ValueError:
+        await message.answer("❌ Введите целое число (например: 200):")
+    except Exception as e:
+        logger.error(f"Flip leverage error: {e}")
+        await message.answer(f"❌ Ошибка: {html.escape(str(e))[:200]}")
+        await state.clear()
+
+
+@states_router.message(SetupStates.waiting_for_flip_position_size)
+async def process_flip_position_size(message: Message, state: FSMContext, user: UserSettings, db: Database):
+    """Обработка ввода размера позиции для flip trading"""
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Отменено")
+        return
+
+    try:
+        size = float(message.text.strip())
+        if size < 10 or size > 10000:
+            await message.answer("❌ Размер позиции должен быть от $10 до $10000. Попробуй снова:")
+            return
+
+        if db:
+            flip_settings = await db.get_flip_settings(user.user_id)
+            if not flip_settings:
+                flip_settings = await db.create_flip_settings(user.user_id)
+            flip_settings.position_size_usd = size
+            await db.update_flip_settings(flip_settings)
+
+        await state.clear()
+
+        keyboard = InlineKeyboardBuilder()
+        keyboard.button(text="💰 К размеру", callback_data="flip:position_size")
+        keyboard.button(text="🔥 Flip меню", callback_data="flip:menu")
+        keyboard.adjust(1)
+
+        await message.answer(
+            f"✅ **Размер позиции: ${size:.0f}**",
+            reply_markup=keyboard.as_markup()
+        )
+
+    except ValueError:
+        await message.answer("❌ Введите число (например: 100):")
+    except Exception as e:
+        logger.error(f"Flip position size error: {e}")
         await message.answer(f"❌ Ошибка: {html.escape(str(e))[:200]}")
         await state.clear()
