@@ -472,6 +472,64 @@ class MexcAPI:
             logger.error(f"Get position error: {e}")
             return {'success': False, 'error': str(e)}
 
+    async def get_balance(self) -> dict:
+        """Получить баланс фьючерсного аккаунта MEXC"""
+        if not self.api_key or not self.api_secret:
+            return {'success': True, 'balance_usdt': 0.0, 'available': 0.0, 'test_mode': True}
+
+        session = await self._get_session()
+        try:
+            timestamp = await self.get_server_time()
+            params = {
+                "timestamp": timestamp,
+                "api_key": self.api_key
+            }
+            params["sign"] = self._generate_signature(params)
+
+            async with session.get(
+                f"{self.BASE_URL}/api/v1/private/account/assets",
+                params=params
+            ) as resp:
+                data = await resp.json()
+                if data.get('success') or data.get('code') == 200:
+                    assets = data.get('data', [])
+                    usdt_asset = next((a for a in assets if a.get('currency', '').upper() == 'USDT'), None)
+                    if usdt_asset:
+                        balance = float(usdt_asset.get('totalMarginBalance', 0) or usdt_asset.get('marginBalance', 0) or 0)
+                        available = float(usdt_asset.get('availableBalance', 0) or usdt_asset.get('availableOpen', 0) or 0)
+                        return {
+                            'success': True,
+                            'balance_usdt': balance,
+                            'available': available
+                        }
+                    return {'success': True, 'balance_usdt': 0.0, 'available': 0.0}
+                else:
+                    logger.warning(f"MEXC balance error: {data}")
+                    return {'success': False, 'error': str(data)}
+        except Exception as e:
+            logger.error(f"Get MEXC balance error: {e}")
+            return {'success': False, 'error': str(e)}
+
+    async def test_connection(self) -> dict:
+        """Проверить подключение к MEXC API"""
+        if not self.api_key or not self.api_secret:
+            return {'success': False, 'error': 'API keys not configured'}
+
+        balance_result = await self.get_balance()
+        if balance_result.get('success'):
+            return {
+                'success': True,
+                'balance_usdt': balance_result.get('balance_usdt', 0),
+                'message': 'Connected'
+            }
+        return {'success': False, 'error': balance_result.get('error', 'Connection failed')}
+
+    def update_credentials(self, api_key: str, api_secret: str):
+        """Обновить API ключи"""
+        self.api_key = api_key
+        self.api_secret = api_secret
+        logger.info("MEXC API credentials updated")
+
     def _emulate_order(self, symbol: str, side: str, quantity: float) -> dict:
         """Эмуляция ордера в тестовом режиме"""
         import random

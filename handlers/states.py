@@ -39,6 +39,8 @@ class SetupStates(StatesGroup):
     waiting_for_flip_leverage = State()
     waiting_for_flip_position_size = State()
     waiting_for_flip_symbols = State()
+    waiting_for_flip_api_key = State()      # Ввод API ключа MEXC
+    waiting_for_flip_api_secret = State()   # Ввод API секрета MEXC
 
 @states_router.message(SetupStates.waiting_for_api_key)
 async def process_api_key(message: Message, state: FSMContext, user: UserSettings):
@@ -773,5 +775,104 @@ async def process_flip_position_size(message: Message, state: FSMContext, user: 
         await message.answer("❌ Введите число (например: 100):")
     except Exception as e:
         logger.error(f"Flip position size error: {e}")
+        await message.answer(f"❌ Ошибка: {html.escape(str(e))[:200]}")
+        await state.clear()
+
+
+@states_router.message(SetupStates.waiting_for_flip_api_key)
+async def process_flip_api_key(message: Message, state: FSMContext, user: UserSettings):
+    """Обработка ввода API ключа MEXC"""
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Отменено")
+        return
+
+    api_key = message.text.strip()
+    if len(api_key) < 10:
+        await message.answer("❌ API Key слишком короткий. Попробуй снова:")
+        return
+
+    # Сохраняем ключ во временные данные FSM
+    await state.update_data(mexc_api_key=api_key)
+    await state.set_state(SetupStates.waiting_for_flip_api_secret)
+
+    await message.answer(
+        "**🔐 Шаг 2/2: Введи API Secret:**\n\n"
+        "_(Отправь /cancel для отмены)_",
+        reply_markup=InlineKeyboardBuilder().button(text="🔙 Назад", callback_data="flip:api_menu").as_markup()
+    )
+
+
+@states_router.message(SetupStates.waiting_for_flip_api_secret)
+async def process_flip_api_secret(message: Message, state: FSMContext, user: UserSettings, db: Database):
+    """Обработка ввода API секрета MEXC и сохранение"""
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Отменено")
+        return
+
+    api_secret = message.text.strip()
+    if len(api_secret) < 10:
+        await message.answer("❌ API Secret слишком короткий. Попробуй снова:")
+        return
+
+    try:
+        # Получаем ранее сохраненный ключ
+        data = await state.get_data()
+        api_key = data.get('mexc_api_key', '')
+
+        if not api_key:
+            await message.answer("❌ Ошибка: API Key не найден. Начни заново.")
+            await state.clear()
+            return
+
+        # Пробуем подключиться к MEXC для проверки
+        await message.answer("🔄 Проверяю подключение к MEXC...")
+
+        from services.mexc_flip_trader import MexcAPI
+        mexc = MexcAPI(api_key, api_secret)
+        conn = await mexc.test_connection()
+
+        if db:
+            flip_settings = await db.get_flip_settings(user.user_id)
+            if not flip_settings:
+                flip_settings = await db.create_flip_settings(user.user_id)
+
+            flip_settings.mexc_api_key = api_key
+            flip_settings.mexc_api_secret = api_secret
+            await db.update_flip_settings(flip_settings)
+
+        await state.clear()
+        await mexc.close()
+
+        if conn.get('success'):
+            bal = conn.get('balance_usdt', 0)
+            keyboard = InlineKeyboardBuilder()
+            keyboard.button(text="🔑 API меню", callback_data="flip:api_menu")
+            keyboard.button(text="🔥 Flip меню", callback_data="flip:menu")
+            keyboard.adjust(1)
+
+            await message.answer(
+                f"✅ **API MEXC сохранены и подключены!**\n\n"
+                f"💳 **Баланс:** ${bal:.2f} USDT\n\n"
+                f"Теперь можешь переключиться в реальный режим.",
+                reply_markup=keyboard.as_markup()
+            )
+        else:
+            # Сохраняем даже если проверка не удалась - возможно сеть/время
+            keyboard = InlineKeyboardBuilder()
+            keyboard.button(text="🔑 API меню", callback_data="flip:api_menu")
+            keyboard.button(text="🔥 Flip меню", callback_data="flip:menu")
+            keyboard.adjust(1)
+
+            await message.answer(
+                f"⚠️ **API сохранены, но проверка не пройдена**\n\n"
+                f"Причина: {conn.get('error', 'Неизвестно')[:100]}\n\n"
+                f"Проверь ключи позже через меню API.",
+                reply_markup=keyboard.as_markup()
+            )
+
+    except Exception as e:
+        logger.error(f"API secret save error: {e}")
         await message.answer(f"❌ Ошибка: {html.escape(str(e))[:200]}")
         await state.clear()

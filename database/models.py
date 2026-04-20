@@ -176,7 +176,7 @@ class FlipSettings:
     """Настройки MEXC Flip Trading для пользователя"""
     user_id: int
     enabled: bool = False
-    selected_symbols: list = field(default_factory=lambda: ['BTC', 'ETH', 'SOL'])  # Символы для торговли
+    selected_symbols: list = field(default_factory=lambda: ['BTC', 'ETH', 'SOL', 'TAO', 'ASTER', 'BCH'])  # Символы для торговли
     leverage: int = 200  # Плечо (50-300x)
     position_size_usd: float = 100.0  # Размер позиции в USDT
     max_daily_flips: int = 300  # Максимум флипов в день
@@ -184,6 +184,8 @@ class FlipSettings:
     min_price_movement_pct: float = 0.01  # Мин движение цены для входа (%)
     close_on_reverse: bool = True  # Закрывать при развороте
     test_mode: bool = True  # Тестовый режим
+    mexc_api_key: str = ""  # API ключ MEXC (переопределяет глобальный)
+    mexc_api_secret: str = ""  # API секрет MEXC
     created_at: str = None
     updated_at: str = None
     
@@ -356,7 +358,7 @@ class Database:
                         CREATE TABLE IF NOT EXISTS flip_settings (
                             user_id INTEGER PRIMARY KEY,
                             enabled BOOLEAN DEFAULT 0,
-                            selected_symbols TEXT DEFAULT '["BTC", "ETH", "SOL"]',
+                            selected_symbols TEXT DEFAULT '["BTC", "ETH", "SOL", "TAO", "ASTER", "BCH"]',
                             leverage INTEGER DEFAULT 200,
                             position_size_usd REAL DEFAULT 100.0,
                             max_daily_flips INTEGER DEFAULT 300,
@@ -364,6 +366,8 @@ class Database:
                             min_price_movement_pct REAL DEFAULT 0.01,
                             close_on_reverse BOOLEAN DEFAULT 1,
                             test_mode BOOLEAN DEFAULT 1,
+                            mexc_api_key TEXT DEFAULT '',
+                            mexc_api_secret TEXT DEFAULT '',
                             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                             FOREIGN KEY (user_id) REFERENCES users(user_id)
@@ -477,7 +481,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS flip_settings (
                     user_id INTEGER PRIMARY KEY,
                     enabled BOOLEAN DEFAULT 0,
-                    selected_symbols TEXT DEFAULT '["BTC", "ETH", "SOL"]',
+                    selected_symbols TEXT DEFAULT '["BTC", "ETH", "SOL", "TAO", "ASTER", "BCH"]',
                     leverage INTEGER DEFAULT 200,
                     position_size_usd REAL DEFAULT 100.0,
                     max_daily_flips INTEGER DEFAULT 300,
@@ -485,6 +489,8 @@ class Database:
                     min_price_movement_pct REAL DEFAULT 0.01,
                     close_on_reverse BOOLEAN DEFAULT 1,
                     test_mode BOOLEAN DEFAULT 1,
+                    mexc_api_key TEXT DEFAULT '',
+                    mexc_api_secret TEXT DEFAULT '',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (user_id) REFERENCES users(user_id)
@@ -926,7 +932,7 @@ class Database:
                 return FlipSettings(
                     user_id=row['user_id'],
                     enabled=bool(row['enabled']),
-                    selected_symbols=json.loads(row['selected_symbols']) if row['selected_symbols'] else ['BTC', 'ETH', 'SOL'],
+                    selected_symbols=json.loads(row['selected_symbols']) if row['selected_symbols'] else ['BTC', 'ETH', 'SOL', 'TAO', 'ASTER', 'BCH'],
                     leverage=row['leverage'] if row['leverage'] is not None else 200,
                     position_size_usd=row['position_size_usd'] if row['position_size_usd'] is not None else 100.0,
                     max_daily_flips=row['max_daily_flips'] if row['max_daily_flips'] is not None else 300,
@@ -934,6 +940,8 @@ class Database:
                     min_price_movement_pct=row['min_price_movement_pct'] if row['min_price_movement_pct'] is not None else 0.01,
                     close_on_reverse=bool(row['close_on_reverse']) if row['close_on_reverse'] is not None else True,
                     test_mode=bool(row['test_mode']) if row['test_mode'] is not None else True,
+                    mexc_api_key=row['mexc_api_key'] if row['mexc_api_key'] is not None else '',
+                    mexc_api_secret=row['mexc_api_secret'] if row['mexc_api_secret'] is not None else '',
                     created_at=row['created_at'],
                     updated_at=row['updated_at']
                 )
@@ -949,13 +957,15 @@ class Database:
                 await self._conn.execute("""
                     INSERT INTO flip_settings (user_id, enabled, selected_symbols, leverage,
                         position_size_usd, max_daily_flips, max_daily_loss_usd,
-                        min_price_movement_pct, close_on_reverse, test_mode)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        min_price_movement_pct, close_on_reverse, test_mode,
+                        mexc_api_key, mexc_api_secret)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     user_id, int(settings.enabled), json.dumps(settings.selected_symbols),
                     settings.leverage, settings.position_size_usd, settings.max_daily_flips,
                     settings.max_daily_loss_usd, settings.min_price_movement_pct,
-                    int(settings.close_on_reverse), int(settings.test_mode)
+                    int(settings.close_on_reverse), int(settings.test_mode),
+                    settings.mexc_api_key, settings.mexc_api_secret
                 ))
                 await self._conn.commit()
                 logger.info(f"Created flip settings for user {user_id}")
@@ -973,6 +983,7 @@ class Database:
                     position_size_usd = ?, max_daily_flips = ?,
                     max_daily_loss_usd = ?, min_price_movement_pct = ?,
                     close_on_reverse = ?, test_mode = ?,
+                    mexc_api_key = ?, mexc_api_secret = ?,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE user_id = ?
             """, (
@@ -980,6 +991,7 @@ class Database:
                 settings.leverage, settings.position_size_usd, settings.max_daily_flips,
                 settings.max_daily_loss_usd, settings.min_price_movement_pct,
                 int(settings.close_on_reverse), int(settings.test_mode),
+                settings.mexc_api_key, settings.mexc_api_secret,
                 settings.user_id
             ))
             await self._conn.commit()

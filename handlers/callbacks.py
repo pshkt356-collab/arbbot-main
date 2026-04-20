@@ -2012,7 +2012,41 @@ async def show_flip_menu(callback: CallbackQuery, user: UserSettings, db: Databa
     status = "🟢 Активен" if flip_settings.enabled else "🔴 Выключен"
     test_status = "🧪 Тест" if flip_settings.test_mode else "💰 Реал"
     symbols_str = ", ".join(flip_settings.selected_symbols) if flip_settings.selected_symbols else "Не выбраны"
-    
+
+    # Проверяем статус MEXC API и баланс
+    api_status = "❌ Не настроены"
+    balance_str = ""
+    has_api = bool(flip_settings.mexc_api_key and flip_settings.mexc_api_secret)
+
+    if has_api:
+        api_status = "✅ Настроены"
+        try:
+            from services.mexc_flip_trader import MexcAPI
+            mexc = MexcAPI(flip_settings.mexc_api_key, flip_settings.mexc_api_secret)
+            conn = await mexc.test_connection()
+            if conn.get('success'):
+                bal = conn.get('balance_usdt', 0)
+                api_status = "✅ Подключено"
+                balance_str = f"💳 **Баланс MEXC:** ${bal:.2f} USDT\n"
+            else:
+                api_status = "⚠️ Ошибка подключения"
+        except Exception as e:
+            api_status = f"⚠️ Ошибка: {str(e)[:30]}"
+    else:
+        # Проверяем глобальные API ключи из env
+        from config import settings
+        if settings.mexc_api_key and settings.mexc_api_secret:
+            api_status = "✅ Глобальные (env)"
+            try:
+                from services.mexc_flip_trader import MexcAPI
+                mexc = MexcAPI()
+                conn = await mexc.test_connection()
+                if conn.get('success'):
+                    bal = conn.get('balance_usdt', 0)
+                    balance_str = f"💳 **Баланс MEXC:** ${bal:.2f} USDT\n"
+            except Exception:
+                pass
+
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(
@@ -2032,7 +2066,14 @@ async def show_flip_menu(callback: CallbackQuery, user: UserSettings, db: Databa
         InlineKeyboardButton(text="📊 Статистика", callback_data="flip:stats"),
         InlineKeyboardButton(text="📱 Меню", callback_data="menu:main")
     )
-    
+    builder.row(
+        InlineKeyboardButton(text="🔑 API MEXC", callback_data="flip:api_menu")
+    )
+
+    api_prompt = ""
+    if not has_api and not (settings.mexc_api_key and settings.mexc_api_secret):
+        api_prompt = "\n⚠️ _Добавь API MEXC для реальной торговли_\n"
+
     text = (
         f"**🔥 MEXC Flip Trading**\n\n"
         f"Автоматическая торговля лонгами на MEXC по сигналам Binance.\n\n"
@@ -2040,7 +2081,10 @@ async def show_flip_menu(callback: CallbackQuery, user: UserSettings, db: Databa
         f"💎 **Пары:** {escape_html(symbols_str)}\n"
         f"⚡ **Плечо:** {flip_settings.leverage}x\n"
         f"💰 **Позиция:** ${flip_settings.position_size_usd:.0f}\n"
-        f"🧪 **Режим:** {test_status}\n\n"
+        f"🧪 **Режим:** {test_status}\n"
+        f"🔑 **API MEXC:** {api_status}\n"
+        f"{balance_str}"
+        f"{api_prompt}\n"
         f"**Как работает:**\n"
         f"• Следит за ценами Binance\n"
         f"• При росте → открывает лонг на MEXC\n"
@@ -2048,7 +2092,7 @@ async def show_flip_menu(callback: CallbackQuery, user: UserSettings, db: Databa
         f"• Множество быстрых сделок = прибыль\n\n"
         f"_MEXC фьючерсы: нулевая комиссия_"
     )
-    
+
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
 
 
@@ -2109,7 +2153,7 @@ async def show_flip_symbols(callback: CallbackQuery, user: UserSettings, db: Dat
             flip_settings = await db.create_flip_settings(user.user_id)
         
         # Доступные популярные пары
-        available_symbols = ['BTC', 'ETH', 'SOL', 'XRP', 'BNB', 'DOGE', 'ADA', 'TRX', 'AVAX', 'LINK', 'LTC', 'DOT']
+        available_symbols = ['BTC', 'ETH', 'SOL', 'XRP', 'BNB', 'DOGE', 'ADA', 'TRX', 'AVAX', 'LINK', 'LTC', 'DOT', 'TAO', 'ASTER', 'BCH']
         
         builder = InlineKeyboardBuilder()
         
@@ -2357,3 +2401,170 @@ async def show_flip_stats(callback: CallbackQuery, user: UserSettings, db: Datab
         logger.error(f"Flip stats error: {e}")
         await callback.message.edit_text(f"❌ Ошибка: {escape_html(str(e))[:100]}",
             reply_markup=InlineKeyboardBuilder().button(text="📱 Меню", callback_data="menu:main").as_markup())
+
+
+@callbacks_router.callback_query(F.data == "flip:api_menu")
+async def show_flip_api_menu(callback: CallbackQuery, user: UserSettings, db: Database = None):
+    """Меню управления API ключами MEXC"""
+    await callback.answer()
+
+    if not db:
+        await callback.message.edit_text("❌ База данных недоступна",
+            reply_markup=InlineKeyboardBuilder().button(text="📱 Меню", callback_data="menu:main").as_markup())
+        return
+
+    try:
+        flip_settings = await db.get_flip_settings(user.user_id)
+        if not flip_settings:
+            flip_settings = await db.create_flip_settings(user.user_id)
+
+        has_api = bool(flip_settings.mexc_api_key and flip_settings.mexc_api_secret)
+
+        if has_api:
+            # Показываем статус и баланс
+            from services.mexc_flip_trader import MexcAPI
+            mexc = MexcAPI(flip_settings.mexc_api_key, flip_settings.mexc_api_secret)
+            conn = await mexc.test_connection()
+            if conn.get('success'):
+                bal = conn.get('balance_usdt', 0)
+                status = "✅ Подключено"
+                balance_info = f"💳 **Баланс:** ${bal:.2f} USDT\n"
+            else:
+                status = f"⚠️ Ошибка: {conn.get('error', 'Неизвестно')[:40]}"
+                balance_info = ""
+
+            # Показываем маскированный ключ
+            key_masked = flip_settings.mexc_api_key[:6] + "****" + flip_settings.mexc_api_key[-4:] if len(flip_settings.mexc_api_key) > 10 else "****"
+
+            text = (
+                f"**🔑 API MEXC**\n\n"
+                f"📍 **Статус:** {status}\n"
+                f"🔐 **Ключ:** `{key_masked}`\n"
+                f"{balance_info}\n"
+                f"_API ключи хранятся в зашифрованном виде._"
+            )
+
+            builder = InlineKeyboardBuilder()
+            builder.row(
+                InlineKeyboardButton(text="🔄 Проверить", callback_data="flip:api_check"),
+                InlineKeyboardButton(text="❌ Удалить", callback_data="flip:api_delete")
+            )
+            builder.row(
+                InlineKeyboardButton(text="🔁 Заменить", callback_data="flip:api_replace"),
+                InlineKeyboardButton(text="🔙 Назад", callback_data="flip:menu")
+            )
+        else:
+            # API не настроены - предлагаем добавить
+            text = (
+                f"**🔑 API MEXC**\n\n"
+                f"❌ **API ключи не настроены**\n\n"
+                f"Для реальной торговли необходимо добавить API ключи MEXC.\n\n"
+                f"**Как получить:**\n"
+                f"1. Зайди на MEXC → Аккаунт → API\n"
+                f"2. Создай API с правами на фьючерсы\n"
+                f"3. Скопируй ключ и секрет\n\n"
+                f"⚠️ _НЕ давай права на вывод!_"
+            )
+
+            builder = InlineKeyboardBuilder()
+            builder.row(
+                InlineKeyboardButton(text="➕ Добавить API", callback_data="flip:api_add")
+            )
+            builder.row(
+                InlineKeyboardButton(text="🔙 Назад", callback_data="flip:menu")
+            )
+
+        await callback.message.edit_text(text, reply_markup=builder.as_markup())
+
+    except Exception as e:
+        logger.error(f"Flip API menu error: {e}")
+        await callback.message.edit_text(f"❌ Ошибка: {escape_html(str(e))[:100]}",
+            reply_markup=InlineKeyboardBuilder().button(text="🔙 Назад", callback_data="flip:menu").as_markup())
+
+
+@callbacks_router.callback_query(F.data == "flip:api_add")
+async def add_flip_api(callback: CallbackQuery, state: FSMContext):
+    """Начать добавление API ключа MEXC"""
+    await callback.answer()
+    from handlers.states import SetupStates
+    await state.set_state(SetupStates.waiting_for_flip_api_key)
+    await state.update_data(api_action="add")
+    await callback.message.edit_text(
+        "**🔑 Добавление API MEXC**\n\n"
+        "Шаг 1/2: Введи **API Key**:\n\n"
+        "_(Отправь /cancel для отмены)_",
+        reply_markup=InlineKeyboardBuilder().button(text="🔙 Назад", callback_data="flip:api_menu").as_markup()
+    )
+
+
+@callbacks_router.callback_query(F.data == "flip:api_replace")
+async def replace_flip_api(callback: CallbackQuery, state: FSMContext):
+    """Заменить API ключи MEXC"""
+    await callback.answer()
+    from handlers.states import SetupStates
+    await state.set_state(SetupStates.waiting_for_flip_api_key)
+    await state.update_data(api_action="replace")
+    await callback.message.edit_text(
+        "**🔑 Замена API MEXC**\n\n"
+        "Шаг 1/2: Введи новый **API Key**:\n\n"
+        "_(Отправь /cancel для отмены)_",
+        reply_markup=InlineKeyboardBuilder().button(text="🔙 Назад", callback_data="flip:api_menu").as_markup()
+    )
+
+
+@callbacks_router.callback_query(F.data == "flip:api_check")
+async def check_flip_api(callback: CallbackQuery, user: UserSettings, db: Database = None):
+    """Проверить подключение API MEXC"""
+    await callback.answer("🔄 Проверяю...", show_alert=False)
+
+    if not db:
+        await callback.answer("❌ База данных недоступна", show_alert=True)
+        return
+
+    try:
+        flip_settings = await db.get_flip_settings(user.user_id)
+        if not flip_settings or not flip_settings.mexc_api_key:
+            await callback.answer("❌ API не настроены", show_alert=True)
+            return
+
+        from services.mexc_flip_trader import MexcAPI
+        mexc = MexcAPI(flip_settings.mexc_api_key, flip_settings.mexc_api_secret)
+        conn = await mexc.test_connection()
+
+        if conn.get('success'):
+            bal = conn.get('balance_usdt', 0)
+            await callback.answer(f"✅ Подключено! Баланс: ${bal:.2f} USDT", show_alert=True)
+        else:
+            await callback.answer(f"❌ Ошибка: {conn.get('error', 'Неизвестно')[:80]}", show_alert=True)
+
+        # Обновляем меню
+        await show_flip_api_menu(callback, user, db)
+
+    except Exception as e:
+        logger.error(f"API check error: {e}")
+        await callback.answer(f"❌ Ошибка проверки", show_alert=True)
+
+
+@callbacks_router.callback_query(F.data == "flip:api_delete")
+async def delete_flip_api(callback: CallbackQuery, user: UserSettings, db: Database = None):
+    """Удалить API ключи MEXC"""
+    if not db:
+        await callback.answer("❌ База данных недоступна", show_alert=True)
+        return
+
+    try:
+        flip_settings = await db.get_flip_settings(user.user_id)
+        if not flip_settings:
+            await callback.answer("❌ Настройки не найдены", show_alert=True)
+            return
+
+        flip_settings.mexc_api_key = ""
+        flip_settings.mexc_api_secret = ""
+        await db.update_flip_settings(flip_settings)
+
+        await callback.answer("✅ API ключи удалены", show_alert=True)
+        await show_flip_api_menu(callback, user, db)
+
+    except Exception as e:
+        logger.error(f"API delete error: {e}")
+        await callback.answer("❌ Ошибка", show_alert=True)
