@@ -586,19 +586,8 @@ async def show_profile_menu(callback: CallbackQuery, user: UserSettings, scanner
     """Меню профиля"""
     await callback.answer()
 
-    # Refresh balance from scanner cached balances if available
+    # Use user total_balance (reads from cached exchange balances if available)
     balance_display = f"{user.total_balance:.2f}"
-    if scanner and scanner._cached_balances:
-        total = sum(scanner._cached_balances.values())
-        if total > 0:
-            balance_display = f"{total:.2f}"
-            # Update user in DB
-            user.total_balance = total
-            if db:
-                try:
-                    await db.update_user(user)
-                except Exception:
-                    pass
 
     builder = InlineKeyboardBuilder()
     builder.row(
