@@ -827,13 +827,7 @@ async def process_flip_api_secret(message: Message, state: FSMContext, user: Use
             await state.clear()
             return
 
-        # Пробуем подключиться к MEXC для проверки
-        await message.answer("🔄 Проверяю подключение к MEXC...")
-
-        from services.mexc_flip_trader import MexcAPI
-        mexc = MexcAPI(api_key, api_secret)
-        conn = await mexc.test_connection()
-
+        # Сохраняем ключи в БД ДО проверки подключения — даже если сеть/время проблемы
         if db:
             flip_settings = await db.get_flip_settings(user.user_id)
             if not flip_settings:
@@ -843,35 +837,44 @@ async def process_flip_api_secret(message: Message, state: FSMContext, user: Use
             flip_settings.mexc_api_secret = api_secret
             await db.update_flip_settings(flip_settings)
 
-        await state.clear()
-        await mexc.close()
+        # Пробуем подключиться к MEXC для проверки
+        await message.answer("🔄 Проверяю подключение к MEXC...")
 
-        if conn.get('success'):
-            bal = conn.get('balance_usdt', 0)
-            keyboard = InlineKeyboardBuilder()
-            keyboard.button(text="🔑 API меню", callback_data="flip:api_menu")
-            keyboard.button(text="🔥 Flip меню", callback_data="flip:menu")
-            keyboard.adjust(1)
+        from services.mexc_flip_trader import MexcAPI
+        mexc = MexcAPI(api_key, api_secret)
+        try:
+            conn = await mexc.test_connection()
 
-            await message.answer(
-                f"✅ **API MEXC сохранены и подключены!**\n\n"
-                f"💳 **Баланс:** ${bal:.2f} USDT\n\n"
-                f"Теперь можешь переключиться в реальный режим.",
-                reply_markup=keyboard.as_markup()
-            )
-        else:
-            # Сохраняем даже если проверка не удалась - возможно сеть/время
-            keyboard = InlineKeyboardBuilder()
-            keyboard.button(text="🔑 API меню", callback_data="flip:api_menu")
-            keyboard.button(text="🔥 Flip меню", callback_data="flip:menu")
-            keyboard.adjust(1)
+            await state.clear()
 
-            await message.answer(
-                f"⚠️ **API сохранены, но проверка не пройдена**\n\n"
-                f"Причина: {conn.get('error', 'Неизвестно')[:100]}\n\n"
-                f"Проверь ключи позже через меню API.",
-                reply_markup=keyboard.as_markup()
-            )
+            if conn.get('success'):
+                bal = conn.get('balance_usdt', 0)
+                keyboard = InlineKeyboardBuilder()
+                keyboard.button(text="🔑 API меню", callback_data="flip:api_menu")
+                keyboard.button(text="🔥 Flip меню", callback_data="flip:menu")
+                keyboard.adjust(1)
+
+                await message.answer(
+                    f"✅ **API MEXC сохранены и подключены!**\n\n"
+                    f"💳 **Баланс:** ${bal:.2f} USDT\n\n"
+                    f"Теперь можешь переключиться в реальный режим.",
+                    reply_markup=keyboard.as_markup()
+                )
+            else:
+                # Ключи уже сохранены — показываем предупреждение
+                keyboard = InlineKeyboardBuilder()
+                keyboard.button(text="🔑 API меню", callback_data="flip:api_menu")
+                keyboard.button(text="🔥 Flip меню", callback_data="flip:menu")
+                keyboard.adjust(1)
+
+                await message.answer(
+                    f"⚠️ **API сохранены, но проверка не пройдена**\n\n"
+                    f"Причина: {conn.get('error', 'Неизвестно')[:100]}\n\n"
+                    f"Проверь ключи позже через меню API.",
+                    reply_markup=keyboard.as_markup()
+                )
+        finally:
+            await mexc.close()
 
     except Exception as e:
         logger.error(f"API secret save error: {e}")

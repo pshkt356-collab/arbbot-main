@@ -796,7 +796,6 @@ class FlipTrader:
 
     def __init__(self):
         self.price_tracker: Optional[BinancePriceTracker] = None
-        self.mexc_api = MexcAPI()
         self.db = Database(settings.db_file)
         self.running = False
         self._tasks: List[asyncio.Task] = []
@@ -804,6 +803,9 @@ class FlipTrader:
         # Активные сессии: {(user_id, symbol): FlipSession}
         self.active_sessions: Dict[tuple, FlipSession] = {}
         self._sessions_lock = asyncio.Lock()
+        # Per-user MEXC API instances: {user_id: MexcAPI}
+        self.user_mexc_apis: Dict[int, MexcAPI] = {}
+        self._apis_lock = asyncio.Lock()
 
     async def start(self):
         """Запуск Flip Trading сервиса"""
@@ -851,11 +853,14 @@ class FlipTrader:
                 logger.error(f"Error stopping price tracker: {e}")
             self.price_tracker = None
 
-        # Закрываем MEXC API сессию
-        try:
-            await self.mexc_api.close()
-        except Exception as e:
-            logger.error(f"Error closing MEXC API: {e}")
+        # Закрываем все per-user MEXC API сессии
+        async with self._apis_lock:
+            for uid, mexc_api in list(self.user_mexc_apis.items()):
+                try:
+                    await mexc_api.close()
+                except Exception as e:
+                    logger.error(f"Error closing MEXC API for user {uid}: {e}")
+            self.user_mexc_apis.clear()
 
         # Отменяем задачи
         for task in self._tasks:
@@ -889,6 +894,33 @@ class FlipTrader:
             symbols = flip_settings.selected_symbols
             if not symbols:
                 return {'success': False, 'error': 'No symbols selected'}
+
+            # Проверяем API ключи пользователя
+            user_api_key = flip_settings.mexc_api_key
+            user_api_secret = flip_settings.mexc_api_secret
+
+            if not flip_settings.test_mode:
+                if not user_api_key or not user_api_secret:
+                    return {
+                        'success': False,
+                        'error': 'MEXC API keys not configured. Set your API keys in flip settings.'
+                    }
+
+            # Создаем per-user MexcAPI (или с пользовательскими ключами, или с глобальными для тестового режима)
+            async with self._apis_lock:
+                # Закрываем старый API instance для этого пользователя если есть
+                old_api = self.user_mexc_apis.pop(user_id, None)
+                if old_api:
+                    try:
+                        await old_api.close()
+                    except Exception as e:
+                        logger.error(f"Error closing old MEXC API for user {user_id}: {e}")
+
+                mexc_api = MexcAPI(
+                    api_key=user_api_key or None,
+                    api_secret=user_api_secret or None
+                )
+                self.user_mexc_apis[user_id] = mexc_api
 
             # Собираем все символы от всех активных пользователей
             all_symbols = set(s.upper() for s in symbols)
@@ -933,7 +965,7 @@ class FlipTrader:
                         symbol=symbol,
                         flip_settings=flip_settings,
                         price_tracker=self.price_tracker,
-                        mexc_api=self.mexc_api,
+                        mexc_api=mexc_api,
                         db=self.db
                     )
                     self.active_sessions[key] = session
@@ -947,7 +979,8 @@ class FlipTrader:
 
             logger.info(
                 f"Flip session started for user {user_id}, symbols: {started_symbols}, "
-                f"leverage={flip_settings.leverage}x, size=${flip_settings.position_size_usd}"
+                f"leverage={flip_settings.leverage}x, size=${flip_settings.position_size_usd}, "
+                f"keys={'custom' if (user_api_key and user_api_secret) else 'global' if flip_settings.test_mode else 'none'}"
             )
             return {
                 'success': True,
@@ -977,6 +1010,15 @@ class FlipTrader:
         # Отписываем от сигналов
         if self.price_tracker:
             self.price_tracker.unsubscribe(user_id)
+
+        # Закрываем per-user MEXC API
+        async with self._apis_lock:
+            mexc_api = self.user_mexc_apis.pop(user_id, None)
+            if mexc_api:
+                try:
+                    await mexc_api.close()
+                except Exception as e:
+                    logger.error(f"Error closing MEXC API for user {user_id}: {e}")
 
         logger.info(f"Stopped sessions for user {user_id}: {closed}")
         return {'success': True, 'closed_symbols': closed}

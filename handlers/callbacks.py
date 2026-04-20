@@ -2040,6 +2040,12 @@ async def show_flip_menu(callback: CallbackQuery, user: UserSettings, db: Databa
                 api_status = "⚠️ Ошибка подключения"
         except Exception as e:
             api_status = f"⚠️ Ошибка: {str(e)[:30]}"
+        finally:
+            if mexc:
+                try:
+                    await mexc.close()
+                except Exception:
+                    pass
     else:
         # Проверяем глобальные API ключи из env
         from config import settings
@@ -2054,6 +2060,12 @@ async def show_flip_menu(callback: CallbackQuery, user: UserSettings, db: Databa
                     balance_str = f"💳 **Баланс MEXC:** ${bal:.2f} USDT\n"
             except Exception:
                 pass
+            finally:
+                if mexc:
+                    try:
+                        await mexc.close()
+                    except Exception:
+                        pass
 
     builder = InlineKeyboardBuilder()
     builder.row(
@@ -2432,14 +2444,17 @@ async def show_flip_api_menu(callback: CallbackQuery, user: UserSettings, db: Da
             # Показываем статус и баланс
             from services.mexc_flip_trader import MexcAPI
             mexc = MexcAPI(flip_settings.mexc_api_key, flip_settings.mexc_api_secret)
-            conn = await mexc.test_connection()
-            if conn.get('success'):
-                bal = conn.get('balance_usdt', 0)
-                status = "✅ Подключено"
-                balance_info = f"💳 **Баланс:** ${bal:.2f} USDT\n"
-            else:
-                status = f"⚠️ Ошибка: {conn.get('error', 'Неизвестно')[:40]}"
-                balance_info = ""
+            try:
+                conn = await mexc.test_connection()
+                if conn.get('success'):
+                    bal = conn.get('balance_usdt', 0)
+                    status = "✅ Подключено"
+                    balance_info = f"💳 **Баланс:** ${bal:.2f} USDT\n"
+                else:
+                    status = f"⚠️ Ошибка: {conn.get('error', 'Неизвестно')[:40]}"
+                    balance_info = ""
+            finally:
+                await mexc.close()
 
             # Показываем маскированный ключ
             key_masked = flip_settings.mexc_api_key[:6] + "****" + flip_settings.mexc_api_key[-4:] if len(flip_settings.mexc_api_key) > 10 else "****"
@@ -2537,7 +2552,10 @@ async def check_flip_api(callback: CallbackQuery, user: UserSettings, db: Databa
 
         from services.mexc_flip_trader import MexcAPI
         mexc = MexcAPI(flip_settings.mexc_api_key, flip_settings.mexc_api_secret)
-        conn = await mexc.test_connection()
+        try:
+            conn = await mexc.test_connection()
+        finally:
+            await mexc.close()
 
         if conn.get('success'):
             bal = conn.get('balance_usdt', 0)
