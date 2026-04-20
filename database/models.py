@@ -94,6 +94,11 @@ class UserSettings:
             )
         # Fallback to legacy storage in risk_settings
         return self.risk_settings.get('total_balance', 0.0)
+
+    @total_balance.setter
+    def total_balance(self, value: float):
+        """Установить общий баланс (сохраняет в risk_settings)"""
+        self.risk_settings['total_balance'] = value
     
     @property
     def available_balance(self) -> float:
@@ -116,6 +121,16 @@ class UserSettings:
                 if isinstance(bal, dict)
             )
         return self.risk_settings.get('locked_balance', 0.0)
+
+    @property
+    def test_mode(self) -> bool:
+        """Тестовый режим торговли — читает из alert_settings"""
+        return self.alert_settings.get('test_mode', True)
+
+    @test_mode.setter
+    def test_mode(self, value: bool):
+        """Установить тестовый режим — сохраняет в alert_settings"""
+        self.alert_settings['test_mode'] = value
 
     def update_exchange_balance(self, exchange_id: str, total: float = 0, free: float = 0, used: float = 0):
         """Обновить баланс конкретной биржи"""

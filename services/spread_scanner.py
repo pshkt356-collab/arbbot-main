@@ -187,11 +187,13 @@ class SpreadScanner:
         self._reconnect_attempts: Dict[str, int] = {}
         self._max_reconnect_delay = 60
 
-    def set_user_threshold(self, user_id: int, threshold: float, for_basis: bool = False):
+    def set_user_threshold(self, user_id: int, threshold: float, for_basis: bool = False, alerts_enabled: bool = None):
         if for_basis:
             self.user_basis_settings[user_id] = threshold
         else:
             self.user_settings[user_id] = threshold
+        if alerts_enabled is not None:
+            self.user_alerts_enabled[user_id] = alerts_enabled
 
     def set_user_alert_preferences(self, user_id: int, inter_enabled: bool = True, 
                                     basis_enabled: bool = True, funding_enabled: bool = True,
