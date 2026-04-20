@@ -2113,7 +2113,7 @@ async def show_flip_menu(callback: CallbackQuery, user: UserSettings, db: Databa
         f"_MEXC фьючерсы: нулевая комиссия_"
     )
 
-    await callback.message.edit_text(text, reply_markup=builder.as_markup())
+    await safe_edit_text(callback, text, reply_markup=builder.as_markup())
 
 
 @callbacks_router.callback_query(F.data == "flip:toggle")
@@ -2163,7 +2163,7 @@ async def show_flip_symbols(callback: CallbackQuery, user: UserSettings, db: Dat
     await callback.answer()
     
     if not db:
-        await callback.message.edit_text("❌ База данных недоступна",
+        await safe_edit_text(callback, "❌ База данных недоступна",
             reply_markup=InlineKeyboardBuilder().button(text="📱 Меню", callback_data="menu:main").as_markup())
         return
     
@@ -2200,11 +2200,11 @@ async def show_flip_symbols(callback: CallbackQuery, user: UserSettings, db: Dat
             f"Нажми на пару чтобы добавить/убрать:"
         )
         
-        await callback.message.edit_text(text, reply_markup=builder.as_markup())
+        await safe_edit_text(callback, text, reply_markup=builder.as_markup())
         
     except Exception as e:
         logger.error(f"Flip symbols error: {e}")
-        await callback.message.edit_text(f"❌ Ошибка: {escape_html(str(e))[:100]}",
+        await safe_edit_text(callback, f"❌ Ошибка: {escape_html(str(e))[:100]}",
             reply_markup=InlineKeyboardBuilder().button(text="📱 Меню", callback_data="menu:main").as_markup())
 
 
@@ -2249,7 +2249,7 @@ async def show_flip_leverage(callback: CallbackQuery, user: UserSettings, db: Da
     await callback.answer()
     
     if not db:
-        await callback.message.edit_text("❌ База данных недоступна",
+        await safe_edit_text(callback, "❌ База данных недоступна",
             reply_markup=InlineKeyboardBuilder().button(text="📱 Меню", callback_data="menu:main").as_markup())
         return
     
@@ -2287,11 +2287,11 @@ async def show_flip_leverage(callback: CallbackQuery, user: UserSettings, db: Da
             f"Выбери плечо:"
         )
         
-        await callback.message.edit_text(text, reply_markup=builder.as_markup())
+        await safe_edit_text(callback, text, reply_markup=builder.as_markup())
         
     except Exception as e:
         logger.error(f"Flip leverage error: {e}")
-        await callback.message.edit_text(f"❌ Ошибка: {escape_html(str(e))[:100]}",
+        await safe_edit_text(callback, f"❌ Ошибка: {escape_html(str(e))[:100]}",
             reply_markup=InlineKeyboardBuilder().button(text="📱 Меню", callback_data="menu:main").as_markup())
 
 
@@ -2325,7 +2325,7 @@ async def set_custom_leverage(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     from handlers.states import SetupStates
     await state.set_state(SetupStates.waiting_for_flip_leverage)
-    await callback.message.edit_text(
+    await safe_edit_text(callback,
         "**⚡ Введи плечо (1-300):**\n\n"
         "Например: 200\n\n"
         "_(Отправь /cancel для отмены)_",
@@ -2339,7 +2339,7 @@ async def show_flip_position_size(callback: CallbackQuery, user: UserSettings, s
     await callback.answer()
     from handlers.states import SetupStates
     await state.set_state(SetupStates.waiting_for_flip_position_size)
-    await callback.message.edit_text(
+    await safe_edit_text(callback,
         "**💰 Введи размер позиции (USDT):**\n\n"
         "Например: 100\n\n"
         "Рекомендуется начинать с $50-100.\n\n"
@@ -2378,7 +2378,7 @@ async def show_flip_stats(callback: CallbackQuery, user: UserSettings, db: Datab
     await callback.answer()
     
     if not db:
-        await callback.message.edit_text("❌ База данных недоступна",
+        await safe_edit_text(callback, "❌ База данных недоступна",
             reply_markup=InlineKeyboardBuilder().button(text="📱 Меню", callback_data="menu:main").as_markup())
         return
     
@@ -2419,7 +2419,7 @@ async def show_flip_stats(callback: CallbackQuery, user: UserSettings, db: Datab
         
     except Exception as e:
         logger.error(f"Flip stats error: {e}")
-        await callback.message.edit_text(f"❌ Ошибка: {escape_html(str(e))[:100]}",
+        await safe_edit_text(callback, f"❌ Ошибка: {escape_html(str(e))[:100]}",
             reply_markup=InlineKeyboardBuilder().button(text="📱 Меню", callback_data="menu:main").as_markup())
 
 
@@ -2429,7 +2429,7 @@ async def show_flip_api_menu(callback: CallbackQuery, user: UserSettings, db: Da
     await callback.answer()
 
     if not db:
-        await callback.message.edit_text("❌ База данных недоступна",
+        await safe_edit_text(callback, "❌ База данных недоступна",
             reply_markup=InlineKeyboardBuilder().button(text="📱 Меню", callback_data="menu:main").as_markup())
         return
 
@@ -2497,11 +2497,11 @@ async def show_flip_api_menu(callback: CallbackQuery, user: UserSettings, db: Da
                 InlineKeyboardButton(text="🔙 Назад", callback_data="flip:menu")
             )
 
-        await callback.message.edit_text(text, reply_markup=builder.as_markup())
+        await safe_edit_text(callback, text, reply_markup=builder.as_markup())
 
     except Exception as e:
         logger.error(f"Flip API menu error: {e}")
-        await callback.message.edit_text(f"❌ Ошибка: {escape_html(str(e))[:100]}",
+        await safe_edit_text(callback, f"❌ Ошибка: {escape_html(str(e))[:100]}",
             reply_markup=InlineKeyboardBuilder().button(text="🔙 Назад", callback_data="flip:menu").as_markup())
 
 
@@ -2512,7 +2512,7 @@ async def add_flip_api(callback: CallbackQuery, state: FSMContext):
     from handlers.states import SetupStates
     await state.set_state(SetupStates.waiting_for_flip_api_key)
     await state.update_data(api_action="add")
-    await callback.message.edit_text(
+    await safe_edit_text(callback,
         "**🔑 Добавление API MEXC**\n\n"
         "Шаг 1/2: Введи **API Key**:\n\n"
         "_(Отправь /cancel для отмены)_",
@@ -2527,7 +2527,7 @@ async def replace_flip_api(callback: CallbackQuery, state: FSMContext):
     from handlers.states import SetupStates
     await state.set_state(SetupStates.waiting_for_flip_api_key)
     await state.update_data(api_action="replace")
-    await callback.message.edit_text(
+    await safe_edit_text(callback,
         "**🔑 Замена API MEXC**\n\n"
         "Шаг 1/2: Введи новый **API Key**:\n\n"
         "_(Отправь /cancel для отмены)_",
