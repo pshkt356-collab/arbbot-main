@@ -904,7 +904,7 @@ class FlipSession:
                     logger.info(f"[FlipSession] CLOSING short (reverse signal): user={self.user_id}, symbol={self.symbol}, trigger_price={binance_price:.4f}")
                     await self._close_position("reverse")
                 elif direction == 'down' and not self.has_open_position:
-    now = time.time()
+                    now = time.time()
 
     logger.error(
         f"[DEBUG] TRY OPEN SHORT | cooldown_until={self._open_failure_cooldown_until} "
