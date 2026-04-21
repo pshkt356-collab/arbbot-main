@@ -244,9 +244,29 @@ class BinancePriceTracker:
 
 
 class MexcAPI:
-    """Обёртка для MEXC Contract API (асинхронная)"""
+    """
+    Обёртка для MEXC Contract API (асинхронная).
 
-    BASE_URL = "https://contract.mexc.com"
+    Аутентификация (OPEN-API source):
+      Заголовки:
+        ApiKey      – API ключ
+        Request-Time – unix timestamp в миллисекундах
+        Signature   – HMAC-SHA256 подпись
+        Recv-Window – окно допустимого отклонения времени (опц., по ум. 60 с)
+
+    Правило подписи:
+      target_string = accessKey + timestamp + parameterString
+      где parameterString:
+        • GET / DELETE  → бизнес-параметры отсортированы по ключу и соединены через '&'
+        • POST          → JSON-строка тела запроса (без сортировки ключей)
+      Если бизнес-параметров нет — используется пустая строка "".
+
+    Домен обновлён согласно changelog 2026-01-19:
+      https://api.mexc.com  (был https://contract.mexc.com)
+    """
+
+    BASE_URL = "https://api.mexc.com"
+    RECV_WINDOW = "60"  # максимум по документации MEXC
 
     def __init__(self, api_key: str = None, api_secret: str = None):
         self.api_key = api_key or settings.mexc_api_key
@@ -259,30 +279,74 @@ class MexcAPI:
             self._session = aiohttp.ClientSession(timeout=timeout)
         return self._session
 
-    def _generate_signature(self, params: dict) -> str:
-        """Генерация подписи для MEXC API — params отсортированы по ключу"""
-        query_string = "&".join([f"{k}={v}" for k, v in sorted(params.items())])
+    # ------------------------------------------------------------------
+    #  Подпись
+    # ------------------------------------------------------------------
+    def _sign(self, target_string: str) -> str:
+        """HMAC-SHA256 подпись целевой строки."""
         return hmac.new(
-            self.api_secret.encode('utf-8'),
-            query_string.encode('utf-8'),
-            hashlib.sha256
+            self.api_secret.encode("utf-8"),
+            target_string.encode("utf-8"),
+            hashlib.sha256,
         ).hexdigest()
 
-    def _build_signed_url(self, endpoint: str, params: dict) -> str:
-        """Формирует URL с подписью для GET запроса (порядок параметров фиксирован)"""
-        # Сначала создаем подпись из отсортированных параметров
-        sign = self._generate_signature(params)
-        # Затем формируем query string в том же отсортированном порядке + sign в конце
-        query_string = "&".join([f"{k}={v}" for k, v in sorted(params.items())])
-        query_string += f"&sign={sign}"
-        return f"{self.BASE_URL}{endpoint}?{query_string}"
+    def _auth_headers(
+        self,
+        request_time: str,
+        param_string: str = "",
+    ) -> dict:
+        """Формирует заголовки аутентификации для OPEN-API."""
+        to_sign = f"{self.api_key}{request_time}{param_string}"
+        return {
+            "ApiKey": self.api_key,
+            "Request-Time": request_time,
+            "Signature": self._sign(to_sign),
+            "Recv-Window": self.RECV_WINDOW,
+        }
 
-    def _build_signed_body(self, params: dict) -> str:
-        """Формирует form-encoded тело с подписью для POST запроса"""
-        sign = self._generate_signature(params)
-        sorted_params = dict(sorted(params.items()))
-        sorted_params["sign"] = sign
-        return "&".join([f"{k}={v}" for k, v in sorted_params.items()])
+    # ------------------------------------------------------------------
+    #  GET  (приватные)
+    # ------------------------------------------------------------------
+    def _private_get_url_and_headers(
+        self, endpoint: str, business_params: dict
+    ) -> tuple[str, dict]:
+        """
+        Для GET-запросов:
+          • сортируем бизнес-параметры по ключу
+          • формируем parameterString через '&'
+          • собираем заголовки ApiKey / Request-Time / Signature
+          • возвращаем (url_without_query, headers)
+            — aiohttp сам соберёт query из business_params
+        """
+        request_time = str(int(time.time() * 1000))
+        # business_params — то, что уйдёт в query string
+        sorted_params = dict(sorted(business_params.items()))
+        param_string = "&".join(
+            [f"{k}={v}" for k, v in sorted_params.items()]
+        )
+        headers = self._auth_headers(request_time, param_string)
+        url = f"{self.BASE_URL}{endpoint}"
+        return url, headers, sorted_params
+
+    # ------------------------------------------------------------------
+    #  POST  (приватные)
+    # ------------------------------------------------------------------
+    def _private_post_url_headers_body(
+        self, endpoint: str, business_body: dict
+    ) -> tuple[str, dict, str]:
+        """
+        Для POST-запросов:
+          • тело — JSON, ключи НЕ сортируем
+          • parameterString = json.dumps(business_body, separators=(',', ':'))
+          • подпись = sign(accessKey + timestamp + json_body)
+          • возвращаем (url, headers, json_body)
+        """
+        request_time = str(int(time.time() * 1000))
+        json_body = json.dumps(business_body, separators=(",", ":"))
+        headers = self._auth_headers(request_time, json_body)
+        headers["Content-Type"] = "application/json"
+        url = f"{self.BASE_URL}{endpoint}"
+        return url, headers, json_body
 
     async def close(self):
         if self._session and not self._session.closed:
@@ -338,26 +402,22 @@ class MexcAPI:
         session = await self._get_session()
         try:
             mexc_symbol = f"{symbol.upper()}_USDT"
-            timestamp = await self.get_server_time()
-            params = {
+            body = {
                 "symbol": mexc_symbol,
                 "leverage": leverage,
-                "timestamp": timestamp,
-                "api_key": self.api_key
             }
-            body = self._build_signed_body(params)
+            url, headers, json_body = self._private_post_url_headers_body(
+                "/api/v1/private/position/change_leverage", body
+            )
 
-            async with session.post(
-                f"{self.BASE_URL}/api/v1/private/position/change_leverage",
-                data=body,
-                headers={'Content-Type': 'application/x-www-form-urlencoded'}
-            ) as resp:
+            async with session.post(url, data=json_body, headers=headers) as resp:
                 data = await resp.json()
-                if data.get('success') or data.get('code') == 200:
+                if data.get('success') or data.get('code') == 0:
                     logger.info(f"Leverage set to {leverage}x for {symbol}")
                     return True
                 else:
-                    logger.warning(f"Leverage set failed: {data}")
+                    err = self._handle_api_error(data)
+                    logger.warning(f"Leverage set failed: {err.get('error')}")
                     return False
         except Exception as e:
             logger.error(f"Set leverage error: {e}")
@@ -371,25 +431,20 @@ class MexcAPI:
         session = await self._get_session()
         try:
             mexc_symbol = f"{symbol.upper()}_USDT"
-            timestamp = await self.get_server_time()
-            params = {
+            body = {
                 "symbol": mexc_symbol,
                 "side": 1,  # 1 = Open Long
                 "vol": quantity,
                 "type": 5,  # 5 = Market order
                 "openType": 1,  # isolated margin
-                "timestamp": timestamp,
-                "api_key": self.api_key
             }
-            body = self._build_signed_body(params)
+            url, headers, json_body = self._private_post_url_headers_body(
+                "/api/v1/private/order/create", body
+            )
 
-            async with session.post(
-                f"{self.BASE_URL}/api/v1/private/order/submit",
-                data=body,
-                headers={'Content-Type': 'application/x-www-form-urlencoded'}
-            ) as resp:
+            async with session.post(url, data=json_body, headers=headers) as resp:
                 data = await resp.json()
-                if data.get('success') or data.get('code') == 200:
+                if data.get('success') or data.get('code') == 0:
                     result = data.get('data', {})
                     logger.info(f"Long opened: {symbol} qty={quantity}")
                     return {
@@ -399,8 +454,9 @@ class MexcAPI:
                         'quantity': quantity
                     }
                 else:
-                    logger.error(f"Open long failed: {data}")
-                    return {'success': False, 'error': str(data)}
+                    err = self._handle_api_error(data)
+                    logger.error(f"Open long failed: {err.get('error')}")
+                    return err
         except Exception as e:
             logger.error(f"Open long error: {e}")
             return {'success': False, 'error': str(e)}
@@ -413,25 +469,20 @@ class MexcAPI:
         session = await self._get_session()
         try:
             mexc_symbol = f"{symbol.upper()}_USDT"
-            timestamp = await self.get_server_time()
-            params = {
+            body = {
                 "symbol": mexc_symbol,
-                "side": 3,  # 3 = Close Long
+                "side": 4,  # 4 = Close Long (исправлено: было 3=Open Short!)
                 "vol": quantity,
                 "type": 5,  # Market order
                 "openType": 1,
-                "timestamp": timestamp,
-                "api_key": self.api_key
             }
-            body = self._build_signed_body(params)
+            url, headers, json_body = self._private_post_url_headers_body(
+                "/api/v1/private/order/create", body
+            )
 
-            async with session.post(
-                f"{self.BASE_URL}/api/v1/private/order/submit",
-                data=body,
-                headers={'Content-Type': 'application/x-www-form-urlencoded'}
-            ) as resp:
+            async with session.post(url, data=json_body, headers=headers) as resp:
                 data = await resp.json()
-                if data.get('success') or data.get('code') == 200:
+                if data.get('success') or data.get('code') == 0:
                     result = data.get('data', {})
                     logger.info(f"Long closed: {symbol} qty={quantity}")
                     return {
@@ -441,8 +492,9 @@ class MexcAPI:
                         'quantity': quantity
                     }
                 else:
-                    logger.error(f"Close long failed: {data}")
-                    return {'success': False, 'error': str(data)}
+                    err = self._handle_api_error(data)
+                    logger.error(f"Close long failed: {err.get('error')}")
+                    return err
         except Exception as e:
             logger.error(f"Close long error: {e}")
             return {'success': False, 'error': str(e)}
@@ -455,17 +507,14 @@ class MexcAPI:
         session = await self._get_session()
         try:
             mexc_symbol = f"{symbol.upper()}_USDT"
-            timestamp = await self.get_server_time()
-            params = {
-                "symbol": mexc_symbol,
-                "timestamp": timestamp,
-                "api_key": self.api_key
-            }
-            url = self._build_signed_url("/api/v1/private/position/open_positions", params)
+            # private GET: /api/v1/private/position/open_positions (без параметров)
+            url, headers, _ = self._private_get_url_and_headers(
+                "/api/v1/private/position/open_positions", {}
+            )
 
-            async with session.get(url) as resp:
+            async with session.get(url, headers=headers) as resp:
                 data = await resp.json()
-                if data.get('success') or data.get('code') == 200:
+                if data.get('success') or data.get('code') == 0:
                     positions = data.get('data', [])
                     # Ищем позицию по символу
                     for pos in positions:
@@ -483,7 +532,11 @@ class MexcAPI:
                             }
                     return {'success': True, 'position': None}
                 else:
-                    return {'success': False, 'error': str(data)}
+                    return self._handle_api_error(data)
+        except aiohttp.ClientResponseError as e:
+            if e.status == 401:
+                return {'success': False, 'error': 'MEXC: Not logged in or login has expired (401). Check API keys.'}
+            return {'success': False, 'error': f'HTTP {e.status}: {e.message}'}
         except Exception as e:
             logger.error(f"Get position error: {e}")
             return {'success': False, 'error': str(e)}
@@ -495,20 +548,18 @@ class MexcAPI:
 
         session = await self._get_session()
         try:
-            timestamp = await self.get_server_time()
-            params = {
-                "timestamp": timestamp,
-                "api_key": self.api_key
-            }
-            url = self._build_signed_url("/api/v1/private/account/assets", params)
+            # private GET: /api/v1/private/account/assets (без параметров)
+            url, headers, _ = self._private_get_url_and_headers(
+                "/api/v1/private/account/assets", {}
+            )
 
-            async with session.get(url) as resp:
+            async with session.get(url, headers=headers) as resp:
                 data = await resp.json()
-                if data.get('success') or data.get('code') == 200:
+                if data.get('success') or data.get('code') == 0:
                     assets = data.get('data', [])
                     usdt_asset = next((a for a in assets if a.get('currency', '').upper() == 'USDT'), None)
                     if usdt_asset:
-                        balance = float(usdt_asset.get('totalMarginBalance', 0) or usdt_asset.get('marginBalance', 0) or 0)
+                        balance = float(usdt_asset.get('totalMarginBalance', 0) or usdt_asset.get('marginBalance', 0) or usdt_asset.get('equity', 0) or 0)
                         available = float(usdt_asset.get('availableBalance', 0) or usdt_asset.get('availableOpen', 0) or 0)
                         return {
                             'success': True,
@@ -517,11 +568,36 @@ class MexcAPI:
                         }
                     return {'success': True, 'balance_usdt': 0.0, 'available': 0.0}
                 else:
-                    logger.warning(f"MEXC balance error: {data}")
-                    return {'success': False, 'error': str(data)}
+                    err = self._handle_api_error(data)
+                    logger.warning(f"MEXC balance error: {err.get('error')}")
+                    return err
+        except aiohttp.ClientResponseError as e:
+            if e.status == 401:
+                return {'success': False, 'error': 'MEXC: Not logged in or login has expired (401). Check API keys.'}
+            return {'success': False, 'error': f'HTTP {e.status}: {e.message}'}
         except Exception as e:
             logger.error(f"Get MEXC balance error: {e}")
             return {'success': False, 'error': str(e)}
+
+    # ------------------------------------------------------------------
+    #  Обработка типичных ошибок MEXC API
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _handle_api_error(data: dict) -> dict:
+        """Преобразует стандартные ошибки MEXC в понятные сообщения."""
+        code = data.get('code')
+        msg = data.get('message', '')
+        if code == 401:
+            return {'success': False, 'error': 'MEXC: Not logged in or login has expired (401). Check API keys.'}
+        if code == 402:
+            return {'success': False, 'error': 'MEXC: API Key expired, please renew (402).'}
+        if code == 406:
+            return {'success': False, 'error': 'MEXC: Accessing IP is not in the whitelist (406).'}
+        if code == 602:
+            return {'success': False, 'error': 'MEXC: Signature verification failed (602). Check secret key.'}
+        if code == 700007:
+            return {'success': False, 'error': 'MEXC: No permission to access this endpoint (700007).' }
+        return {'success': False, 'error': f"MEXC API error: code={code}, message={msg}"}
 
     async def test_connection(self) -> dict:
         """Проверить подключение к MEXC API"""
@@ -585,29 +661,44 @@ class FlipSession:
         # Храним время открытия сделки для точного расчета длительности
         self._opened_at: Optional[str] = None
 
+    async def _on_price_signal(self, user_id: int, symbol: str, direction: str, price: float):
+        """Callback для подписки на ценовые сигналы."""
+        if user_id != self.user_id or symbol != self.symbol:
+            return
+        await self.on_price_direction(direction, price)
+
     async def run(self):
         """Основной цикл сессии"""
         logger.info(f"FlipSession started: user={self.user_id}, symbol={self.symbol}")
 
-        # Устанавливаем плечо (если не тестовый режим)
-        if not self.settings.test_mode:
-            leverage_set = await self.mexc_api.set_leverage(self.symbol, self.settings.leverage)
-            if not leverage_set:
-                logger.warning(f"Failed to set leverage for {self.symbol}, continuing anyway")
-        else:
-            logger.info(f"Test mode: skipping leverage set for {self.symbol}")
+        # Подписываемся на ценовые сигналы
+        self.price_tracker.subscribe_to_signals(
+            self._on_price_signal, self.user_id, self.symbol
+        )
 
-        while self.is_running:
-            try:
-                await asyncio.sleep(1)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Session loop error: user={self.user_id}, symbol={self.symbol}: {e}")
+        try:
+            # Устанавливаем плечо (если не тестовый режим)
+            if not self.settings.test_mode:
+                leverage_set = await self.mexc_api.set_leverage(self.symbol, self.settings.leverage)
+                if not leverage_set:
+                    logger.warning(f"Failed to set leverage for {self.symbol}, continuing anyway")
+            else:
+                logger.info(f"Test mode: skipping leverage set for {self.symbol}")
 
-        # Закрываем позицию при остановке сессии
-        if self.has_open_position:
-            await self._close_position("session_stop")
+            while self.is_running:
+                try:
+                    await asyncio.sleep(1)
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.error(f"Session loop error: user={self.user_id}, symbol={self.symbol}: {e}")
+        finally:
+            # Отписываемся от сигналов
+            self.price_tracker.unsubscribe_from_signals(self.user_id, self.symbol)
+
+            # Закрываем позицию при остановке сессии
+            if self.has_open_position:
+                await self._close_position("session_stop")
 
         logger.info(f"FlipSession stopped: user={self.user_id}, symbol={self.symbol}")
 
@@ -972,11 +1063,6 @@ class FlipTrader:
                     asyncio.create_task(session.run())
                     started_symbols.append(symbol.upper())
 
-                    # Подписываем сессию на сигналы
-                    self.price_tracker.subscribe_to_signals(
-                        self._on_price_signal, user_id, symbol
-                    )
-
             logger.info(
                 f"Flip session started for user {user_id}, symbols: {started_symbols}, "
                 f"leverage={flip_settings.leverage}x, size=${flip_settings.position_size_usd}, "
@@ -1006,10 +1092,6 @@ class FlipTrader:
                     closed.append(key[1])  # symbol
                 except Exception as e:
                     logger.error(f"Error closing session {key}: {e}")
-
-        # Отписываем от сигналов
-        if self.price_tracker:
-            self.price_tracker.unsubscribe(user_id)
 
         # Закрываем per-user MEXC API
         async with self._apis_lock:
