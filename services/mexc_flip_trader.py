@@ -430,8 +430,15 @@ class MexcAPI:
             logger.error(f"MEXC depth error for {symbol}: {e}")
             return {}
 
-    async def set_leverage(self, symbol: str, leverage: int) -> bool:
-        """Установить плечо для символа"""
+    async def set_leverage(self, symbol: str, leverage: int, open_type: int = 1, position_type: int = 1) -> bool:
+        """Установить плечо для символа.
+        
+        Args:
+            symbol: торговая пара (без _USDT)
+            leverage: плечо (1-125)
+            open_type: 1=isolated, 2=cross
+            position_type: 1=long, 2=short
+        """
         if not self.api_key or not self.api_secret:
             logger.warning("MEXC API keys not configured, skipping leverage set")
             return True  # В тестовом режиме считаем OK
@@ -442,6 +449,8 @@ class MexcAPI:
             body = {
                 "symbol": mexc_symbol,
                 "leverage": leverage,
+                "openType": open_type,       # 1=isolated, 2=cross — обязательно
+                "positionType": position_type,  # 1=long, 2=short — обязательно
             }
             url, headers, json_body = self._private_post_url_headers_body(
                 "/api/v1/private/position/change_leverage", body
@@ -450,7 +459,7 @@ class MexcAPI:
             async with session.post(url, data=json_body, headers=headers) as resp:
                 data = await resp.json()
                 if data.get('success') or data.get('code') == 0:
-                    logger.info(f"Leverage set to {leverage}x for {symbol}")
+                    logger.info(f"Leverage set to {leverage}x for {symbol} (openType={open_type}, positionType={position_type})")
                     return True
                 else:
                     err = self._handle_api_error(data)
@@ -460,7 +469,7 @@ class MexcAPI:
             logger.error(f"Set leverage error: {e}")
             return False
 
-    async def open_long(self, symbol: str, quantity: float) -> dict:
+    async def open_long(self, symbol: str, quantity: float, leverage: int = None) -> dict:
         """Открыть лонг позицию"""
         if not self.api_key or not self.api_secret:
             return self._emulate_order(symbol, "BUY", quantity)
@@ -474,6 +483,8 @@ class MexcAPI:
                 "vol": quantity,
                 "type": 5,  # 5 = Market order
                 "openType": 1,  # isolated margin
+                "leverage": leverage or 1,  # обязательно при открытии
+                "positionType": 1,  # long
             }
             url, headers, json_body = self._private_post_url_headers_body(
                 "/api/v1/private/order/create", body
@@ -508,10 +519,11 @@ class MexcAPI:
             mexc_symbol = f"{symbol.upper()}_USDT"
             body = {
                 "symbol": mexc_symbol,
-                "side": 4,  # 4 = Close Long (исправлено: было 3=Open Short!)
+                "side": 4,  # 4 = Close Long
                 "vol": quantity,
                 "type": 5,  # Market order
                 "openType": 1,
+                "positionType": 1,  # long
             }
             url, headers, json_body = self._private_post_url_headers_body(
                 "/api/v1/private/order/create", body
@@ -537,7 +549,7 @@ class MexcAPI:
             return {'success': False, 'error': str(e)}
 
 
-    async def open_short(self, symbol: str, quantity: float) -> dict:
+    async def open_short(self, symbol: str, quantity: float, leverage: int = None) -> dict:
         """Открыть шорт позицию (side=3 = Open Short)"""
         if not self.api_key or not self.api_secret:
             return self._emulate_order(symbol, "SELL", quantity)
@@ -551,6 +563,8 @@ class MexcAPI:
                 "vol": quantity,
                 "type": 5,  # 5 = Market order
                 "openType": 1,  # isolated margin
+                "leverage": leverage or 1,  # обязательно при открытии
+                "positionType": 2,  # short
             }
             url, headers, json_body = self._private_post_url_headers_body(
                 "/api/v1/private/order/create", body
@@ -589,6 +603,7 @@ class MexcAPI:
                 "vol": quantity,
                 "type": 5,  # Market order
                 "openType": 1,
+                "positionType": 2,  # short
             }
             url, headers, json_body = self._private_post_url_headers_body(
                 "/api/v1/private/order/create", body
@@ -822,10 +837,10 @@ class FlipSession:
         try:
             # Устанавливаем плечо (если не тестовый режим)
             if not self.settings.test_mode:
-                logger.info(f"[FlipSession] Setting leverage {self.settings.leverage}x for {self.symbol}")
-                leverage_set = await self.mexc_api.set_leverage(self.symbol, self.settings.leverage)
+                logger.info(f"[FlipSession] Setting leverage {self.settings.leverage}x LONG for {self.symbol}")
+                leverage_set = await self.mexc_api.set_leverage(self.symbol, self.settings.leverage, open_type=1, position_type=1)
                 if leverage_set:
-                    logger.info(f"[FlipSession] Leverage set OK: {self.symbol} {self.settings.leverage}x")
+                    logger.info(f"[FlipSession] Leverage set OK: {self.symbol} {self.settings.leverage}x LONG")
                 else:
                     logger.warning(f"[FlipSession] FAILED to set leverage for {self.symbol}, continuing anyway")
             else:
@@ -978,7 +993,7 @@ class FlipSession:
                 f"qty={quantity:.6f} margin=${margin_usd:.2f} position=${position_size:.0f} "
                 f"({self.settings.leverage}x) mode={'TEST' if self.settings.test_mode else 'REAL'}"
             )
-            result = await self.mexc_api.open_long(self.symbol, quantity)
+            result = await self.mexc_api.open_long(self.symbol, quantity, self.settings.leverage)
 
             if not result.get('success'):
                 err_msg = result.get('error', 'Unknown error')
@@ -1045,6 +1060,13 @@ class FlipSession:
             position_size = margin_usd * self.settings.leverage
 
             if not self.settings.test_mode:
+                logger.info(f"[FlipSession] Setting leverage {self.settings.leverage}x SHORT for {self.symbol}")
+                leverage_set = await self.mexc_api.set_leverage(self.symbol, self.settings.leverage, open_type=1, position_type=2)
+                if leverage_set:
+                    logger.info(f"[FlipSession] Leverage set OK: {self.symbol} {self.settings.leverage}x SHORT")
+                else:
+                    logger.warning(f"[FlipSession] FAILED to set leverage for {self.symbol}, continuing anyway")
+
                 bal = await self.mexc_api.get_balance()
                 if not bal.get('success'):
                     err = bal.get('error', 'Unknown balance error')
@@ -1065,7 +1087,7 @@ class FlipSession:
                 return
 
             logger.info(f"[FlipSession] PLACING SHORT order: user={self.user_id} symbol={self.symbol} qty={quantity:.6f} margin=${margin_usd:.2f} position=${position_size:.0f} ({self.settings.leverage}x) mode={'TEST' if self.settings.test_mode else 'REAL'}")
-            result = await self.mexc_api.open_short(self.symbol, quantity)
+            result = await self.mexc_api.open_short(self.symbol, quantity, self.settings.leverage)
 
             if not result.get('success'):
                 err_msg = result.get('error', 'Unknown error')
