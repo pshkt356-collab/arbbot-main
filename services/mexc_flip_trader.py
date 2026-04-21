@@ -906,7 +906,7 @@ class FlipSession:
                 elif direction == 'down' and not self.has_open_position:
                     now = time.time()
 
-    logger.error(
+                    logger.error(
         f"[DEBUG] TRY OPEN SHORT | cooldown_until={self._open_failure_cooldown_until} "
         f"now={now} remaining={self._open_failure_cooldown_until - now}"
     )
