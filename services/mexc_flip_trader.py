@@ -558,7 +558,6 @@ class MexcAPI:
 
             async with session.post(url, data=json_body, headers=headers) as resp:
                 data = await resp.json()
-                logger.error(f"[DEBUG] MEXC RAW RESPONSE: {data}")
                 if data.get('success') or data.get('code') == 0:
                     result = data.get('data', {})
                     logger.info(f"Short opened: {symbol} qty={quantity}")
@@ -904,20 +903,6 @@ class FlipSession:
                     logger.info(f"[FlipSession] CLOSING short (reverse signal): user={self.user_id}, symbol={self.symbol}, trigger_price={binance_price:.4f}")
                     await self._close_position("reverse")
                 elif direction == 'down' and not self.has_open_position:
-                    now = time.time()
-
-                    logger.error(
-        f"[DEBUG] TRY OPEN SHORT | cooldown_until={self._open_failure_cooldown_until} "
-        f"now={now} remaining={self._open_failure_cooldown_until - now}"
-    )
-
-    if now < self._open_failure_cooldown_until:
-        logger.error("[DEBUG] BLOCKED BY COOLDOWN")
-        return
-
-    logger.error("[DEBUG] PASSED COOLDOWN → GO OPEN SHORT")
-
-    await self._open_short_position(binance_price)
                     # Проверяем cooldown
                     now = time.time()
                     if now < self._open_failure_cooldown_until:
@@ -1045,7 +1030,7 @@ class FlipSession:
     async def _open_short_position(self, binance_price: float):
         """Открыть шорт позицию на MEXC"""
         try:
-            logger.error("[DEBUG] ENTERED _open_short_position")
+            # Проверяем дневные лимиты
             today_count = await self.db.get_today_flip_count(self.user_id)
             if today_count >= self.settings.max_daily_flips:
                 logger.info(f"[FlipSession] Daily flip limit reached for user {self.user_id}: {today_count}/{self.settings.max_daily_flips}")
@@ -1080,7 +1065,6 @@ class FlipSession:
                 return
 
             logger.info(f"[FlipSession] PLACING SHORT order: user={self.user_id} symbol={self.symbol} qty={quantity:.6f} margin=${margin_usd:.2f} position=${position_size:.0f} ({self.settings.leverage}x) mode={'TEST' if self.settings.test_mode else 'REAL'}")
-            logger.error(f"[DEBUG] SENDING ORDER: symbol={self.symbol} qty={quantity}")
             result = await self.mexc_api.open_short(self.symbol, quantity)
 
             if not result.get('success'):
