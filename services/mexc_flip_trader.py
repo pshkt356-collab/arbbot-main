@@ -42,6 +42,9 @@ class BinancePriceTracker:
 
     async def start(self):
         """Запуск WebSocket подключения к Binance"""
+        if self.running:
+            logger.warning("[PriceTracker] Already running, ignoring duplicate start")
+            return
         self.running = True
         logger.info(
             f"[PriceTracker] STARTING symbols={self.symbols} "
@@ -343,7 +346,7 @@ class MexcAPI:
     # ------------------------------------------------------------------
     def _private_get_url_and_headers(
         self, endpoint: str, business_params: dict
-    ) -> tuple[str, dict]:
+    ) -> tuple[str, dict, dict]:
         """
         Для GET-запросов:
           • сортируем бизнес-параметры по ключу
@@ -533,6 +536,83 @@ class MexcAPI:
             logger.error(f"Close long error: {e}")
             return {'success': False, 'error': str(e)}
 
+
+    async def open_short(self, symbol: str, quantity: float) -> dict:
+        """Открыть шорт позицию (side=3 = Open Short)"""
+        if not self.api_key or not self.api_secret:
+            return self._emulate_order(symbol, "SELL", quantity)
+
+        session = await self._get_session()
+        try:
+            mexc_symbol = f"{symbol.upper()}_USDT"
+            body = {
+                "symbol": mexc_symbol,
+                "side": 3,  # 3 = Open Short
+                "vol": quantity,
+                "type": 5,  # 5 = Market order
+                "openType": 1,  # isolated margin
+            }
+            url, headers, json_body = self._private_post_url_headers_body(
+                "/api/v1/private/order/create", body
+            )
+
+            async with session.post(url, data=json_body, headers=headers) as resp:
+                data = await resp.json()
+                if data.get('success') or data.get('code') == 0:
+                    result = data.get('data', {})
+                    logger.info(f"Short opened: {symbol} qty={quantity}")
+                    return {
+                        'success': True,
+                        'order_id': result.get('orderId', ''),
+                        'price': float(result.get('price', 0) or 0),
+                        'quantity': quantity
+                    }
+                else:
+                    err = self._handle_api_error(data)
+                    logger.error(f"Open short failed: {err.get('error')}")
+                    return err
+        except Exception as e:
+            logger.error(f"Open short error: {e}")
+            return {'success': False, 'error': str(e)}
+
+    async def close_short(self, symbol: str, quantity: float) -> dict:
+        """Закрыть шорт позицию (side=2 = Close Short)"""
+        if not self.api_key or not self.api_secret:
+            return self._emulate_order(symbol, "BUY", quantity)
+
+        session = await self._get_session()
+        try:
+            mexc_symbol = f"{symbol.upper()}_USDT"
+            body = {
+                "symbol": mexc_symbol,
+                "side": 2,  # 2 = Close Short
+                "vol": quantity,
+                "type": 5,  # Market order
+                "openType": 1,
+            }
+            url, headers, json_body = self._private_post_url_headers_body(
+                "/api/v1/private/order/create", body
+            )
+
+            async with session.post(url, data=json_body, headers=headers) as resp:
+                data = await resp.json()
+                if data.get('success') or data.get('code') == 0:
+                    result = data.get('data', {})
+                    logger.info(f"Short closed: {symbol} qty={quantity}")
+                    return {
+                        'success': True,
+                        'order_id': result.get('orderId', ''),
+                        'price': float(result.get('price', 0) or 0),
+                        'quantity': quantity
+                    }
+                else:
+                    err = self._handle_api_error(data)
+                    logger.error(f"Close short failed: {err.get('error')}")
+                    return err
+        except Exception as e:
+            logger.error(f"Close short error: {e}")
+            return {'success': False, 'error': str(e)}
+
     async def get_position(self, symbol: str) -> dict:
         """Получить текущую позицию"""
         if not self.api_key or not self.api_secret:
@@ -546,7 +626,7 @@ class MexcAPI:
                 "/api/v1/private/position/open_positions", {}
             )
 
-            async with session.get(url, headers=headers) as resp:
+            async with session.get(url, headers=headers, params=sorted_params) as resp:
                 data = await resp.json()
                 if data.get('success') or data.get('code') == 0:
                     positions = data.get('data', [])
@@ -587,7 +667,7 @@ class MexcAPI:
                 "/api/v1/private/account/assets", {}
             )
 
-            async with session.get(url, headers=headers) as resp:
+            async with session.get(url, headers=headers, params=sorted_params) as resp:
                 data = await resp.json()
                 if data.get('success') or data.get('code') == 0:
                     assets = data.get('data', [])
@@ -696,6 +776,11 @@ class FlipSession:
         self._opened_at: Optional[str] = None
         # Cooldown после неудачной попытки открытия позиции (чтобы не спамить API)
         self._open_failure_cooldown_until: float = 0.0
+        # Stop-loss, take-profit, time limit settings
+        self.stop_loss_pct: float = 2.0       # 2% stop loss
+        self.take_profit_pct: float = 5.0    # 5% take profit
+        self.max_position_duration_sec: int = 300  # 5 min max
+        self.current_direction: Optional[str] = None
 
     async def _on_price_signal(self, user_id: int, symbol: str, direction: str, price: float):
         """Callback для подписки на ценовые сигналы."""
@@ -711,6 +796,10 @@ class FlipSession:
             f"margin=${self.settings.position_size_usd} position=${self.settings.position_size_usd * self.settings.leverage} "
             f"close_on_reverse={self.settings.close_on_reverse}"
         )
+
+        # Подписываемся на ценовые сигналы
+        # Восстанавливаем открытую позицию из БД
+        await self._load_open_position()
 
         # Подписываемся на ценовые сигналы
         self.price_tracker.subscribe_to_signals(
@@ -740,6 +829,9 @@ class FlipSession:
                         heartbeat_counter = 0
                         pos_status = "OPEN" if self.has_open_position else "flat"
                         latest_price = self.price_tracker.get_latest_price(self.symbol)
+                        # Проверка SL/TP/time limit
+                        if self.has_open_position:
+                            await self._check_sl_tp_time()
                         pos_size = self.settings.position_size_usd * self.settings.leverage
                         logger.info(
                             f"[FlipSession] HEARTBEAT user={self.user_id} symbol={self.symbol} "
@@ -795,7 +887,19 @@ class FlipSession:
                         return
                     logger.info(f"[FlipSession] OPENING long: user={self.user_id}, symbol={self.symbol}, trigger_price={binance_price:.4f}")
                     await self._open_position(binance_price)
-                elif direction == 'down' and self.has_open_position and self.settings.close_on_reverse:
+                elif direction == 'up' and self.has_open_position and self.current_direction == 'short':
+                    logger.info(f"[FlipSession] CLOSING short (reverse signal): user={self.user_id}, symbol={self.symbol}, trigger_price={binance_price:.4f}")
+                    await self._close_position("reverse")
+                elif direction == 'down' and not self.has_open_position:
+                    # Проверяем cooldown
+                    now = time.time()
+                    if now < self._open_failure_cooldown_until:
+                        remaining = int(self._open_failure_cooldown_until - now)
+                        logger.debug(f"[FlipSession] OPEN COOLDOWN user={self.user_id} symbol={self.symbol}: {remaining}s remaining")
+                        return
+                    logger.info(f"[FlipSession] OPENING short: user={self.user_id}, symbol={self.symbol}, trigger_price={binance_price:.4f}")
+                    await self._open_short_position(binance_price)
+                elif direction == 'down' and self.has_open_position and self.current_direction == 'long' and self.settings.close_on_reverse:
                     logger.info(f"[FlipSession] CLOSING long (reverse signal): user={self.user_id}, symbol={self.symbol}, trigger_price={binance_price:.4f}")
                     await self._close_position("reverse")
                 else:
@@ -896,6 +1000,7 @@ class FlipSession:
 
             self.current_trade_id = await self.db.add_flip_trade(trade)
             self.trades_count += 1
+            self._open_failure_cooldown_until = time.time() + 10  # 10s cooldown after success
 
             pos_size = self.settings.position_size_usd * self.settings.leverage
             logger.info(
@@ -909,6 +1014,85 @@ class FlipSession:
         except Exception as e:
             logger.error(f"Open position error: user={self.user_id}, symbol={self.symbol}: {e}")
 
+
+    async def _open_short_position(self, binance_price: float):
+        """Открыть шорт позицию на MEXC"""
+        try:
+            # Проверяем дневные лимиты
+            today_count = await self.db.get_today_flip_count(self.user_id)
+            if today_count >= self.settings.max_daily_flips:
+                logger.info(f"[FlipSession] Daily flip limit reached for user {self.user_id}: {today_count}/{self.settings.max_daily_flips}")
+                return
+
+            today_pnl = await self.db.get_today_flip_pnl(self.user_id)
+            if today_pnl <= -self.settings.max_daily_loss_usd:
+                logger.info(f"[FlipSession] Daily loss limit reached for user {self.user_id}: ${today_pnl:.2f}")
+                return
+
+            margin_usd = self.settings.position_size_usd
+            position_size = margin_usd * self.settings.leverage
+
+            if not self.settings.test_mode:
+                bal = await self.mexc_api.get_balance()
+                if not bal.get('success'):
+                    err = bal.get('error', 'Unknown balance error')
+                    logger.error(f"[FlipSession] BALANCE CHECK FAILED user={self.user_id}: {err}")
+                    return
+                available = bal.get('available', 0)
+                if available < margin_usd:
+                    logger.error(f"[FlipSession] INSUFFICIENT MARGIN user={self.user_id}: available=${available:.2f}, margin_required=${margin_usd:.2f}")
+                    self._open_failure_cooldown_until = time.time() + 60
+                    return
+
+            # Рассчитываем количество
+            quantity = position_size / binance_price
+            quantity = float(Decimal(str(quantity)).quantize(Decimal('0.001'), rounding=ROUND_DOWN))
+
+            if quantity <= 0:
+                logger.warning(f"[FlipSession] Invalid quantity for {self.symbol}: {quantity}")
+                return
+
+            logger.info(f"[FlipSession] PLACING SHORT order: user={self.user_id} symbol={self.symbol} qty={quantity:.6f} margin=${margin_usd:.2f} position=${position_size:.0f} ({self.settings.leverage}x) mode={'TEST' if self.settings.test_mode else 'REAL'}")
+            result = await self.mexc_api.open_short(self.symbol, quantity)
+
+            if not result.get('success'):
+                err_msg = result.get('error', 'Unknown error')
+                logger.error(f"[FlipSession] OPEN SHORT FAILED user={self.user_id} symbol={self.symbol}: {err_msg}")
+                self._open_failure_cooldown_until = time.time() + 60
+                return
+
+            entry_price = result.get('price', binance_price)
+            self.entry_price = entry_price
+            self.entry_binance_price = binance_price
+            self.has_open_position = True
+            self.current_direction = 'short'
+
+            now_utc = datetime.now(timezone.utc)
+            self._opened_at = now_utc.isoformat()
+
+            trade = FlipTrade(
+                user_id=self.user_id,
+                symbol=self.symbol,
+                direction='short',
+                entry_price=entry_price,
+                leverage=self.settings.leverage,
+                position_size_usd=self.settings.position_size_usd,
+                quantity=quantity,
+                status='open',
+                binance_entry_price=binance_price,
+                opened_at=self._opened_at,
+                metadata={'test_mode': self.settings.test_mode}
+            )
+
+            self.current_trade_id = await self.db.add_flip_trade(trade)
+            self.trades_count += 1
+            self._open_failure_cooldown_until = time.time() + 10  # 10s cooldown after success
+
+            logger.info(f"[FlipSession] SHORT OPENED #{self.current_trade_id}: {self.symbol} @{entry_price:.4f} (Binance: {binance_price:.4f}) qty={quantity:.4f} margin=${margin_usd:.2f} position=${position_size:.0f} ({self.settings.leverage}x) test={self.settings.test_mode} [user={self.user_id}]")
+
+        except Exception as e:
+            logger.error(f"Open short position error: user={self.user_id}, symbol={self.symbol}: {e}")
+
     async def _close_position(self, reason: str):
         """Закрыть лонг позицию на MEXC"""
         if not self.has_open_position or not self.current_trade_id:
@@ -919,7 +1103,9 @@ class FlipSession:
             binance_price = self.price_tracker.get_latest_price(self.symbol)
 
             # Рассчитываем количество для закрытия
-            quantity = self.settings.position_size_usd / self.entry_price
+            # Рассчитываем количество: position_size = margin * leverage
+            position_size = self.settings.position_size_usd * self.settings.leverage
+            quantity = position_size / self.entry_price
             quantity = float(Decimal(str(quantity)).quantize(Decimal('0.001'), rounding=ROUND_DOWN))
 
             if quantity <= 0:
@@ -929,7 +1115,11 @@ class FlipSession:
                 f"[FlipSession] PLACING CLOSE order: user={self.user_id} symbol={self.symbol} "
                 f"qty={quantity:.6f} reason={reason} mode={'TEST' if self.settings.test_mode else 'REAL'}"
             )
-            result = await self.mexc_api.close_long(self.symbol, quantity)
+            # Закрываем в зависимости от направления
+            if self.current_direction == 'short':
+                result = await self.mexc_api.close_short(self.symbol, quantity)
+            else:
+                result = await self.mexc_api.close_long(self.symbol, quantity)
 
             if not result.get('success'):
                 err_msg = result.get('error', 'Unknown error')
@@ -942,7 +1132,13 @@ class FlipSession:
             # Рассчитываем PnL
             # Для лонга: PnL = (exit - entry) / entry * leverage * position_size
             if self.entry_price > 0:
-                price_change_pct = (exit_price - self.entry_price) / self.entry_price * 100
+                # Рассчитываем PnL с учетом направления
+                if self.current_direction == 'short':
+                    # Для шорта: прибыль когда цена падает
+                    price_change_pct = (self.entry_price - exit_price) / self.entry_price * 100
+                else:
+                    # Для лонга: прибыль когда цена растет
+                    price_change_pct = (exit_price - self.entry_price) / self.entry_price * 100
             else:
                 price_change_pct = 0
 
@@ -986,10 +1182,70 @@ class FlipSession:
             self.current_trade_id = None
             self.entry_price = 0.0
             self.entry_binance_price = 0.0
+            self.current_direction = None
             self._opened_at = None
 
         except Exception as e:
             logger.error(f"Close position error: user={self.user_id}, symbol={self.symbol}: {e}")
+
+
+    async def _load_open_position(self):
+        """Загрузить открытую позицию из БД при старте"""
+        try:
+            open_trades = await self.db.get_open_flip_trades(self.user_id)
+            for trade in open_trades:
+                if trade.symbol == self.symbol and trade.status == 'open':
+                    self.has_open_position = True
+                    self.current_trade_id = trade.id
+                    self.current_direction = trade.direction
+                    self.entry_price = trade.entry_price
+                    self.entry_binance_price = trade.binance_entry_price
+                    self._opened_at = trade.opened_at
+                    logger.info(f"[FlipSession] RESTORED position: {self.symbol} #{trade.id} dir={trade.direction}")
+                    return
+        except Exception as e:
+            logger.error(f"[FlipSession] Error loading open position: {e}")
+
+    async def _check_sl_tp_time(self):
+        """Проверка stop-loss, take-profit и time limit для открытой позиции"""
+        if not self.has_open_position or not self.entry_price > 0:
+            return
+
+        current_price = self.price_tracker.get_latest_price(self.symbol)
+        if current_price <= 0:
+            return
+
+        # Расчет изменения цены
+        if self.current_direction == 'long':
+            price_change_pct = (current_price - self.entry_price) / self.entry_price * 100
+        elif self.current_direction == 'short':
+            price_change_pct = (self.entry_price - current_price) / self.entry_price * 100
+        else:
+            return
+
+        # Проверка stop loss
+        if price_change_pct <= -self.stop_loss_pct:
+            logger.info(f"[FlipSession] STOP LOSS triggered: {self.symbol} {price_change_pct:.2f}%")
+            await self._close_position("stop_loss")
+            return
+
+        # Проверка take profit
+        if price_change_pct >= self.take_profit_pct:
+            logger.info(f"[FlipSession] TAKE PROFIT triggered: {self.symbol} {price_change_pct:.2f}%")
+            await self._close_position("take_profit")
+            return
+
+        # Проверка time limit
+        if self._opened_at:
+            try:
+                opened_dt = datetime.fromisoformat(self._opened_at.replace('Z', '+00:00'))
+                elapsed_sec = (datetime.now(timezone.utc) - opened_dt).total_seconds()
+                if elapsed_sec >= self.max_position_duration_sec:
+                    logger.info(f"[FlipSession] TIME LIMIT reached: {self.symbol} {elapsed_sec:.0f}s")
+                    await self._close_position("time_limit")
+                    return
+            except (ValueError, TypeError):
+                pass
 
     async def close(self):
         """Закрыть сессию"""

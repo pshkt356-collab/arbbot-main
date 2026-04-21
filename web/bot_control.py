@@ -19,7 +19,8 @@ def render_user_management():
     """Управление пользователями"""
     st.header("👥 Управление пользователями")
 
-    db = Database()
+    from config import settings
+    db = Database(settings.db_file)
 
     # В реальности здесь должен быть метод get_all_users()
     # Пока показываем заглушку

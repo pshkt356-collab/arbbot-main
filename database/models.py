@@ -1,12 +1,89 @@
 import aiosqlite
 import json
 import asyncio
+import os
+import base64
 from datetime import datetime
 from dataclasses import dataclass, asdict, field
 from typing import Optional, List, Dict, Any, Union
 import logging
 
+from cryptography.fernet import Fernet
+
 logger = logging.getLogger(__name__)
+
+class ApiKeyEncryption:
+    """Шифрование/дешифрование API ключей через Fernet"""
+    _instance = None
+    _fernet = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            key = os.environ.get('API_ENCRYPTION_KEY')
+            if key:
+                # Убедимся что ключ в правильном формате для Fernet (32 bytes, base64-encoded)
+                try:
+                    cls._instance._fernet = Fernet(key.encode())
+                except Exception:
+                    # Если ключ невалидный — генерируем из него валидный
+                    import hashlib
+                    derived_key = base64.urlsafe_b64encode(hashlib.sha256(key.encode()).digest())
+                    cls._instance._fernet = Fernet(derived_key)
+            else:
+                logger.warning("API_ENCRYPTION_KEY not set — API keys will be stored UNENCRYPTED!")
+        return cls._instance
+
+    def encrypt(self, value: str) -> str:
+        if not value or not self._fernet:
+            return value
+        try:
+            return self._fernet.encrypt(value.encode()).decode()
+        except Exception:
+            return value
+
+    def decrypt(self, value: str) -> str:
+        if not value or not self._fernet:
+            return value
+        try:
+            return self._fernet.decrypt(value.encode()).decode()
+        except Exception:
+            # Если не удалось расшифровать — возможно значение не зашифровано
+            return value
+
+    def encrypt_dict(self, data: dict) -> dict:
+        """Шифрует api_key и api_secret внутри словаря"""
+        if not self._fernet or not data:
+            return data
+        result = {}
+        for key, value in data.items():
+            if isinstance(value, dict):
+                result[key] = {}
+                for k, v in value.items():
+                    if k in ('api_key', 'api_secret', 'password') and v and isinstance(v, str):
+                        result[key][k] = self.encrypt(v)
+                    else:
+                        result[key][k] = v
+            else:
+                result[key] = value
+        return result
+
+    def decrypt_dict(self, data: dict) -> dict:
+        """Расшифровывает api_key и api_secret внутри словаря"""
+        if not self._fernet or not data:
+            return data
+        result = {}
+        for key, value in data.items():
+            if isinstance(value, dict):
+                result[key] = {}
+                for k, v in value.items():
+                    if k in ('api_key', 'api_secret', 'password') and v and isinstance(v, str):
+                        result[key][k] = self.decrypt(v)
+                    else:
+                        result[key][k] = v
+            else:
+                result[key] = value
+        return result
 
 @dataclass
 class UserSettings:
@@ -222,20 +299,33 @@ class Database:
     _instance: Optional['Database'] = None
     _singleton_lock = asyncio.Lock()
 
-    def __new__(cls, db_path: str = 'arbitrage_bot.db'):
+    def __new__(cls, db_path: str = None):
+        if db_path is None:
+            from config import settings
+            db_path = settings.db_file
+
         if cls._instance is not None:
             return cls._instance
 
-        instance = super().__new__(cls)
-        instance._initialized = False
-        instance._db_path = db_path
-        instance._conn = None
-        instance._conn_lock = asyncio.Lock()
-        instance._query_lock = asyncio.Lock()
-        instance._init_lock = asyncio.Lock()
+        # Блокируем создание нескольких инстансов
+        # Note: __new__ не может быть async, используем синхронный lock
+        import threading
+        _thread_lock = threading.Lock()
+        with _thread_lock:
+            if cls._instance is not None:
+                return cls._instance
 
-        cls._instance = instance
-        return instance
+            instance = super().__new__(cls)
+            instance._initialized = False
+            instance._db_path = db_path
+            instance._conn = None
+            instance._conn_lock = asyncio.Lock()
+            instance._query_lock = asyncio.Lock()
+            instance._init_lock = asyncio.Lock()
+            instance._key_enc = ApiKeyEncryption()
+
+            cls._instance = instance
+            return instance
 
     async def initialize(self):
         """Инициализация БД с проверкой на повторный вызов"""
@@ -570,7 +660,7 @@ class Database:
                 return UserSettings(
                     user_id=row['user_id'],
                     is_trading_enabled=bool(row['is_trading_enabled']),
-                    api_keys=json.loads(row['api_keys']),
+                    api_keys=self._key_enc.decrypt_dict(json.loads(row['api_keys'])),
                     commission_rates=json.loads(row['commission_rates']),
                     alert_settings=json.loads(row['alert_settings']),
                     risk_settings=json.loads(row['risk_settings']),
@@ -613,7 +703,7 @@ class Database:
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     user_id,
-                    json.dumps(user.api_keys),
+                    json.dumps(self._key_enc.encrypt_dict(user.api_keys)),
                     json.dumps(user.commission_rates),
                     json.dumps(user.alert_settings),
                     json.dumps(user.risk_settings),
@@ -659,7 +749,7 @@ class Database:
                     users.append(UserSettings(
                         user_id=row['user_id'],
                         is_trading_enabled=bool(row['is_trading_enabled']),
-                        api_keys=json.loads(row['api_keys']),
+                        api_keys=self._key_enc.decrypt_dict(json.loads(row['api_keys'])),
                         commission_rates=json.loads(row['commission_rates']),
                         alert_settings=json.loads(row['alert_settings']),
                         risk_settings=json.loads(row['risk_settings']),
@@ -713,7 +803,7 @@ class Database:
                 WHERE user_id = ?
             """, (
                 int(user.is_trading_enabled),
-                json.dumps(user.api_keys),
+                json.dumps(self._key_enc.encrypt_dict(user.api_keys)),
                 json.dumps(user.commission_rates),
                 json.dumps(user.alert_settings),
                 json.dumps(user.risk_settings),
@@ -966,8 +1056,8 @@ class Database:
                     min_price_movement_pct=row['min_price_movement_pct'] if row['min_price_movement_pct'] is not None else 0.01,
                     close_on_reverse=bool(row['close_on_reverse']) if row['close_on_reverse'] is not None else True,
                     test_mode=bool(row['test_mode']) if row['test_mode'] is not None else True,
-                    mexc_api_key=row['mexc_api_key'] if 'mexc_api_key' in row.keys() and row['mexc_api_key'] is not None else '',
-                    mexc_api_secret=row['mexc_api_secret'] if 'mexc_api_secret' in row.keys() and row['mexc_api_secret'] is not None else '',
+                    mexc_api_key=self._key_enc.decrypt(row['mexc_api_key']) if 'mexc_api_key' in row.keys() and row['mexc_api_key'] is not None else '',
+                    mexc_api_secret=self._key_enc.decrypt(row['mexc_api_secret']) if 'mexc_api_secret' in row.keys() and row['mexc_api_secret'] is not None else '',
                     created_at=row['created_at'],
                     updated_at=row['updated_at']
                 )
@@ -991,7 +1081,7 @@ class Database:
                     settings.leverage, settings.position_size_usd, settings.max_daily_flips,
                     settings.max_daily_loss_usd, settings.min_price_movement_pct,
                     int(settings.close_on_reverse), int(settings.test_mode),
-                    settings.mexc_api_key, settings.mexc_api_secret
+                    self._key_enc.encrypt(settings.mexc_api_key), self._key_enc.encrypt(settings.mexc_api_secret)
                 ))
                 await self._conn.commit()
                 logger.info(f"Created flip settings for user {user_id}")
@@ -1017,7 +1107,7 @@ class Database:
                 settings.leverage, settings.position_size_usd, settings.max_daily_flips,
                 settings.max_daily_loss_usd, settings.min_price_movement_pct,
                 int(settings.close_on_reverse), int(settings.test_mode),
-                settings.mexc_api_key, settings.mexc_api_secret,
+                self._key_enc.encrypt(settings.mexc_api_key), self._key_enc.encrypt(settings.mexc_api_secret),
                 settings.user_id
             ))
             await self._conn.commit()

@@ -17,7 +17,24 @@ class UserRateLimiter(BaseMiddleware):
         self.requests: Dict[int, list] = {}
         self.locks: Dict[int, asyncio.Lock] = {}
         self.cooldowns: Dict[str, float] = {}
+        self._cleanup_interval = 300  # 5 minutes
+        self._last_cleanup = time.time()
         
+    def _cleanup_old_entries(self):
+        """Очистка старых записей пользователей"""
+        now = time.time()
+        if now - self._last_cleanup < self._cleanup_interval:
+            return
+        self._last_cleanup = now
+        cutoff = now - 600  # 10 minutes
+        expired_users = [uid for uid, times in self.requests.items()
+                         if not times or max(times) < cutoff]
+        for uid in expired_users:
+            del self.requests[uid]
+            self.locks.pop(uid, None)
+        if expired_users:
+            logger.debug(f"RateLimiter: cleaned up {len(expired_users)} expired entries")
+
     def _get_lock(self, user_id: int) -> asyncio.Lock:
         if user_id not in self.locks:
             self.locks[user_id] = asyncio.Lock()
@@ -60,6 +77,8 @@ class UserRateLimiter(BaseMiddleware):
         else:
             return await handler(event, data)
         
+        self._cleanup_old_entries()
+
         if not self._check_rate_limit(user_id):
             logger.warning(f"Rate limit exceeded for user {user_id}")
             if isinstance(event, Message):

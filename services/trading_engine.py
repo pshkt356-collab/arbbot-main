@@ -2,6 +2,7 @@ import asyncio
 import ccxt.async_support as ccxt
 import time
 import uuid
+import random
 import logging
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
@@ -202,9 +203,8 @@ class TradingEngine:
 
     async def _open_test_trade(self, user: UserSettings, symbol: str, long_ex: str, short_ex: str,
                               buy_pd, sell_pd, entry_spread: float, db: Database, strategy: str, correlation_id: str) -> TradeResult:
-        import random
 
-        size_usd = min(user.risk_settings.get('max_position_usd', 10000), 1000)
+        size_usd = user.risk_settings.get('max_position_usd', 10000)
 
         slippage_long = random.uniform(0.0001, 0.001)
         slippage_short = random.uniform(0.0001, 0.001)
@@ -294,7 +294,7 @@ class TradingEngine:
             if not await self._check_circuit_breaker(long_ex) or not await self._check_circuit_breaker(short_ex):
                 return TradeResult(success=False, error="Circuit breaker active", correlation_id=correlation_id)
 
-            size_usd = min(user.risk_settings.get('max_position_usd', 10000), 1000)
+            size_usd = user.risk_settings.get('max_position_usd', 10000)
 
             exchange_long = None
             exchange_short = None
@@ -783,18 +783,49 @@ class TradingEngine:
     async def open_single_exchange_trade(self, user: UserSettings, symbol: str, exchange_id: str,
                                          side: str, size_usd: float, test_mode: bool = True) -> TradeResult:
         """Открыть позицию только на одной бирже (лонг или шорт) — прокси на PositionMonitor"""
-        pm = PositionMonitor(self)
-        return await pm.open_single_exchange_trade(user, symbol, exchange_id, side, size_usd, test_mode)
+        db = Database(settings.db_file)
+        await db.initialize()
+        try:
+            pm = PositionMonitor(
+                trade=Trade(user_id=user.user_id, symbol=symbol, strategy=f'single_{side}',
+                       long_exchange=exchange_id if side == 'long' else '',
+                       short_exchange=exchange_id if side == 'short' else '',
+                       size_usd=size_usd, status='open'),
+                user=user, db=db, engine=self
+            )
+            return await pm.open_single_exchange_trade(user, symbol, exchange_id, side, size_usd, test_mode)
+        finally:
+            await db.close()
 
     async def modify_sl_tp(self, trade_id: int, user: UserSettings, stop_loss: float = None, take_profit: float = None) -> TradeResult:
         """Изменить стоп-лосс и/или тейк-профит — прокси на PositionMonitor"""
-        pm = PositionMonitor(self)
-        return await pm.modify_sl_tp(trade_id, user, stop_loss, take_profit)
+        monitor_key = f"{user.user_id}:{trade_id}"
+        async with self.monitors_lock:
+            if monitor_key in self.active_monitors:
+                monitor = self.active_monitors[monitor_key]
+                return await monitor.modify_sl_tp(trade_id, user, stop_loss, take_profit)
+        db = Database(settings.db_file)
+        await db.initialize()
+        try:
+            pm = PositionMonitor(Trade(id=trade_id, user_id=user.user_id), user, db, self)
+            return await pm.modify_sl_tp(trade_id, user, stop_loss, take_profit)
+        finally:
+            await db.close()
 
     async def partial_close(self, trade_id: int, user: UserSettings, percentage: float) -> TradeResult:
         """Частичное закрытие позиции — прокси на PositionMonitor"""
-        pm = PositionMonitor(self)
-        return await pm.partial_close(trade_id, user, percentage)
+        monitor_key = f"{user.user_id}:{trade_id}"
+        async with self.monitors_lock:
+            if monitor_key in self.active_monitors:
+                monitor = self.active_monitors[monitor_key]
+                return await monitor.partial_close(trade_id, user, percentage)
+        db = Database(settings.db_file)
+        await db.initialize()
+        try:
+            pm = PositionMonitor(Trade(id=trade_id, user_id=user.user_id), user, db, self)
+            return await pm.partial_close(trade_id, user, percentage)
+        finally:
+            await db.close()
 
 
 class PositionMonitor:
@@ -892,6 +923,24 @@ class PositionMonitor:
                 await self._close_position("trailing_stop")
                 return
 
+            # Trailing stop для шорта
+            if self.trade.trailing_enabled and self._min_price_seen_short < float('inf') and self._min_price_seen_short < self.trade.entry_price_short:
+                trailing_dist = self.user.risk_settings.get('trailing_stop_distance', 10)
+                short_runup = (self.trade.entry_price_short - self._min_price_seen_short) / self.trade.entry_price_short * 100
+                if short_runup > trailing_dist:
+                    trail_distance = self._min_price_seen_short * trailing_dist / 100
+                    new_stop = self._min_price_seen_short + trail_distance
+                    if self.trade.trailing_stop_price == 0 or new_stop < self.trade.trailing_stop_price:
+                        self.trade.trailing_stop_price = new_stop
+                        await self.db.update_trade(self.trade)
+                        logger.info(f"Trailing stop (short) moved to {new_stop:.4f} for trade {self.trade.id}")
+                if self.trade.trailing_stop_price > 0 and self.trade.current_price_short >= self.trade.trailing_stop_price:
+                    await self._close_position("trailing_stop")
+                    return
+
+                await self._close_position("trailing_stop")
+                return
+
         if self.trade.current_price_long <= self.trade.emergency_stop_price:
             await self._close_position("emergency_stop")
             return
@@ -952,7 +1001,6 @@ class PositionMonitor:
             await db.close()
 
     async def _open_single_test_trade(self, user, symbol, exchange_id, side, size_usd, db, correlation_id):
-        import random
         size = min(size_usd, user.risk_settings.get('max_position_usd', 10000))
         if size < 10:
             size = 100

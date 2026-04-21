@@ -55,6 +55,8 @@ class ExchangeStatusChecker:
             self._check_binance(),
             self._check_bybit(),
             self._check_okx(),
+            self._check_whitebit(),
+            self._check_mexc(),
         ]
         await asyncio.gather(*tasks, return_exceptions=True)
     
@@ -142,6 +144,43 @@ class ExchangeStatusChecker:
                 next_check=datetime.now() + timedelta(seconds=self.check_interval)
             )
     
+
+    async def _check_whitebit(self):
+        try:
+            url = "https://api.whitebit.com/api/v4/public/status"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=5) as resp:
+                    is_up = resp.status == 200
+            self._statuses['whitebit'] = ExchangeHealth(
+                exchange_id='whitebit', is_operational=is_up, is_maintenance=False,
+                status_message='OK' if is_up else 'No response',
+                last_check=datetime.now(), next_check=datetime.now() + timedelta(seconds=self.check_interval)
+            )
+        except Exception as e:
+            self._statuses['whitebit'] = ExchangeHealth(
+                exchange_id='whitebit', is_operational=False, is_maintenance=False,
+                status_message=str(e)[:50], last_check=datetime.now(),
+                next_check=datetime.now() + timedelta(seconds=self.check_interval)
+            )
+
+    async def _check_mexc(self):
+        try:
+            url = "https://api.mexc.com/api/v3/ping"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=5) as resp:
+                    is_up = resp.status == 200
+            self._statuses['mexc'] = ExchangeHealth(
+                exchange_id='mexc', is_operational=is_up, is_maintenance=False,
+                status_message='OK' if is_up else 'No response',
+                last_check=datetime.now(), next_check=datetime.now() + timedelta(seconds=self.check_interval)
+            )
+        except Exception as e:
+            self._statuses['mexc'] = ExchangeHealth(
+                exchange_id='mexc', is_operational=False, is_maintenance=False,
+                status_message=str(e)[:50], last_check=datetime.now(),
+                next_check=datetime.now() + timedelta(seconds=self.check_interval)
+            )
+
     def is_exchange_available(self, exchange_id: str) -> bool:
         status = self._statuses.get(exchange_id.lower())
         if not status:

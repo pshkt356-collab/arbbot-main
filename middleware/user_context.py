@@ -40,7 +40,8 @@ class UserContextMiddleware(BaseMiddleware):
             # Используем переданный экземпляр или создаем новый
             db = self._db
             if db is None:
-                db = Database()
+                from config import settings
+                db = Database(settings.db_file)
 
             # Проверяем что db не None и инициализируем если нужно
             if db is None:

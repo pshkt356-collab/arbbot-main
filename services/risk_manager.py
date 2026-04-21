@@ -22,7 +22,8 @@ class RiskCheck:
 
 class RiskManager:
     def __init__(self, check_interval: int = 30):
-        self.db = Database('arbitrage_bot.db')
+        from config import settings
+        self.db = Database(settings.db_file)
         self.check_interval = check_interval
         self.running = False
         self.user_risk_settings: Dict[int, dict] = {}
@@ -43,11 +44,50 @@ class RiskManager:
         """Проверка всех открытых позиций"""
         try:
             await self.db.initialize()
-            # Получаем все открытые сделки из всех пользователей
-            # Упрощенная реализация - в реальности нужен метод get_all_open_trades
-            pass
+            async with self.db._conn.execute(
+                "SELECT DISTINCT user_id FROM trades WHERE status = 'open'"
+            ) as cursor:
+                rows = await cursor.fetchall()
+            for row in rows:
+                await self._check_user_positions(row['user_id'])
         except Exception as e:
             logger.error(f"Error checking positions: {e}")
+
+    async def _check_user_positions(self, user_id: int):
+        """Проверка позиций конкретного пользователя"""
+        try:
+            user = await self.db.get_user(user_id)
+            if not user:
+                return
+            open_trades = await self.db.get_open_trades(user_id)
+            if not open_trades:
+                return
+            total_pnl = sum((t.pnl_usd or 0) for t in open_trades)
+            daily_loss_limit = user.risk_settings.get('max_daily_loss_usd', 500)
+            if total_pnl <= -daily_loss_limit:
+                logger.warning(f"RiskManager: Daily loss limit reached for user {user_id}: ${total_pnl:.2f}")
+            max_positions = user.risk_settings.get('max_open_positions', 5)
+            if len(open_trades) >= max_positions:
+                logger.warning(f"RiskManager: Max positions reached for user {user_id}: {len(open_trades)}/{max_positions}")
+            symbol_counts = {}
+            for t in open_trades:
+                symbol_counts[t.symbol] = symbol_counts.get(t.symbol, 0) + 1
+            for symbol, count in symbol_counts.items():
+                if count >= 3:
+                    logger.warning(f"RiskManager: Concentration risk for {symbol}: {count} positions")
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc)
+            max_hours = user.risk_settings.get('max_position_hours', 24)
+            for trade in open_trades:
+                try:
+                    opened_at = datetime.fromisoformat(trade.opened_at.replace('Z', '+00:00'))
+                    hours_open = (now - opened_at).total_seconds() / 3600
+                    if hours_open > max_hours:
+                        logger.warning(f"RiskManager: Position #{trade.id} open for {hours_open:.1f}h (limit: {max_hours}h)")
+                except (ValueError, TypeError):
+                    pass
+        except Exception as e:
+            logger.error(f"Error checking user {user_id} positions: {e}")
 
     def stop(self):
         self.running = False

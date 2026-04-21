@@ -29,6 +29,8 @@ class SQLiteStorage(BaseStorage):
         if self._db is None:
             self._db = await aiosqlite.connect(self.db_path)
             self._db.row_factory = aiosqlite.Row
+            await self._db.execute("PRAGMA journal_mode=WAL")
+            await self._db.execute("PRAGMA synchronous=NORMAL")
             await self._db.execute("""
                 CREATE TABLE IF NOT EXISTS fsm_states (
                     key TEXT PRIMARY KEY,
@@ -48,7 +50,7 @@ class SQLiteStorage(BaseStorage):
         db = await self._get_db()
         str_key = self._make_key(key)
         state_str = state.state if state else None
-        logger.info(f"[FSM STORAGE] set_state: key={str_key}, state={state_str}")
+        logger.debug(f"[FSM STORAGE] set_state: key={str_key}, state={state_str}")
 
         await db.execute(
             """INSERT INTO fsm_states (key, state, data) VALUES (?, ?, '{}')
@@ -56,7 +58,7 @@ class SQLiteStorage(BaseStorage):
             (str_key, state_str)
         )
         await db.commit()
-        logger.info(f"[FSM STORAGE] set_state committed: key={str_key}")
+        logger.debug(f"[FSM STORAGE] set_state committed: key={str_key}")
 
     async def get_state(self, key: StorageKey) -> Optional[str]:
         """Get state for a key"""
@@ -92,18 +94,18 @@ class SQLiteStorage(BaseStorage):
         ) as cursor:
             row = await cursor.fetchone()
             if row:
-                logger.info(f"[FSM STORAGE] get_data: key={str_key}, state={row['state']}, data={row['data']}")
+                logger.debug(f"[FSM STORAGE] get_data: key={str_key}, state={row['state']}, data={row['data']}")
                 if row['data']:
                     return json.loads(row['data'])
             else:
-                logger.info(f"[FSM STORAGE] get_data: key={str_key}, NO ROW FOUND")
+                logger.debug(f"[FSM STORAGE] get_data: key={str_key}, NO ROW FOUND")
             return {}
 
     async def update_data(self, key: StorageKey, data: Dict[str, Any]) -> None:
         """Update data for a key (merge with existing)"""
         db = await self._get_db()
         str_key = self._make_key(key)
-        logger.info(f"[FSM STORAGE] update_data: key={str_key}, new_data={data}")
+        logger.debug(f"[FSM STORAGE] update_data: key={str_key}, new_data={data}")
 
         # Get existing data
         async with db.execute(
@@ -113,11 +115,11 @@ class SQLiteStorage(BaseStorage):
             if row:
                 existing = json.loads(row['data']) if row['data'] else {}
                 current_state = row['state']
-                logger.info(f"[FSM STORAGE] update_data: existing data={existing}, state={current_state}")
+                logger.debug(f"[FSM STORAGE] update_data: existing data={existing}, state={current_state}")
             else:
                 existing = {}
                 current_state = None
-                logger.info(f"[FSM STORAGE] update_data: no existing row")
+                logger.debug(f"[FSM STORAGE] update_data: no existing row")
 
         # Merge and save
         existing.update(data)
@@ -129,7 +131,7 @@ class SQLiteStorage(BaseStorage):
             (str_key, current_state, data_json)
         )
         await db.commit()
-        logger.info(f"[FSM STORAGE] update_data committed: key={str_key}, merged_data={existing}")
+        logger.debug(f"[FSM STORAGE] update_data committed: key={str_key}, merged_data={existing}")
 
     async def close(self) -> None:
         """Close database connection"""
