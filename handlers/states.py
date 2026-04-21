@@ -749,8 +749,8 @@ async def process_flip_position_size(message: Message, state: FSMContext, user: 
 
     try:
         size = float(message.text.strip())
-        if size < 10 or size > 10000:
-            await message.answer("❌ Размер позиции должен быть от $10 до $10000. Попробуй снова:")
+        if size < 1 or size > 10000:
+            await message.answer("❌ Размер позиции должен быть от $1 до $10000. Попробуй снова:")
             return
 
         if db:
