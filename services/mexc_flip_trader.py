@@ -790,6 +790,18 @@ class FlipSession:
 
     async def run(self):
         """Основной цикл сессии"""
+        try:
+            await self._run_impl()
+        except Exception as e:
+            logger.error(f"[FlipSession] FATAL ERROR user={self.user_id} symbol={self.symbol}: {e}", exc_info=True)
+            # Гарантированная отписка при падении
+            try:
+                self.price_tracker.unsubscribe_from_signals(self.user_id, self.symbol)
+            except Exception:
+                pass
+
+    async def _run_impl(self):
+        """Реализация основного цикла сессии"""
         logger.info(
             f"[FlipSession] START user={self.user_id} symbol={self.symbol} "
             f"test_mode={self.settings.test_mode} leverage={self.settings.leverage}x "
@@ -1251,6 +1263,11 @@ class FlipSession:
         """Закрыть сессию"""
         logger.info(f"Closing FlipSession: user={self.user_id}, symbol={self.symbol}")
         self.is_running = False
+        # Явно отписываемся от сигналов (даже если run() еще не начался)
+        try:
+            self.price_tracker.unsubscribe_from_signals(self.user_id, self.symbol)
+        except Exception:
+            pass
         if self.has_open_position:
             await self._close_position("manual")
 
@@ -1469,7 +1486,15 @@ class FlipTrader:
                         db=self.db
                     )
                     self.active_sessions[key] = session
-                    asyncio.create_task(session.run())
+                    task = asyncio.create_task(session.run())
+                    # Логируем ошибки если задача падает
+                    def _on_task_done(t):
+                        if t.cancelled():
+                            return
+                        exc = t.exception()
+                        if exc:
+                            logger.error(f"[FlipTrader] Session task crashed: user={user_id}, symbol={symbol}: {exc}")
+                    task.add_done_callback(_on_task_done)
                     started_symbols.append(symbol.upper())
 
             position_size = flip_settings.position_size_usd * flip_settings.leverage
@@ -1495,15 +1520,40 @@ class FlipTrader:
     async def stop_user_session(self, user_id: int) -> dict:
         """Остановка всех сессий пользователя"""
         closed = []
+        symbols_to_remove = []
         async with self._sessions_lock:
             keys_to_remove = [k for k in self.active_sessions.keys() if k[0] == user_id]
             for key in keys_to_remove:
                 session = self.active_sessions.pop(key)
+                symbols_to_remove.append(key[1])
+                # Явно отписываем от сигналов до закрытия
+                try:
+                    self.price_tracker.unsubscribe_from_signals(user_id, key[1])
+                except Exception:
+                    pass
                 try:
                     await session.close()
                     closed.append(key[1])  # symbol
                 except Exception as e:
                     logger.error(f"Error closing session {key}: {e}")
+
+        # Удаляем символы из price tracker если больше никому не нужны
+        if self.price_tracker:
+            for sym in symbols_to_remove:
+                # Проверяем остались ли подписчики на этот символ
+                remaining = [s for s in self.price_tracker._signal_subscribers if s[2] == sym]
+                if not remaining:
+                    self.price_tracker.remove_symbols([sym])
+                    logger.info(f"[FlipTrader] Removed symbol {sym} from price tracker (no subscribers)")
+
+            # Если подписчиков не осталось — останавливаем price tracker
+            if not self.price_tracker._signal_subscribers:
+                logger.info("[FlipTrader] No signal subscribers left, stopping price tracker")
+                try:
+                    await self.price_tracker.stop()
+                except Exception as e:
+                    logger.error(f"Error stopping price tracker: {e}")
+                self.price_tracker = None
 
         # Закрываем per-user MEXC API
         async with self._apis_lock:
