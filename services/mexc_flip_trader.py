@@ -43,7 +43,10 @@ class BinancePriceTracker:
     async def start(self):
         """Запуск WebSocket подключения к Binance"""
         self.running = True
-        logger.info(f"Starting Binance price tracker for symbols: {self.symbols}")
+        logger.info(
+            f"[PriceTracker] STARTING symbols={self.symbols} "
+            f"window={self.window_size} tick_interval={settings.flip_tick_interval_ms}ms"
+        )
         self._tasks = [
             asyncio.create_task(self._ws_price_stream(), name="binance_ws"),
             asyncio.create_task(self._analyze_loop(), name="price_analyze"),
@@ -51,7 +54,7 @@ class BinancePriceTracker:
         try:
             await self._shutdown_event.wait()
         except asyncio.CancelledError:
-            pass
+            logger.info("[PriceTracker] Cancelled")
         finally:
             await self.stop()
 
@@ -152,18 +155,29 @@ class BinancePriceTracker:
                 for symbol in self.symbols:
                     direction = await self._detect_direction(symbol)
                     if direction:
+                        price = self.latest_prices.get(symbol, 0)
+                        subs = sum(1 for _, _, s in self._signal_subscribers if s == symbol)
+                        logger.info(
+                            f"[PriceTracker] SIGNAL {symbol}: direction={direction} "
+                            f"price={price:.4f} subscribers={subs}"
+                        )
                         # Отправляем сигнал подписчикам
+                        sent = 0
                         for callback, user_id, sub_symbol in self._signal_subscribers:
                             if sub_symbol == symbol:
                                 try:
-                                    await callback(user_id, symbol, direction, self.latest_prices.get(symbol, 0))
+                                    await callback(user_id, symbol, direction, price)
+                                    sent += 1
                                 except Exception as e:
-                                    logger.error(f"Signal callback error: {e}")
+                                    logger.error(f"[PriceTracker] Signal callback error for user={user_id}: {e}")
+                        if sent == 0 and subs > 0:
+                            logger.warning(f"[PriceTracker] No callbacks sent for {symbol} despite {subs} subscribers")
 
             except asyncio.CancelledError:
+                logger.info("[PriceTracker] Analyze loop cancelled")
                 break
             except Exception as e:
-                logger.error(f"Analyze loop error: {e}")
+                logger.error(f"[PriceTracker] Analyze loop error: {e}")
                 await asyncio.sleep(1)
 
     async def _detect_direction(self, symbol: str) -> Optional[str]:
@@ -196,8 +210,16 @@ class BinancePriceTracker:
             min_movement = settings.flip_min_price_movement_pct
 
             if change_pct > min_movement:
+                logger.info(
+                    f"[PriceTracker] DETECT UP {symbol}: change={change_pct:.4f}% "
+                    f"old_avg={old_avg:.4f} recent_avg={recent_avg:.4f}"
+                )
                 return 'up'
             elif change_pct < -min_movement:
+                logger.info(
+                    f"[PriceTracker] DETECT DOWN {symbol}: change={change_pct:.4f}% "
+                    f"old_avg={old_avg:.4f} recent_avg={recent_avg:.4f}"
+                )
                 return 'down'
 
             return None
@@ -209,14 +231,26 @@ class BinancePriceTracker:
     def subscribe_to_signals(self, callback: Callable, user_id: int, symbol: str):
         """Подписаться на сигналы направления"""
         self._signal_subscribers.append((callback, user_id, symbol.upper()))
-        logger.info(f"User {user_id} subscribed to {symbol.upper()} signals")
+        logger.info(f"[PriceTracker] SUBSCRIBE user={user_id} symbol={symbol.upper()} (total_subs={len(self._signal_subscribers)})")
 
     def unsubscribe(self, user_id: int):
-        """Отписать пользователя от сигналов"""
+        """Отписать пользователя от всех сигналов"""
+        before = len(self._signal_subscribers)
         self._signal_subscribers = [
             s for s in self._signal_subscribers if s[1] != user_id
         ]
-        logger.info(f"User {user_id} unsubscribed from all flip signals")
+        logger.info(f"[PriceTracker] UNSUBSCRIBE user={user_id} (removed={before - len(self._signal_subscribers)})")
+
+    def unsubscribe_from_signals(self, user_id: int, symbol: str):
+        """Отписать пользователя от сигналов по конкретному символу"""
+        before = len(self._signal_subscribers)
+        sym = symbol.upper()
+        self._signal_subscribers = [
+            s for s in self._signal_subscribers
+            if not (s[1] == user_id and s[2] == sym)
+        ]
+        removed = before - len(self._signal_subscribers)
+        logger.info(f"[PriceTracker] UNSUBSCRIBE user={user_id} symbol={sym} (removed={removed})")
 
     def add_symbols(self, new_symbols: List[str]):
         """Добавить новые символы для отслеживания (без перезапуска)"""
@@ -669,38 +703,61 @@ class FlipSession:
 
     async def run(self):
         """Основной цикл сессии"""
-        logger.info(f"FlipSession started: user={self.user_id}, symbol={self.symbol}")
+        logger.info(
+            f"[FlipSession] START user={self.user_id} symbol={self.symbol} "
+            f"test_mode={self.settings.test_mode} leverage={self.settings.leverage}x "
+            f"size=${self.settings.position_size_usd} close_on_reverse={self.settings.close_on_reverse}"
+        )
 
         # Подписываемся на ценовые сигналы
         self.price_tracker.subscribe_to_signals(
             self._on_price_signal, self.user_id, self.symbol
         )
+        logger.info(f"[FlipSession] Subscribed to price signals: user={self.user_id}, symbol={self.symbol}")
 
         try:
             # Устанавливаем плечо (если не тестовый режим)
             if not self.settings.test_mode:
+                logger.info(f"[FlipSession] Setting leverage {self.settings.leverage}x for {self.symbol}")
                 leverage_set = await self.mexc_api.set_leverage(self.symbol, self.settings.leverage)
-                if not leverage_set:
-                    logger.warning(f"Failed to set leverage for {self.symbol}, continuing anyway")
+                if leverage_set:
+                    logger.info(f"[FlipSession] Leverage set OK: {self.symbol} {self.settings.leverage}x")
+                else:
+                    logger.warning(f"[FlipSession] FAILED to set leverage for {self.symbol}, continuing anyway")
             else:
-                logger.info(f"Test mode: skipping leverage set for {self.symbol}")
+                logger.info(f"[FlipSession] Test mode: skipping leverage set for {self.symbol}")
 
+            # --- heartbeat каждые 30 секунд ---
+            heartbeat_counter = 0
             while self.is_running:
                 try:
                     await asyncio.sleep(1)
+                    heartbeat_counter += 1
+                    if heartbeat_counter >= 30:
+                        heartbeat_counter = 0
+                        pos_status = "OPEN" if self.has_open_position else "flat"
+                        latest_price = self.price_tracker.get_latest_price(self.symbol)
+                        logger.info(
+                            f"[FlipSession] HEARTBEAT user={self.user_id} symbol={self.symbol} "
+                            f"pos={pos_status} trades={self.trades_count} pnl_today=${self.pnl_today:.4f} "
+                            f"price={latest_price:.2f}"
+                        )
                 except asyncio.CancelledError:
+                    logger.info(f"[FlipSession] Cancelled: user={self.user_id}, symbol={self.symbol}")
                     break
                 except Exception as e:
-                    logger.error(f"Session loop error: user={self.user_id}, symbol={self.symbol}: {e}")
+                    logger.error(f"[FlipSession] Loop error: user={self.user_id}, symbol={self.symbol}: {e}")
         finally:
             # Отписываемся от сигналов
             self.price_tracker.unsubscribe_from_signals(self.user_id, self.symbol)
+            logger.info(f"[FlipSession] Unsubscribed from price signals: user={self.user_id}, symbol={self.symbol}")
 
             # Закрываем позицию при остановке сессии
             if self.has_open_position:
+                logger.info(f"[FlipSession] Closing open position on session stop: user={self.user_id}, symbol={self.symbol}")
                 await self._close_position("session_stop")
 
-        logger.info(f"FlipSession stopped: user={self.user_id}, symbol={self.symbol}")
+        logger.info(f"[FlipSession] STOPPED user={self.user_id}, symbol={self.symbol}")
 
     async def on_price_direction(self, direction: str, binance_price: float):
         """
@@ -713,14 +770,27 @@ class FlipSession:
         if not self.is_running:
             return
 
+        pos_status = "OPEN" if self.has_open_position else "flat"
+        logger.info(
+            f"[FlipSession] SIGNAL user={self.user_id} symbol={self.symbol} "
+            f"direction={direction} price={binance_price:.4f} pos={pos_status}"
+        )
+
         async with self._position_lock:
             try:
                 if direction == 'up' and not self.has_open_position:
+                    logger.info(f"[FlipSession] OPENING long: user={self.user_id}, symbol={self.symbol}, trigger_price={binance_price:.4f}")
                     await self._open_position(binance_price)
                 elif direction == 'down' and self.has_open_position and self.settings.close_on_reverse:
+                    logger.info(f"[FlipSession] CLOSING long (reverse signal): user={self.user_id}, symbol={self.symbol}, trigger_price={binance_price:.4f}")
                     await self._close_position("reverse")
+                else:
+                    logger.debug(
+                        f"[FlipSession] SIGNAL IGNORED user={self.user_id} symbol={self.symbol}: "
+                        f"direction={direction} has_pos={self.has_open_position} close_on_reverse={self.settings.close_on_reverse}"
+                    )
             except Exception as e:
-                logger.error(f"Direction handler error: user={self.user_id}, symbol={self.symbol}: {e}")
+                logger.error(f"[FlipSession] Direction handler error: user={self.user_id}, symbol={self.symbol}: {e}", exc_info=True)
 
     async def _open_position(self, binance_price: float):
         """Открыть лонг позицию на MEXC"""
@@ -728,13 +798,33 @@ class FlipSession:
             # Проверяем дневные лимиты перед открытием
             today_count = await self.db.get_today_flip_count(self.user_id)
             if today_count >= self.settings.max_daily_flips:
-                logger.info(f"Daily flip limit reached for user {self.user_id}: {today_count}/{self.settings.max_daily_flips}")
+                logger.info(f"[FlipSession] Daily flip limit reached for user {self.user_id}: {today_count}/{self.settings.max_daily_flips}")
                 return
 
             today_pnl = await self.db.get_today_flip_pnl(self.user_id)
             if today_pnl <= -self.settings.max_daily_loss_usd:
-                logger.info(f"Daily loss limit reached for user {self.user_id}: ${today_pnl:.2f}")
+                logger.info(f"[FlipSession] Daily loss limit reached for user {self.user_id}: ${today_pnl:.2f}")
                 return
+
+            # --- Проверка баланса (только реальный режим) ---
+            if not self.settings.test_mode:
+                bal = await self.mexc_api.get_balance()
+                if not bal.get('success'):
+                    err = bal.get('error', 'Unknown balance error')
+                    logger.error(f"[FlipSession] BALANCE CHECK FAILED user={self.user_id}: {err}")
+                    return
+                available = bal.get('available', 0)
+                required = self.settings.position_size_usd
+                if available < required:
+                    logger.error(
+                        f"[FlipSession] INSUFFICIENT BALANCE user={self.user_id}: "
+                        f"available=${available:.2f}, required=${required:.2f}"
+                    )
+                    return
+                logger.info(
+                    f"[FlipSession] Balance OK user={self.user_id}: "
+                    f"available=${available:.2f}, required=${required:.2f}"
+                )
 
             # Рассчитываем количество
             quantity = self.settings.position_size_usd / binance_price
@@ -743,14 +833,20 @@ class FlipSession:
             quantity = float(Decimal(str(quantity)).quantize(Decimal('0.001'), rounding=ROUND_DOWN))
 
             if quantity <= 0:
-                logger.warning(f"Invalid quantity for {self.symbol}: {quantity}")
+                logger.warning(f"[FlipSession] Invalid quantity for {self.symbol}: {quantity}")
                 return
 
             # Открываем позицию
+            logger.info(
+                f"[FlipSession] PLACING LONG order: user={self.user_id} symbol={self.symbol} "
+                f"qty={quantity:.6f} size=${self.settings.position_size_usd} "
+                f"mode={'TEST' if self.settings.test_mode else 'REAL'}"
+            )
             result = await self.mexc_api.open_long(self.symbol, quantity)
 
             if not result.get('success'):
-                logger.error(f"Failed to open long: {result.get('error')}")
+                err_msg = result.get('error', 'Unknown error')
+                logger.error(f"[FlipSession] OPEN LONG FAILED user={self.user_id} symbol={self.symbol}: {err_msg}")
                 return
 
             entry_price = result.get('price', binance_price)
@@ -781,10 +877,10 @@ class FlipSession:
             self.trades_count += 1
 
             logger.info(
-                f"FLIP OPEN #{self.current_trade_id}: {self.symbol} "
+                f"[FlipSession] LONG OPENED #{self.current_trade_id}: {self.symbol} "
                 f"@{entry_price:.4f} (Binance: {binance_price:.4f}) "
                 f"qty={quantity:.4f} lev={self.settings.leverage}x "
-                f"[user={self.user_id}]"
+                f"test={self.settings.test_mode} [user={self.user_id}]"
             )
 
         except Exception as e:
@@ -806,10 +902,15 @@ class FlipSession:
             if quantity <= 0:
                 quantity = 0.001  # Минимальное количество
 
+            logger.info(
+                f"[FlipSession] PLACING CLOSE order: user={self.user_id} symbol={self.symbol} "
+                f"qty={quantity:.6f} reason={reason} mode={'TEST' if self.settings.test_mode else 'REAL'}"
+            )
             result = await self.mexc_api.close_long(self.symbol, quantity)
 
             if not result.get('success'):
-                logger.error(f"Failed to close long #{self.current_trade_id}: {result.get('error')}")
+                err_msg = result.get('error', 'Unknown error')
+                logger.error(f"[FlipSession] CLOSE LONG FAILED user={self.user_id} symbol={self.symbol}: {err_msg}")
                 # Не сбрасываем has_open_position чтобы попробовать закрыть позже
                 return
 
@@ -851,11 +952,11 @@ class FlipSession:
 
             emoji = "GREEN" if pnl_usd >= 0 else "RED"
             logger.info(
-                f"FLIP CLOSE #{self.current_trade_id}: {self.symbol} "
+                f"[FlipSession] LONG CLOSED #{self.current_trade_id}: {self.symbol} "
                 f"entry={self.entry_price:.4f} exit={exit_price:.4f} "
                 f"PnL=${pnl_usd:.4f} ({price_change_pct:.4f}%) "
                 f"dur={duration_ms}ms reason={reason} [{emoji}] "
-                f"[user={self.user_id}]"
+                f"test={self.settings.test_mode} [user={self.user_id}]"
             )
 
             # Сбрасываем состояние
@@ -1012,6 +1113,35 @@ class FlipTrader:
                     api_secret=user_api_secret or None
                 )
                 self.user_mexc_apis[user_id] = mexc_api
+
+            # --- Тест подключения к MEXC перед запуском ---
+            if not flip_settings.test_mode:
+                logger.info(f"Testing MEXC connection for user {user_id}...")
+                conn_test = await mexc_api.test_connection()
+                if not conn_test.get('success'):
+                    err_msg = conn_test.get('error', 'Unknown connection error')
+                    logger.error(f"MEXC connection failed for user {user_id}: {err_msg}")
+                    # Удаляем API instance при ошибке
+                    async with self._apis_lock:
+                        self.user_mexc_apis.pop(user_id, None)
+                    try:
+                        await mexc_api.close()
+                    except Exception:
+                        pass
+                    return {'success': False, 'error': f'MEXC API error: {err_msg}'}
+                logger.info(
+                    f"MEXC connected for user {user_id}, "
+                    f"balance=${conn_test.get('balance_usdt', 0):.2f} USDT"
+                )
+                # Проверяем минимальный баланс
+                min_required = flip_settings.position_size_usd * 2  # запас 2x
+                if conn_test.get('balance_usdt', 0) < min_required:
+                    logger.warning(
+                        f"Low MEXC balance for user {user_id}: "
+                        f"${conn_test.get('balance_usdt', 0):.2f} (need ~${min_required:.2f})"
+                    )
+            else:
+                logger.info(f"Test mode: skipping MEXC connection check for user {user_id}")
 
             # Собираем все символы от всех активных пользователей
             all_symbols = set(s.upper() for s in symbols)

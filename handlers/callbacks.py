@@ -2136,16 +2136,29 @@ async def toggle_flip_trading(callback: CallbackQuery, user: UserSettings, db: D
         
         if flip_settings.enabled:
             # Запускаем сессию
+            logger.info(f"Starting flip session for user {user.user_id}, symbols={flip_settings.selected_symbols}, test_mode={flip_settings.test_mode}")
             result = await flip_trader.start_user_session(user.user_id, flip_settings)
             if result.get('success'):
-                await callback.answer(f"🚀 Flip Trading АКТИВИРОВАН!", show_alert=True)
+                mode_str = "🧪 ТЕСТ" if result.get('test_mode') else "💰 РЕАЛЬНЫЙ"
+                symbols_str = ", ".join(result.get('symbols', []))
+                await callback.answer(
+                    f"🚀 Flip Trading АКТИВЕН!\n\n"
+                    f"Пары: {symbols_str}\n"
+                    f"Плечо: {result.get('leverage')}x\n"
+                    f"Позиция: ${result.get('position_size', 0):.0f}\n"
+                    f"Режим: {mode_str}",
+                    show_alert=True
+                )
             else:
                 # Откатываем если не удалось запустить
                 flip_settings.enabled = False
                 await db.update_flip_settings(flip_settings)
-                await callback.answer(f"❌ Ошибка запуска: {result.get('error', 'Unknown')}", show_alert=True)
+                err = result.get('error', 'Unknown error')
+                logger.error(f"Flip session start failed for user {user.user_id}: {err}")
+                await callback.answer(f"❌ Ошибка запуска:\n{err[:200]}", show_alert=True)
         else:
             # Останавливаем сессию
+            logger.info(f"Stopping flip session for user {user.user_id}")
             await flip_trader.stop_user_session(user.user_id)
             await callback.answer(f"🔴 Flip Trading ОСТАНОВЛЕН", show_alert=True)
         
