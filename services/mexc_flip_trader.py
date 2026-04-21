@@ -622,7 +622,7 @@ class MexcAPI:
         try:
             mexc_symbol = f"{symbol.upper()}_USDT"
             # private GET: /api/v1/private/position/open_positions (без параметров)
-            url, headers, _ = self._private_get_url_and_headers(
+            url, headers, sorted_params = self._private_get_url_and_headers(
                 "/api/v1/private/position/open_positions", {}
             )
 
@@ -663,7 +663,7 @@ class MexcAPI:
         session = await self._get_session()
         try:
             # private GET: /api/v1/private/account/assets (без параметров)
-            url, headers, _ = self._private_get_url_and_headers(
+            url, headers, sorted_params = self._private_get_url_and_headers(
                 "/api/v1/private/account/assets", {}
             )
 
