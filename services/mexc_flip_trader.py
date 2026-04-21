@@ -694,6 +694,8 @@ class FlipSession:
         self._position_lock = asyncio.Lock()
         # Храним время открытия сделки для точного расчета длительности
         self._opened_at: Optional[str] = None
+        # Cooldown после неудачной попытки открытия позиции (чтобы не спамить API)
+        self._open_failure_cooldown_until: float = 0.0
 
     async def _on_price_signal(self, user_id: int, symbol: str, direction: str, price: float):
         """Callback для подписки на ценовые сигналы."""
@@ -706,7 +708,8 @@ class FlipSession:
         logger.info(
             f"[FlipSession] START user={self.user_id} symbol={self.symbol} "
             f"test_mode={self.settings.test_mode} leverage={self.settings.leverage}x "
-            f"size=${self.settings.position_size_usd} close_on_reverse={self.settings.close_on_reverse}"
+            f"margin=${self.settings.position_size_usd} position=${self.settings.position_size_usd * self.settings.leverage} "
+            f"close_on_reverse={self.settings.close_on_reverse}"
         )
 
         # Подписываемся на ценовые сигналы
@@ -737,10 +740,12 @@ class FlipSession:
                         heartbeat_counter = 0
                         pos_status = "OPEN" if self.has_open_position else "flat"
                         latest_price = self.price_tracker.get_latest_price(self.symbol)
+                        pos_size = self.settings.position_size_usd * self.settings.leverage
                         logger.info(
                             f"[FlipSession] HEARTBEAT user={self.user_id} symbol={self.symbol} "
                             f"pos={pos_status} trades={self.trades_count} pnl_today=${self.pnl_today:.4f} "
-                            f"price={latest_price:.2f}"
+                            f"margin=${self.settings.position_size_usd:.2f} pos=${pos_size:.0f} "
+                            f"({self.settings.leverage}x) price={latest_price:.2f}"
                         )
                 except asyncio.CancelledError:
                     logger.info(f"[FlipSession] Cancelled: user={self.user_id}, symbol={self.symbol}")
@@ -779,6 +784,15 @@ class FlipSession:
         async with self._position_lock:
             try:
                 if direction == 'up' and not self.has_open_position:
+                    # Проверяем cooldown после неудачной попытки
+                    now = time.time()
+                    if now < self._open_failure_cooldown_until:
+                        remaining = int(self._open_failure_cooldown_until - now)
+                        logger.debug(
+                            f"[FlipSession] OPEN COOLDOWN user={self.user_id} symbol={self.symbol}: "
+                            f"{remaining}s remaining"
+                        )
+                        return
                     logger.info(f"[FlipSession] OPENING long: user={self.user_id}, symbol={self.symbol}, trigger_price={binance_price:.4f}")
                     await self._open_position(binance_price)
                 elif direction == 'down' and self.has_open_position and self.settings.close_on_reverse:
@@ -807,6 +821,11 @@ class FlipSession:
                 return
 
             # --- Проверка баланса (только реальный режим) ---
+            # position_size_usd = размер маржи (собственных средств)
+            # Размер позиции = маржа * плечо
+            margin_usd = self.settings.position_size_usd
+            position_size = margin_usd * self.settings.leverage
+
             if not self.settings.test_mode:
                 bal = await self.mexc_api.get_balance()
                 if not bal.get('success'):
@@ -814,20 +833,21 @@ class FlipSession:
                     logger.error(f"[FlipSession] BALANCE CHECK FAILED user={self.user_id}: {err}")
                     return
                 available = bal.get('available', 0)
-                required = self.settings.position_size_usd
-                if available < required:
+                if available < margin_usd:
                     logger.error(
-                        f"[FlipSession] INSUFFICIENT BALANCE user={self.user_id}: "
-                        f"available=${available:.2f}, required=${required:.2f}"
+                        f"[FlipSession] INSUFFICIENT MARGIN user={self.user_id}: "
+                        f"available=${available:.2f}, margin_required=${margin_usd:.2f}"
                     )
+                    self._open_failure_cooldown_until = time.time() + 60  # 60s cooldown
                     return
                 logger.info(
-                    f"[FlipSession] Balance OK user={self.user_id}: "
-                    f"available=${available:.2f}, required=${required:.2f}"
+                    f"[FlipSession] Margin OK user={self.user_id}: "
+                    f"available=${available:.2f}, margin=${margin_usd:.2f}, "
+                    f"position=${position_size:.0f} ({self.settings.leverage}x)"
                 )
 
-            # Рассчитываем количество
-            quantity = self.settings.position_size_usd / binance_price
+            # Рассчитываем количество: (маржа * плечо) / цена
+            quantity = position_size / binance_price
 
             # Округляем quantity (для MEXC обычно 3 знака)
             quantity = float(Decimal(str(quantity)).quantize(Decimal('0.001'), rounding=ROUND_DOWN))
@@ -839,14 +859,15 @@ class FlipSession:
             # Открываем позицию
             logger.info(
                 f"[FlipSession] PLACING LONG order: user={self.user_id} symbol={self.symbol} "
-                f"qty={quantity:.6f} size=${self.settings.position_size_usd} "
-                f"mode={'TEST' if self.settings.test_mode else 'REAL'}"
+                f"qty={quantity:.6f} margin=${margin_usd:.2f} position=${position_size:.0f} "
+                f"({self.settings.leverage}x) mode={'TEST' if self.settings.test_mode else 'REAL'}"
             )
             result = await self.mexc_api.open_long(self.symbol, quantity)
 
             if not result.get('success'):
                 err_msg = result.get('error', 'Unknown error')
                 logger.error(f"[FlipSession] OPEN LONG FAILED user={self.user_id} symbol={self.symbol}: {err_msg}")
+                self._open_failure_cooldown_until = time.time() + 60  # 60s cooldown
                 return
 
             entry_price = result.get('price', binance_price)
@@ -876,10 +897,12 @@ class FlipSession:
             self.current_trade_id = await self.db.add_flip_trade(trade)
             self.trades_count += 1
 
+            pos_size = self.settings.position_size_usd * self.settings.leverage
             logger.info(
                 f"[FlipSession] LONG OPENED #{self.current_trade_id}: {self.symbol} "
                 f"@{entry_price:.4f} (Binance: {binance_price:.4f}) "
-                f"qty={quantity:.4f} lev={self.settings.leverage}x "
+                f"qty={quantity:.4f} margin=${self.settings.position_size_usd:.2f} "
+                f"position=${pos_size:.0f} ({self.settings.leverage}x) "
                 f"test={self.settings.test_mode} [user={self.user_id}]"
             )
 
@@ -1193,16 +1216,19 @@ class FlipTrader:
                     asyncio.create_task(session.run())
                     started_symbols.append(symbol.upper())
 
+            position_size = flip_settings.position_size_usd * flip_settings.leverage
             logger.info(
                 f"Flip session started for user {user_id}, symbols: {started_symbols}, "
-                f"leverage={flip_settings.leverage}x, size=${flip_settings.position_size_usd}, "
+                f"leverage={flip_settings.leverage}x, margin=${flip_settings.position_size_usd}, "
+                f"position=${position_size}, "
                 f"keys={'custom' if (user_api_key and user_api_secret) else 'global' if flip_settings.test_mode else 'none'}"
             )
             return {
                 'success': True,
                 'symbols': started_symbols,
                 'leverage': flip_settings.leverage,
-                'position_size': flip_settings.position_size_usd,
+                'margin': flip_settings.position_size_usd,
+                'position_size': position_size,
                 'test_mode': flip_settings.test_mode
             }
 

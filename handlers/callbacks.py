@@ -2141,11 +2141,14 @@ async def toggle_flip_trading(callback: CallbackQuery, user: UserSettings, db: D
             if result.get('success'):
                 mode_str = "🧪 ТЕСТ" if result.get('test_mode') else "💰 РЕАЛЬНЫЙ"
                 symbols_str = ", ".join(result.get('symbols', []))
+                margin = result.get('margin', result.get('position_size', 0))
+                position = result.get('position_size', 0)
                 await callback.answer(
                     f"🚀 Flip Trading АКТИВЕН!\n\n"
                     f"Пары: {symbols_str}\n"
                     f"Плечо: {result.get('leverage')}x\n"
-                    f"Позиция: ${result.get('position_size', 0):.0f}\n"
+                    f"Маржа: ${margin:.0f}\n"
+                    f"Позиция: ${position:.0f}\n"
                     f"Режим: {mode_str}",
                     show_alert=True
                 )
