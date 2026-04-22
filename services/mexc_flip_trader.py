@@ -1139,9 +1139,11 @@ class FlipSession:
                 )
 
             # MEXC futures USDT-M: vol = количество контрактов.
-            # Позиция (USDT) = qty * contractSize.
-            # qty = позиция / contractSize
-            raw_quantity = position_size / contract_size
+            # contractSize = размер контракта в БАЗОВОЙ валюте (монетах).
+            # Стоимость 1 контракта = price * contractSize.
+            # qty = позиция_USDT / (price * contractSize)
+            contract_value = binance_price * contract_size
+            raw_quantity = position_size / contract_value if contract_value > 0 else 0
 
             # Округляем quantity согласно правилам MEXC для данного символа
             quantity = self.mexc_api.round_quantity(raw_quantity, vol_scale, vol_unit, min_vol)
@@ -1150,15 +1152,15 @@ class FlipSession:
                 logger.warning(
                     f"[FlipSession] Invalid quantity for {self.symbol}: raw={raw_quantity:.6f}, "
                     f"rounded={quantity}, min_vol={min_vol}, vol_scale={vol_scale}, vol_unit={vol_unit}, "
-                    f"contractSize={contract_size}"
+                    f"contractSize={contract_size}, contractValue={contract_value:.4f}"
                 )
                 return
 
             # Открываем позицию
             logger.info(
                 f"[FlipSession] PLACING LONG order: user={self.user_id} symbol={self.symbol} "
-                f"qty={quantity} (raw={raw_quantity:.6f}) contractSize={contract_size} "
-                f"margin=${margin_usd:.2f} position=${position_size:.0f} "
+                f"qty={quantity} (raw={raw_quantity:.2f}) contractSize={contract_size} "
+                f"contractValue=${contract_value:.2f} margin=${margin_usd:.2f} position=${position_size:.0f} "
                 f"({self.settings.leverage}x) mode={'TEST' if self.settings.test_mode else 'REAL'}"
             )
             result = await self.mexc_api.open_long(self.symbol, quantity, self.settings.leverage)
@@ -1267,22 +1269,24 @@ class FlipSession:
                 )
 
             # MEXC futures USDT-M: vol = количество контрактов.
-            # qty = позиция / contractSize
-            raw_quantity = position_size / contract_size
+            # contractSize = размер контракта в БАЗОВОЙ валюте (монетах).
+            # qty = позиция_USDT / (price * contractSize)
+            contract_value = binance_price * contract_size
+            raw_quantity = position_size / contract_value if contract_value > 0 else 0
             quantity = self.mexc_api.round_quantity(raw_quantity, vol_scale, vol_unit, min_vol)
 
             if quantity <= 0:
                 logger.warning(
                     f"[FlipSession] Invalid quantity for {self.symbol}: raw={raw_quantity:.6f}, "
                     f"rounded={quantity}, min_vol={min_vol}, vol_scale={vol_scale}, vol_unit={vol_unit}, "
-                    f"contractSize={contract_size}"
+                    f"contractSize={contract_size}, contractValue={contract_value:.4f}"
                 )
                 return
 
             logger.info(
                 f"[FlipSession] PLACING SHORT order: user={self.user_id} symbol={self.symbol} "
-                f"qty={quantity} (raw={raw_quantity:.6f}) contractSize={contract_size} "
-                f"margin=${margin_usd:.2f} position=${position_size:.0f} "
+                f"qty={quantity} (raw={raw_quantity:.2f}) contractSize={contract_size} "
+                f"contractValue=${contract_value:.2f} margin=${margin_usd:.2f} position=${position_size:.0f} "
                 f"({self.settings.leverage}x) mode={'TEST' if self.settings.test_mode else 'REAL'}"
             )
             result = await self.mexc_api.open_short(self.symbol, quantity, self.settings.leverage)
