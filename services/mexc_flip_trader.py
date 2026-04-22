@@ -684,18 +684,54 @@ class MexcAPI:
 
             async with session.get(url, headers=headers, params=sorted_params) as resp:
                 data = await resp.json()
+                logger.info(f"[MEXC] Balance raw response: {json.dumps(data, default=str)[:500]}")
                 if data.get('success') or data.get('code') == 0:
                     assets = data.get('data', [])
-                    usdt_asset = next((a for a in assets if a.get('currency', '').upper() == 'USDT'), None)
-                    if usdt_asset:
-                        balance = float(usdt_asset.get('totalMarginBalance', 0) or usdt_asset.get('marginBalance', 0) or usdt_asset.get('equity', 0) or 0)
-                        available = float(usdt_asset.get('availableBalance', 0) or usdt_asset.get('availableOpen', 0) or 0)
-                        return {
-                            'success': True,
-                            'balance_usdt': balance,
-                            'available': available
-                        }
-                    return {'success': True, 'balance_usdt': 0.0, 'available': 0.0}
+                    if not assets:
+                        logger.warning("[MEXC] Balance: no assets in response")
+                        return {'success': True, 'balance_usdt': 0.0, 'available': 0.0}
+                    
+                    # Логируем все валюты чтобы понять структуру
+                    currencies = [a.get('currency', 'N/A') for a in assets]
+                    logger.info(f"[MEXC] Balance currencies found: {currencies}")
+                    
+                    # Ищем USDT (case-insensitive)
+                    usdt_asset = next((a for a in assets if str(a.get('currency', '')).upper() == 'USDT'), None)
+                    if not usdt_asset:
+                        # Пробуем первую валюту если USDT не найден
+                        usdt_asset = assets[0]
+                        logger.warning(f"[MEXC] USDT not found, using first asset: {usdt_asset.get('currency')}")
+                    
+                    # Пробуем все возможные поля для баланса
+                    possible_balance_fields = ['equity', 'totalMarginBalance', 'marginBalance', 'cashBalance', 'walletBalance', 'availableBalance']
+                    possible_available_fields = ['availableBalance', 'availableOpen', 'cashBalance', 'equity']
+                    
+                    balance = 0.0
+                    for field in possible_balance_fields:
+                        val = usdt_asset.get(field)
+                        if val is not None and float(val) > 0:
+                            balance = float(val)
+                            logger.info(f"[MEXC] Balance field '{field}' = {balance}")
+                            break
+                    
+                    available = 0.0
+                    for field in possible_available_fields:
+                        val = usdt_asset.get(field)
+                        if val is not None and float(val) > 0:
+                            available = float(val)
+                            logger.info(f"[MEXC] Available field '{field}' = {available}")
+                            break
+                    
+                    # Fallback: если available всё ещё 0, используем balance
+                    if available == 0 and balance > 0:
+                        available = balance
+                        
+                    logger.info(f"[MEXC] Parsed balance: total={balance:.4f}, available={available:.4f}")
+                    return {
+                        'success': True,
+                        'balance_usdt': balance,
+                        'available': available
+                    }
                 else:
                     err = self._handle_api_error(data)
                     logger.warning(f"MEXC balance error: {err.get('error')}")
@@ -969,9 +1005,9 @@ class FlipSession:
                 if available < margin_usd:
                     logger.error(
                         f"[FlipSession] INSUFFICIENT MARGIN user={self.user_id}: "
-                        f"available=${available:.2f}, margin_required=${margin_usd:.2f}"
+                        f"available=${available:.2f}, margin_required=${margin_usd:.2f}. "
+                        f"Please deposit USDT to MEXC futures account."
                     )
-                    self._open_failure_cooldown_until = time.time() + 60  # 60s cooldown
                     return
                 logger.info(
                     f"[FlipSession] Margin OK user={self.user_id}: "
@@ -1077,8 +1113,7 @@ class FlipSession:
                     return
                 available = bal.get('available', 0)
                 if available < margin_usd:
-                    logger.error(f"[FlipSession] INSUFFICIENT MARGIN user={self.user_id}: available=${available:.2f}, margin_required=${margin_usd:.2f}")
-                    self._open_failure_cooldown_until = time.time() + 60
+                    logger.error(f"[FlipSession] INSUFFICIENT MARGIN user={self.user_id}: available=${available:.2f}, margin_required=${margin_usd:.2f}. Please deposit USDT to MEXC futures account.")
                     return
 
             # Рассчитываем количество
