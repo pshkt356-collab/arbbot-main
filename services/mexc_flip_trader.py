@@ -901,6 +901,359 @@ class MexcAPI:
         }
 
 
+class MexcWebSocketClient:
+    """
+    WebSocket клиент для MEXC Futures приватных данных.
+    Подключается к wss://contract.mexc.com/edge и получает:
+    - Обновления ордеров (push.personal.order)
+    - Обновления позиций (push.personal.position)
+    - Обновления баланса (push.personal.asset)
+    
+    Преимущества:
+    - Нет комиссий за WebSocket подписку
+    - Данные приходят в реальном времени
+    - Меньше REST API запросов = экономия на лимитах
+    """
+
+    WS_URL = "wss://contract.mexc.com/edge"
+
+    def __init__(self, api_key: str = None, api_secret: str = None):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.ws = None
+        self.running = False
+        self._task: Optional[asyncio.Task] = None
+        self._lock = asyncio.Lock()
+        self._logged_in = False
+        
+        # Callbacks для различных событий
+        self._order_callbacks: List[Callable] = []      # order updates
+        self._position_callbacks: List[Callable] = []   # position updates
+        self._asset_callbacks: List[Callable] = []      # balance updates
+        
+        # Кэш последних данных
+        self.last_balance: Dict[str, dict] = {}
+        self.last_positions: Dict[str, dict] = {}  # {symbol: position_data}
+        self.last_orders: Dict[str, dict] = {}     # {orderId: order_data}
+
+    async def start(self):
+        """Запуск WebSocket клиента"""
+        if self.running:
+            return
+        if not self.api_key or not self.api_secret:
+            logger.warning("[MexcWS] API keys not configured, WebSocket not started")
+            return
+        
+        self.running = True
+        self._task = asyncio.create_task(self._ws_loop(), name="mexc_ws_client")
+        logger.info("[MexcWS] WebSocket client started")
+
+    async def stop(self):
+        """Остановка WebSocket клиента"""
+        logger.info("[MexcWS] Stopping WebSocket client...")
+        self.running = False
+        self._logged_in = False
+        if self._task and not self._task.done():
+            self._task.cancel()
+            try:
+                await asyncio.wait_for(self._task, timeout=3.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+        if self.ws and not self.ws.closed:
+            await self.ws.close()
+        self._task = None
+        self.ws = None
+        logger.info("[MexcWS] WebSocket client stopped")
+
+    async def _ws_loop(self):
+        """Основной цикл WebSocket подключения с реконнектом"""
+        reconnect_delay = 1
+        max_reconnect_delay = 30
+
+        while self.running:
+            try:
+                async with websockets.connect(
+                    self.WS_URL,
+                    ping_interval=None,  # MEXC использует свой механизм ping/pong
+                    close_timeout=5
+                ) as ws:
+                    self.ws = ws
+                    logger.info("[MexcWS] Connected to MEXC Futures WebSocket")
+                    
+                    # Логинимся
+                    login_success = await self._login()
+                    if not login_success:
+                        logger.error("[MexcWS] Login failed, reconnecting...")
+                        await asyncio.sleep(reconnect_delay)
+                        reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
+                        continue
+                    
+                    self._logged_in = True
+                    reconnect_delay = 1  # Сброс при успешном подключении
+                    
+                    # Запускаем задачу для отправки ping
+                    ping_task = asyncio.create_task(self._ping_loop(), name="mexc_ws_ping")
+                    
+                    try:
+                        async for msg in ws:
+                            if not self.running:
+                                break
+                            try:
+                                data = json.loads(msg)
+                                await self._process_message(data)
+                            except json.JSONDecodeError:
+                                logger.debug("[MexcWS] Non-JSON message received")
+                            except Exception as e:
+                                logger.error(f"[MexcWS] Message process error: {e}")
+                    except websockets.exceptions.ConnectionClosed as e:
+                        logger.warning(f"[MexcWS] Connection closed: {e}")
+                    finally:
+                        ping_task.cancel()
+                        try:
+                            await ping_task
+                        except asyncio.CancelledError:
+                            pass
+                        
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"[MexcWS] Connection error: {e}. Reconnect in {reconnect_delay}s...")
+            
+            self._logged_in = False
+            if self.running:
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
+
+    async def _login(self) -> bool:
+        """Аутентификация на WebSocket сервере MEXC"""
+        try:
+            req_time = str(int(time.time() * 1000))
+            # Signature = HMAC-SHA256(apiSecret + reqTime)
+            sign_payload = f"{self.api_secret}{req_time}"
+            signature = hmac.new(
+                self.api_secret.encode("utf-8"),
+                sign_payload.encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+            
+            login_msg = {
+                "method": "login",
+                "param": {
+                    "apiKey": self.api_key,
+                    "signature": signature,
+                    "reqTime": req_time,
+                    # "subscribe": true  # По умолчанию true - подписываемся на все personal данные
+                }
+            }
+            
+            await self.ws.send(json.dumps(login_msg))
+            
+            # Ждем ответ на login (таймаут 5 секунд)
+            try:
+                resp = await asyncio.wait_for(self.ws.recv(), timeout=5.0)
+                data = json.loads(resp)
+                
+                # Проверяем успешность логина
+                if data.get("channel") == "rs.login" or data.get("code") == 0 or data.get("success"):
+                    logger.info("[MexcWS] Login successful")
+                    return True
+                else:
+                    logger.error(f"[MexcWS] Login failed: {data}")
+                    return False
+                    
+            except asyncio.TimeoutError:
+                logger.error("[MexcWS] Login response timeout")
+                return False
+                
+        except Exception as e:
+            logger.error(f"[MexcWS] Login error: {e}")
+            return False
+
+    async def _ping_loop(self):
+        """Отправка ping каждые 15 секунд для поддержания соединения"""
+        try:
+            while self.running and self.ws and not self.ws.closed:
+                try:
+                    await self.ws.send(json.dumps({"method": "ping"}))
+                except Exception:
+                    break
+                await asyncio.sleep(15)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.debug(f"[MexcWS] Ping loop error: {e}")
+
+    async def _process_message(self, data: dict):
+        """Обработка входящих WebSocket сообщений"""
+        channel = data.get("channel", "")
+        
+        if channel == "pong":
+            return  # Игнорируем pong ответы
+        
+        elif channel == "push.personal.order":
+            await self._handle_order_update(data.get("data", {}))
+        
+        elif channel == "push.personal.position":
+            await self._handle_position_update(data.get("data", {}))
+        
+        elif channel == "push.personal.asset":
+            await self._handle_asset_update(data.get("data", {}))
+        
+        elif channel == "push.personal.order.deal":
+            await self._handle_order_deal(data.get("data", {}))
+        
+        elif channel.startswith("rs."):
+            # Ответы на команды (login, subscribe и т.д.)
+            logger.debug(f"[MexcWS] Response: {channel} = {data}")
+        
+        else:
+            logger.debug(f"[MexcWS] Unhandled channel: {channel}")
+
+    async def _handle_order_update(self, data: dict):
+        """Обработка обновления ордера"""
+        if not data:
+            return
+        order_id = str(data.get("orderId", ""))
+        self.last_orders[order_id] = data
+        
+        symbol = data.get("symbol", "").replace("_USDT", "")
+        state = data.get("state", 0)
+        state_names = {1: "pending", 2: "open", 3: "filled", 4: "cancelled", 5: "invalid"}
+        state_name = state_names.get(state, f"unknown({state})")
+        
+        logger.info(
+            f"[MexcWS] ORDER UPDATE: {symbol} orderId={order_id} "
+            f"side={data.get('side')} state={state_name} "
+            f"dealVol={data.get('dealVol', 0)}/{data.get('vol', 0)} "
+            f"avgPrice={data.get('dealAvgPrice', 0)}"
+        )
+        
+        # Вызываем зарегистрированные callbacks
+        for cb in self._order_callbacks:
+            try:
+                await cb(data)
+            except Exception as e:
+                logger.error(f"[MexcWS] Order callback error: {e}")
+
+    async def _handle_order_deal(self, data: dict):
+        """Обработка исполнения сделки (fill)"""
+        if not data:
+            return
+        logger.info(
+            f"[MexcWS] ORDER DEAL: {data.get('symbol')} "
+            f"orderId={data.get('orderId')} "
+            f"vol={data.get('vol')} price={data.get('price')} "
+            f"side={data.get('side')}"
+        )
+
+    async def _handle_position_update(self, data: dict):
+        """Обработка обновления позиции"""
+        if not data:
+            return
+        symbol = data.get("symbol", "").replace("_USDT", "")
+        self.last_positions[symbol] = data
+        
+        position_type = data.get("positionType", 0)  # 1=long, 2=short
+        state = data.get("state", 0)  # 1=holding, 2=system custody, 3=closed
+        hold_vol = float(data.get("holdVol", 0))
+        
+        direction = "long" if position_type == 1 else "short" if position_type == 2 else "unknown"
+        
+        logger.info(
+            f"[MexcWS] POSITION UPDATE: {symbol} {direction} "
+            f"vol={hold_vol} state={state} "
+            f"avgPrice={data.get('holdAvgPrice', 0)} "
+            f"pnl={data.get('pnl', 0)} leverage={data.get('leverage', 0)}"
+        )
+        
+        for cb in self._position_callbacks:
+            try:
+                await cb(data)
+            except Exception as e:
+                logger.error(f"[MexcWS] Position callback error: {e}")
+
+    async def _handle_asset_update(self, data: dict):
+        """Обработка обновления баланса"""
+        if not data:
+            return
+        currency = data.get("currency", "UNKNOWN")
+        self.last_balance[currency] = data
+        
+        logger.info(
+            f"[MexcWS] ASSET UPDATE: {currency} "
+            f"available={data.get('availableBalance', 0)} "
+            f"equity={data.get('equity', 0)}"
+        )
+        
+        for cb in self._asset_callbacks:
+            try:
+                await cb(data)
+            except Exception as e:
+                logger.error(f"[MexcWS] Asset callback error: {e}")
+
+    def on_order_update(self, callback: Callable):
+        """Регистрация callback для обновлений ордеров"""
+        self._order_callbacks.append(callback)
+
+    def on_position_update(self, callback: Callable):
+        """Регистрация callback для обновлений позиций"""
+        self._position_callbacks.append(callback)
+
+    def on_asset_update(self, callback: Callable):
+        """Регистрация callback для обновлений баланса"""
+        self._asset_callbacks.append(callback)
+
+    async def set_personal_filter(self, filters: List[dict]):
+        """Настройка фильтра personal данных"""
+        if not self.ws or not self._logged_in:
+            logger.warning("[MexcWS] Cannot set filter: not connected")
+            return
+        
+        msg = {
+            "method": "personal.filter",
+            "param": {
+                "filters": filters
+            }
+        }
+        
+        try:
+            await self.ws.send(json.dumps(msg))
+            logger.info(f"[MexcWS] Personal filter set: {filters}")
+        except Exception as e:
+            logger.error(f"[MexcWS] Set filter error: {e}")
+
+    async def subscribe_default(self):
+        """Подписка на все personal данные по умолчанию"""
+        await self.set_personal_filter([])  # Пустой фильтр = все данные
+
+    async def subscribe_symbol_only(self, symbol: str):
+        """Подписка только на данные по конкретному символу"""
+        mexc_symbol = f"{symbol.upper()}_USDT"
+        filters = [
+            {"filter": "order", "rules": [mexc_symbol]},
+            {"filter": "order.deal", "rules": [mexc_symbol]},
+            {"filter": "position", "rules": [mexc_symbol]},
+            {"filter": "asset"}
+        ]
+        await self.set_personal_filter(filters)
+
+    @property
+    def is_logged_in(self) -> bool:
+        return self._logged_in
+
+    def get_cached_position(self, symbol: str) -> Optional[dict]:
+        """Получить кэшированную позицию по символу"""
+        return self.last_positions.get(symbol.upper())
+
+    def get_cached_balance(self, currency: str = "USDT") -> Optional[dict]:
+        """Получить кэшированный баланс по валюте"""
+        return self.last_balance.get(currency.upper())
+
+    def get_cached_order(self, order_id: str) -> Optional[dict]:
+        """Получить кэшированный ордер по ID"""
+        return self.last_orders.get(str(order_id))
+
+
 class FlipSession:
     """
     Торговая сессия для одного пользователя и одного символа.
@@ -935,6 +1288,11 @@ class FlipSession:
         self.take_profit_pct: float = 5.0    # 5% take profit
         self.max_position_duration_sec: int = 300  # 5 min max
         self.current_direction: Optional[str] = None
+
+        # WebSocket клиент для MEXC (для получения обновлений без REST API)
+        self.mexc_ws: Optional[MexcWebSocketClient] = None
+        # Флаг: используем WebSocket данные для отслеживания позиций
+        self._ws_order_confirmed = False
 
     async def _on_price_signal(self, user_id: int, symbol: str, direction: str, price: float):
         """Callback для подписки на ценовые сигналы."""
@@ -972,6 +1330,28 @@ class FlipSession:
             self._on_price_signal, self.user_id, self.symbol
         )
         logger.info(f"[FlipSession] Subscribed to price signals: user={self.user_id}, symbol={self.symbol}")
+
+        # Запускаем MEXC WebSocket клиент для приватных данных (если есть API ключи)
+        if not self.settings.test_mode and self.mexc_api.api_key and self.mexc_api.api_secret:
+            try:
+                self.mexc_ws = MexcWebSocketClient(
+                    api_key=self.mexc_api.api_key,
+                    api_secret=self.mexc_api.api_secret
+                )
+                # Регистрируем callback для обновлений ордеров
+                self.mexc_ws.on_order_update(self._on_ws_order_update)
+                self.mexc_ws.on_position_update(self._on_ws_position_update)
+                await self.mexc_ws.start()
+                # Даем время на подключение и логин
+                await asyncio.sleep(2)
+                # Подписываемся на данные по нашему символу
+                await self.mexc_ws.subscribe_symbol_only(self.symbol)
+                logger.info(f"[FlipSession] MEXC WebSocket started for {self.symbol}")
+            except Exception as e:
+                logger.warning(f"[FlipSession] Failed to start MEXC WebSocket: {e}")
+                self.mexc_ws = None
+        else:
+            logger.info(f"[FlipSession] Test mode or no API keys: MEXC WebSocket not started")
 
         try:
             # Устанавливаем плечо (если не тестовый режим)
@@ -1014,6 +1394,15 @@ class FlipSession:
             # Отписываемся от сигналов
             self.price_tracker.unsubscribe_from_signals(self.user_id, self.symbol)
             logger.info(f"[FlipSession] Unsubscribed from price signals: user={self.user_id}, symbol={self.symbol}")
+
+            # Останавливаем MEXC WebSocket
+            if self.mexc_ws:
+                try:
+                    await self.mexc_ws.stop()
+                    logger.info(f"[FlipSession] MEXC WebSocket stopped for {self.symbol}")
+                except Exception as e:
+                    logger.warning(f"[FlipSession] Error stopping MEXC WebSocket: {e}")
+                self.mexc_ws = None
 
             # Закрываем позицию при остановке сессии
             if self.has_open_position:
@@ -1066,7 +1455,7 @@ class FlipSession:
                         return
                     logger.info(f"[FlipSession] OPENING short: user={self.user_id}, symbol={self.symbol}, trigger_price={binance_price:.4f}")
                     await self._open_short_position(binance_price)
-                elif direction == 'down' and self.has_open_position and self.current_direction == 'long' and self.settings.close_on_reverse:
+                elif direction == 'down' and self.has_open_position and self.current_direction == 'long':
                     logger.info(f"[FlipSession] CLOSING long (reverse signal): user={self.user_id}, symbol={self.symbol}, trigger_price={binance_price:.4f}")
                     await self._close_position("reverse")
                 else:
@@ -1076,6 +1465,64 @@ class FlipSession:
                     )
             except Exception as e:
                 logger.error(f"[FlipSession] Direction handler error: user={self.user_id}, symbol={self.symbol}: {e}", exc_info=True)
+
+    async def _on_ws_order_update(self, order_data: dict):
+        """Callback для обновлений ордеров через WebSocket"""
+        try:
+            symbol = order_data.get("symbol", "").replace("_USDT", "")
+            if symbol != self.symbol:
+                return
+            
+            state = order_data.get("state", 0)
+            side = order_data.get("side", 0)
+            deal_vol = float(order_data.get("dealVol", 0))
+            total_vol = float(order_data.get("vol", 0))
+            
+            # state: 1=pending, 2=open, 3=filled, 4=cancelled, 5=invalid
+            if state == 3 and deal_vol >= total_vol:
+                # Ордер полностью исполнен
+                self._ws_order_confirmed = True
+                avg_price = float(order_data.get("dealAvgPrice", 0))
+                logger.info(
+                    f"[FlipSession] WS ORDER FILLED: {self.symbol} "
+                    f"side={side} vol={deal_vol} avgPrice={avg_price}"
+                )
+            elif state in [4, 5]:
+                # Ордер отменен или невалиден
+                logger.warning(
+                    f"[FlipSession] WS ORDER CANCELLED/INVALID: {self.symbol} "
+                    f"side={side} state={state}"
+                )
+        except Exception as e:
+            logger.error(f"[FlipSession] WS order callback error: {e}")
+
+    async def _on_ws_position_update(self, position_data: dict):
+        """Callback для обновлений позиций через WebSocket"""
+        try:
+            symbol = position_data.get("symbol", "").replace("_USDT", "")
+            if symbol != self.symbol:
+                return
+            
+            hold_vol = float(position_data.get("holdVol", 0))
+            position_type = position_data.get("positionType", 0)  # 1=long, 2=short
+            state = position_data.get("state", 0)  # 1=holding, 3=closed
+            
+            if hold_vol == 0 and state == 3 and self.has_open_position:
+                # Позиция закрыта (holdVol=0 и state=closed)
+                logger.info(
+                    f"[FlipSession] WS POSITION CLOSED: {self.symbol} "
+                    f"holdVol=0 state={state}"
+                )
+            elif hold_vol > 0 and not self.has_open_position:
+                # Позиция открыта (есть holdVol)
+                direction = "long" if position_type == 1 else "short" if position_type == 2 else "unknown"
+                avg_price = float(position_data.get("holdAvgPrice", 0))
+                logger.info(
+                    f"[FlipSession] WS POSITION OPENED: {self.symbol} "
+                    f"direction={direction} vol={hold_vol} avgPrice={avg_price}"
+                )
+        except Exception as e:
+            logger.error(f"[FlipSession] WS position callback error: {e}")
 
     async def _open_position(self, binance_price: float):
         """Открыть лонг позицию на MEXC"""
@@ -1176,6 +1623,7 @@ class FlipSession:
             self.entry_binance_price = binance_price
             self.has_open_position = True
             self.current_quantity = quantity  # Сохраняем для закрытия
+            self.current_direction = 'long'  # Устанавливаем направление позиции
 
             # Сохраняем время открытия
             now_utc = datetime.now(timezone.utc)
@@ -1523,6 +1971,13 @@ class FlipSession:
             self.price_tracker.unsubscribe_from_signals(self.user_id, self.symbol)
         except Exception:
             pass
+        # Останавливаем MEXC WebSocket
+        if self.mexc_ws:
+            try:
+                await self.mexc_ws.stop()
+            except Exception:
+                pass
+            self.mexc_ws = None
         if self.has_open_position:
             await self._close_position("manual")
 
