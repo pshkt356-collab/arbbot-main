@@ -2615,7 +2615,7 @@ async def delete_flip_api(callback: CallbackQuery, user: UserSettings, db: Datab
 
 # ==================== MEXC UID FLIP TRADING CALLBACKS ====================
 
-@router.callback_query(F.data == "uid_flip:menu")
+@callbacks_router.callback_query(F.data == "uid_flip:menu")
 async def show_uid_flip_menu(callback: CallbackQuery, user: UserSettings, db: Database):
     """Показать меню MEXC UID Flip Trading"""
     try:
@@ -2666,7 +2666,7 @@ async def show_uid_flip_menu(callback: CallbackQuery, user: UserSettings, db: Da
         await callback.answer("❌ Ошибка загрузки меню", show_alert=True)
 
 
-@router.callback_query(F.data == "uid_flip:start")
+@callbacks_router.callback_query(F.data == "uid_flip:start")
 async def uid_flip_start(callback: CallbackQuery, user: UserSettings, db: Database):
     """Запуск UID flip trading"""
     try:
@@ -2724,7 +2724,7 @@ async def uid_flip_start(callback: CallbackQuery, user: UserSettings, db: Databa
         await callback.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
 
 
-@router.callback_query(F.data == "uid_flip:stop")
+@callbacks_router.callback_query(F.data == "uid_flip:stop")
 async def uid_flip_stop(callback: CallbackQuery, user: UserSettings, db: Database):
     """Остановка UID flip trading"""
     try:
@@ -2753,7 +2753,7 @@ async def uid_flip_stop(callback: CallbackQuery, user: UserSettings, db: Databas
         await callback.answer("❌ Ошибка", show_alert=True)
 
 
-@router.callback_query(F.data == "uid_flip:test_mode")
+@callbacks_router.callback_query(F.data == "uid_flip:test_mode")
 async def uid_flip_toggle_test(callback: CallbackQuery, user: UserSettings, db: Database):
     """Переключение режима UID flip"""
     try:
@@ -2773,7 +2773,7 @@ async def uid_flip_toggle_test(callback: CallbackQuery, user: UserSettings, db: 
         await callback.answer("❌ Ошибка", show_alert=True)
 
 
-@router.callback_query(F.data == "uid_flip:symbols")
+@callbacks_router.callback_query(F.data == "uid_flip:symbols")
 async def uid_flip_symbols_menu(callback: CallbackQuery, user: UserSettings, db: Database):
     """Меню выбора символов для UID flip"""
     try:
@@ -2807,7 +2807,7 @@ async def uid_flip_symbols_menu(callback: CallbackQuery, user: UserSettings, db:
         await callback.answer("❌ Ошибка", show_alert=True)
 
 
-@router.callback_query(F.data == "uid_flip:leverage")
+@callbacks_router.callback_query(F.data == "uid_flip:leverage")
 async def uid_flip_leverage_menu(callback: CallbackQuery, user: UserSettings, db: Database):
     """Меню плеча UID flip"""
     try:
@@ -2839,7 +2839,7 @@ async def uid_flip_leverage_menu(callback: CallbackQuery, user: UserSettings, db
         await callback.answer("❌ Ошибка", show_alert=True)
 
 
-@router.callback_query(F.data == "uid_flip:position_size")
+@callbacks_router.callback_query(F.data == "uid_flip:position_size")
 async def uid_flip_position_size_menu(callback: CallbackQuery, user: UserSettings, db: Database):
     """Меню размера позиции UID flip"""
     try:
@@ -2871,7 +2871,7 @@ async def uid_flip_position_size_menu(callback: CallbackQuery, user: UserSetting
         await callback.answer("❌ Ошибка", show_alert=True)
 
 
-@router.callback_query(F.data == "uid_flip:stats")
+@callbacks_router.callback_query(F.data == "uid_flip:stats")
 async def uid_flip_stats(callback: CallbackQuery, user: UserSettings, db: Database):
     """Статистика UID flip trading"""
     try:
@@ -2971,12 +2971,12 @@ async def show_uid_session_menu(callback: CallbackQuery, user: UserSettings, db:
         await callback.answer("❌ Ошибка", show_alert=True)
 
 
-@router.callback_query(F.data == "uid_flip:session_menu")
+@callbacks_router.callback_query(F.data == "uid_flip:session_menu")
 async def uid_flip_session_menu_handler(callback: CallbackQuery, user: UserSettings, db: Database):
     await show_uid_session_menu(callback, user, db)
 
 
-@router.callback_query(F.data == "uid_flip:session_add")
+@callbacks_router.callback_query(F.data == "uid_flip:session_add")
 async def uid_flip_session_add(callback: CallbackQuery, state: FSMContext, user: UserSettings):
     """Начать ввод UID данных"""
     try:
@@ -3000,7 +3000,7 @@ async def uid_flip_session_add(callback: CallbackQuery, state: FSMContext, user:
         await callback.answer("❌ Ошибка", show_alert=True)
 
 
-@router.callback_query(F.data == "uid_flip:session_delete")
+@callbacks_router.callback_query(F.data == "uid_flip:session_delete")
 async def uid_flip_session_delete(callback: CallbackQuery, user: UserSettings, db: Database):
     """Удалить UID сессию"""
     try:
