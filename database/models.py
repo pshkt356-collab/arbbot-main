@@ -346,6 +346,7 @@ class Database:
                 await self._migrate_add_scan_type_column()
                 await self._migrate_add_flip_tables()
                 await self._migrate_add_flip_api_columns()
+                await self._migrate_add_uid_flip_tables()
                 self._initialized = True
                 logger.info(f"Database initialized: {self._db_path} (WAL mode)")
             except Exception as e:
@@ -1033,6 +1034,244 @@ class Database:
                 VALUES (?, ?, ?, ?, ?, ?)
             """, (symbol, ex1, ex2, spread, p1, p2))
             await self._conn.commit()
+
+    async def _migrate_add_uid_flip_tables(self):
+        """Миграция: создание таблиц для MEXC UID Flip Trading"""
+        try:
+            async with self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='uid_flip_settings'"
+            ) as cursor:
+                if not await cursor.fetchone():
+                    await self._conn.executescript("""
+                        CREATE TABLE IF NOT EXISTS uid_flip_settings (
+                            user_id INTEGER PRIMARY KEY,
+                            enabled BOOLEAN DEFAULT 0,
+                            selected_symbols TEXT DEFAULT '["BTC", "ETH", "SOL"]',
+                            leverage INTEGER DEFAULT 200,
+                            position_size_usd REAL DEFAULT 100.0,
+                            max_daily_flips INTEGER DEFAULT 300,
+                            max_daily_loss_usd REAL DEFAULT 50.0,
+                            min_price_movement_pct REAL DEFAULT 0.01,
+                            test_mode BOOLEAN DEFAULT 1,
+                            uid TEXT DEFAULT '',
+                            bearer_token TEXT DEFAULT '',
+                            cookies TEXT DEFAULT '',
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            FOREIGN KEY (user_id) REFERENCES users(user_id)
+                        );
+
+                        CREATE TABLE IF NOT EXISTS uid_flip_trades (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            user_id INTEGER,
+                            symbol TEXT,
+                            direction TEXT DEFAULT 'long',
+                            entry_price REAL,
+                            exit_price REAL,
+                            pnl_usd REAL DEFAULT 0,
+                            pnl_percent REAL DEFAULT 0,
+                            leverage INTEGER DEFAULT 200,
+                            position_size_usd REAL DEFAULT 100,
+                            quantity REAL DEFAULT 0,
+                            status TEXT DEFAULT 'open',
+                            close_reason TEXT DEFAULT '',
+                            binance_entry_price REAL DEFAULT 0,
+                            binance_exit_price REAL DEFAULT 0,
+                            opened_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            closed_at TIMESTAMP,
+                            duration_ms INTEGER DEFAULT 0,
+                            metadata TEXT DEFAULT '{}',
+                            FOREIGN KEY (user_id) REFERENCES users(user_id)
+                        );
+
+                        CREATE INDEX IF NOT EXISTS idx_uid_flip_trades_user ON uid_flip_trades(user_id, status);
+                        CREATE INDEX IF NOT EXISTS idx_uid_flip_trades_time ON uid_flip_trades(opened_at);
+                    """)
+                    await self._conn.commit()
+                    logger.info("Migration: created uid_flip_settings and uid_flip_trades tables")
+        except Exception as e:
+            logger.error(f"Migration error for UID flip tables: {e}")
+
+    async def get_uid_flip_settings(self, user_id: int):
+        """Получить настройки UID flip trading пользователя"""
+        if not self._initialized:
+            await self.initialize()
+        from services.mexc_uid_trader import UIDFlipSettings
+        async with self._query_lock:
+            async with self._conn.execute(
+                'SELECT * FROM uid_flip_settings WHERE user_id = ?', (user_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                if not row:
+                    return None
+                return UIDFlipSettings(
+                    user_id=row['user_id'],
+                    enabled=bool(row['enabled']),
+                    selected_symbols=json.loads(row['selected_symbols']) if row['selected_symbols'] else ['BTC', 'ETH', 'SOL'],
+                    leverage=row['leverage'] if row['leverage'] is not None else 200,
+                    position_size_usd=row['position_size_usd'] if row['position_size_usd'] is not None else 100.0,
+                    max_daily_flips=row['max_daily_flips'] if row['max_daily_flips'] is not None else 300,
+                    max_daily_loss_usd=row['max_daily_loss_usd'] if row['max_daily_loss_usd'] is not None else 50.0,
+                    min_price_movement_pct=row['min_price_movement_pct'] if row['min_price_movement_pct'] is not None else 0.01,
+                    test_mode=bool(row['test_mode']) if row['test_mode'] is not None else True,
+                    uid=row['uid'] if row['uid'] else '',
+                    bearer_token=row['bearer_token'] if row['bearer_token'] else '',
+                    cookies=row['cookies'] if row['cookies'] else '',
+                    created_at=row['created_at'],
+                    updated_at=row['updated_at']
+                )
+
+    async def create_uid_flip_settings(self, user_id: int):
+        """Создать настройки UID flip trading по умолчанию"""
+        existing = await self.get_uid_flip_settings(user_id)
+        if existing:
+            return existing
+        from services.mexc_uid_trader import UIDFlipSettings
+        settings = UIDFlipSettings(user_id=user_id)
+        async with self._query_lock:
+            try:
+                await self._conn.execute("""
+                    INSERT INTO uid_flip_settings (user_id, enabled, selected_symbols, leverage,
+                        position_size_usd, max_daily_flips, max_daily_loss_usd,
+                        min_price_movement_pct, test_mode, uid, bearer_token, cookies)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    user_id, int(settings.enabled), json.dumps(settings.selected_symbols),
+                    settings.leverage, settings.position_size_usd, settings.max_daily_flips,
+                    settings.max_daily_loss_usd, settings.min_price_movement_pct,
+                    int(settings.test_mode), settings.uid, settings.bearer_token, settings.cookies
+                ))
+                await self._conn.commit()
+                logger.info(f"Created UID flip settings for user {user_id}")
+            except aiosqlite.IntegrityError:
+                logger.warning(f"UID flip settings for user {user_id} already exist")
+                return await self.get_uid_flip_settings(user_id)
+        return settings
+
+    async def update_uid_flip_settings(self, settings):
+        """Обновить настройки UID flip trading"""
+        async with self._query_lock:
+            await self._conn.execute("""
+                UPDATE uid_flip_settings SET
+                    enabled = ?, selected_symbols = ?, leverage = ?,
+                    position_size_usd = ?, max_daily_flips = ?,
+                    max_daily_loss_usd = ?, min_price_movement_pct = ?,
+                    test_mode = ?, uid = ?, bearer_token = ?, cookies = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE user_id = ?
+            """, (
+                int(settings.enabled), json.dumps(settings.selected_symbols),
+                settings.leverage, settings.position_size_usd, settings.max_daily_flips,
+                settings.max_daily_loss_usd, settings.min_price_movement_pct,
+                int(settings.test_mode), settings.uid, settings.bearer_token, settings.cookies,
+                settings.user_id
+            ))
+            await self._conn.commit()
+
+    async def add_uid_flip_trade(self, trade) -> int:
+        """Добавить UID flip сделку"""
+        from services.mexc_uid_trader import UIDFlipTrade
+        async with self._query_lock:
+            cursor = await self._conn.execute("""
+                INSERT INTO uid_flip_trades (user_id, symbol, direction, entry_price,
+                    leverage, position_size_usd, quantity, status,
+                    binance_entry_price, opened_at, metadata)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                trade.user_id, trade.symbol, trade.direction, trade.entry_price,
+                trade.leverage, trade.position_size_usd, trade.quantity, trade.status,
+                trade.binance_entry_price, trade.opened_at, json.dumps(trade.metadata)
+            ))
+            await self._conn.commit()
+            return cursor.lastrowid
+
+    async def close_uid_flip_trade(self, trade_id: int, exit_price: float, pnl_usd: float,
+                                    pnl_percent: float, close_reason: str,
+                                    binance_exit_price: float, duration_ms: int):
+        """Закрыть UID flip сделку"""
+        async with self._query_lock:
+            await self._conn.execute("""
+                UPDATE uid_flip_trades SET
+                    exit_price = ?, pnl_usd = ?, pnl_percent = ?,
+                    status = 'closed', close_reason = ?,
+                    binance_exit_price = ?, closed_at = CURRENT_TIMESTAMP,
+                    duration_ms = ?
+                WHERE id = ?
+            """, (exit_price, pnl_usd, pnl_percent, close_reason,
+                  binance_exit_price, duration_ms, trade_id))
+            await self._conn.commit()
+
+    async def get_open_uid_flip_trades(self, user_id: int):
+        """Получить открытые UID flip сделки пользователя"""
+        from services.mexc_uid_trader import UIDFlipTrade
+        async with self._query_lock:
+            async with self._conn.execute(
+                "SELECT * FROM uid_flip_trades WHERE user_id = ? AND status = 'open'",
+                (user_id,)
+            ) as cursor:
+                rows = await cursor.fetchall()
+                trades = []
+                for row in rows:
+                    trades.append(UIDFlipTrade(
+                        id=row['id'], user_id=row['user_id'], symbol=row['symbol'],
+                        direction=row['direction'], entry_price=row['entry_price'],
+                        exit_price=row['exit_price'], pnl_usd=row['pnl_usd'],
+                        pnl_percent=row['pnl_percent'], leverage=row['leverage'],
+                        position_size_usd=row['position_size_usd'], quantity=row['quantity'],
+                        status=row['status'], close_reason=row['close_reason'],
+                        binance_entry_price=row['binance_entry_price'],
+                        binance_exit_price=row['binance_exit_price'],
+                        opened_at=row['opened_at'], closed_at=row['closed_at'],
+                        duration_ms=row['duration_ms'],
+                        metadata=json.loads(row['metadata']) if row['metadata'] else {}
+                    ))
+                return trades
+
+    async def get_uid_flip_trade_stats(self, user_id: int, since: str = None) -> dict:
+        """Получить статистику UID flip trading за период"""
+        async with self._query_lock:
+            query = """SELECT COUNT(*) as count,
+                        COALESCE(SUM(pnl_usd), 0) as total_pnl,
+                        COALESCE(AVG(duration_ms), 0) as avg_duration,
+                        COALESCE(SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END), 0) as wins,
+                        COALESCE(SUM(CASE WHEN pnl_usd < 0 THEN 1 ELSE 0 END), 0) as losses
+                    FROM uid_flip_trades WHERE user_id = ? AND status = 'closed'"""
+            params = [user_id]
+            if since:
+                query += " AND opened_at >= ?"
+                params.append(since)
+            async with self._conn.execute(query, params) as cursor:
+                row = await cursor.fetchone()
+                return {
+                    'total_trades': row['count'] or 0,
+                    'total_pnl': row['total_pnl'] or 0,
+                    'avg_duration_ms': row['avg_duration'] or 0,
+                    'wins': row['wins'] or 0,
+                    'losses': row['losses'] or 0,
+                    'win_rate': (row['wins'] / row['count'] * 100) if row['count'] else 0
+                }
+
+    async def get_today_uid_flip_count(self, user_id: int) -> int:
+        """Количество UID флипов сегодня"""
+        today = datetime.now().strftime('%Y-%m-%d')
+        async with self._query_lock:
+            async with self._conn.execute(
+                "SELECT COUNT(*) as count FROM uid_flip_trades WHERE user_id = ? AND status = 'closed' AND opened_at >= ?",
+                (user_id, today)
+            ) as cursor:
+                row = await cursor.fetchone()
+                return row['count'] or 0
+
+    async def get_today_uid_flip_pnl(self, user_id: int) -> float:
+        """PnL UID флипов сегодня"""
+        today = datetime.now().strftime('%Y-%m-%d')
+        async with self._query_lock:
+            async with self._conn.execute(
+                "SELECT COALESCE(SUM(pnl_usd), 0) as pnl FROM uid_flip_trades WHERE user_id = ? AND status = 'closed' AND opened_at >= ?",
+                (user_id, today)
+            ) as cursor:
+                row = await cursor.fetchone()
+                return row['pnl'] or 0
 
     async def get_flip_settings(self, user_id: int) -> Optional[FlipSettings]:
         """Получить настройки flip trading пользователя"""

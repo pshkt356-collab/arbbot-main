@@ -106,7 +106,8 @@ async def show_main_menu(callback: CallbackQuery, user: UserSettings, scanner=No
 
     # Четвертый ряд - MEXC Flip Trading
     builder.row(
-        InlineKeyboardButton(text="🔥 MEXC Flip", callback_data="flip:menu")
+        InlineKeyboardButton(text="🔥 MEXC Flip API", callback_data="flip:menu"),
+        InlineKeyboardButton(text="🆔 MEXC UID", callback_data="uid_flip:menu")
     )
 
     test_status = "🧪 Тест" if user.test_mode else "💰 Реал"
@@ -2609,4 +2610,412 @@ async def delete_flip_api(callback: CallbackQuery, user: UserSettings, db: Datab
 
     except Exception as e:
         logger.error(f"API delete error: {e}")
+        await callback.answer("❌ Ошибка", show_alert=True)
+
+
+# ==================== MEXC UID FLIP TRADING CALLBACKS ====================
+
+@router.callback_query(F.data == "uid_flip:menu")
+async def show_uid_flip_menu(callback: CallbackQuery, user: UserSettings, db: Database):
+    """Показать меню MEXC UID Flip Trading"""
+    try:
+        flip_settings = await db.get_uid_flip_settings(user.user_id)
+        if not flip_settings:
+            flip_settings = await db.create_uid_flip_settings(user.user_id)
+
+        from services.mexc_uid_trader import uid_flip_trader
+        is_active = uid_flip_trader.is_user_active(user.user_id)
+
+        status = "🟢 АКТИВЕН" if is_active else "🔴 Остановлен"
+        uid_status = "✅ Указан" if flip_settings.uid else "❌ Не указан"
+        bearer_status = "✅ Указан" if flip_settings.bearer_token else "❌ Не указан"
+        symbols = ", ".join(flip_settings.selected_symbols) if flip_settings.selected_symbols else "—"
+
+        text = (
+            f"**🆔 MEXC UID Flip Trading**\n\n"
+            f"Статус: {status}\n"
+            f"🆔 UID: {uid_status}\n"
+            f"🔑 Bearer: {bearer_status}\n"
+            f"⚡ Плечо: **{flip_settings.leverage}x**\n"
+            f"💰 Позиция: **${flip_settings.position_size_usd:.0f}**\n"
+            f"🧪 Режим: **{'Тест' if flip_settings.test_mode else 'РЕАЛЬНЫЙ'}**\n"
+            f"📋 Символы: `{symbols}`\n\n"
+            f"Использует браузерную сессию (UID) для торговли без комиссий."
+        )
+
+        keyboard = InlineKeyboardBuilder()
+        if is_active:
+            keyboard.button(text="🛑 Остановить", callback_data="uid_flip:stop")
+        else:
+            keyboard.button(text="▶️ Запустить", callback_data="uid_flip:start")
+
+        keyboard.button(text="📋 Символы", callback_data="uid_flip:symbols")
+        keyboard.button(text="⚡ Плечо", callback_data="uid_flip:leverage")
+        keyboard.button(text="💰 Размер позиции", callback_data="uid_flip:position_size")
+        keyboard.button(text="🧪 Режим", callback_data="uid_flip:test_mode")
+        keyboard.button(text="📊 Статистика", callback_data="uid_flip:stats")
+        keyboard.button(text="🔑 UID сессия", callback_data="uid_flip:session_menu")
+        keyboard.button(text="🔙 Меню", callback_data="menu:main")
+        keyboard.adjust(2, 2, 2, 2, 1)
+
+        await callback.message.edit_text(text, reply_markup=keyboard.as_markup())
+        await callback.answer()
+
+    except Exception as e:
+        logger.error(f"UID flip menu error: {e}")
+        await callback.answer("❌ Ошибка загрузки меню", show_alert=True)
+
+
+@router.callback_query(F.data == "uid_flip:start")
+async def uid_flip_start(callback: CallbackQuery, user: UserSettings, db: Database):
+    """Запуск UID flip trading"""
+    try:
+        flip_settings = await db.get_uid_flip_settings(user.user_id)
+        if not flip_settings:
+            await callback.answer("❌ Настройки не найдены", show_alert=True)
+            return
+
+        if not flip_settings.test_mode and (not flip_settings.uid or not flip_settings.bearer_token):
+            await callback.answer("❌ Укажите UID и Bearer Token!", show_alert=True)
+            return
+
+        if not flip_settings.selected_symbols:
+            await callback.answer("❌ Выберите символы!", show_alert=True)
+            return
+
+        await callback.message.edit_text(
+            f"⏳ Запускаю UID Flip Trading для: {', '.join(flip_settings.selected_symbols)}..."
+        )
+        await callback.answer()
+
+        from services.mexc_uid_trader import uid_flip_trader
+
+        if uid_flip_trader.price_tracker is None:
+            uid_flip_trader.price_tracker = flip_trader.price_tracker
+
+        result = await uid_flip_trader.start_user_session(user.user_id, flip_settings)
+
+        if result.get("success"):
+            symbols = ", ".join(result.get("symbols", []))
+            mode = "🧪 Тест" if result.get("test_mode") else "💰 РЕАЛЬНЫЙ"
+            keyboard = InlineKeyboardBuilder()
+            keyboard.button(text="🛑 Остановить", callback_data="uid_flip:stop")
+            keyboard.button(text="🔑 UID меню", callback_data="uid_flip:menu")
+            keyboard.adjust(1)
+            await callback.message.edit_text(
+                f"✅ **UID Flip Trading запущен!**\n\n"
+                f"📋 Символы: `{symbols}`\n"
+                f"⚡ Плечо: **{result.get('leverage')}x**\n"
+                f"💰 Позиция: **${result.get('position_size', 0):.0f}**\n"
+                f"🧪 Режим: **{mode}**",
+                reply_markup=keyboard.as_markup()
+            )
+        else:
+            keyboard = InlineKeyboardBuilder()
+            keyboard.button(text="🔄 Повторить", callback_data="uid_flip:start")
+            keyboard.button(text="🔑 UID меню", callback_data="uid_flip:menu")
+            keyboard.adjust(1)
+            await callback.message.edit_text(
+                f"❌ **Ошибка запуска**\n\n`{result.get('error', 'Неизвестно')[:200]}`",
+                reply_markup=keyboard.as_markup()
+            )
+    except Exception as e:
+        logger.error(f"UID flip start error: {e}")
+        await callback.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
+
+
+@router.callback_query(F.data == "uid_flip:stop")
+async def uid_flip_stop(callback: CallbackQuery, user: UserSettings, db: Database):
+    """Остановка UID flip trading"""
+    try:
+        await callback.message.edit_text("🛑 Останавливаю UID Flip Trading...")
+        await callback.answer()
+
+        from services.mexc_uid_trader import uid_flip_trader
+        result = await uid_flip_trader.stop_user_session(user.user_id)
+
+        if result.get("success"):
+            closed = ", ".join(result.get("closed_symbols", [])) or "—"
+            keyboard = InlineKeyboardBuilder()
+            keyboard.button(text="▶️ Запустить", callback_data="uid_flip:start")
+            keyboard.button(text="🔑 UID меню", callback_data="uid_flip:menu")
+            keyboard.adjust(1)
+            await callback.message.edit_text(
+                f"✅ **UID Flip Trading остановлен**\n\n"
+                f"Символы: `{closed}`",
+                reply_markup=keyboard.as_markup()
+            )
+        else:
+            await callback.answer("❌ Ошибка остановки", show_alert=True)
+            await show_uid_flip_menu(callback, user, db)
+    except Exception as e:
+        logger.error(f"UID flip stop error: {e}")
+        await callback.answer("❌ Ошибка", show_alert=True)
+
+
+@router.callback_query(F.data == "uid_flip:test_mode")
+async def uid_flip_toggle_test(callback: CallbackQuery, user: UserSettings, db: Database):
+    """Переключение режима UID flip"""
+    try:
+        flip_settings = await db.get_uid_flip_settings(user.user_id)
+        if not flip_settings:
+            await callback.answer("❌ Настройки не найдены", show_alert=True)
+            return
+
+        flip_settings.test_mode = not flip_settings.test_mode
+        await db.update_uid_flip_settings(flip_settings)
+
+        mode = "ТЕСТОВЫЙ" if flip_settings.test_mode else "РЕАЛЬНЫЙ"
+        await callback.answer(f"Режим: {mode}", show_alert=True)
+        await show_uid_flip_menu(callback, user, db)
+    except Exception as e:
+        logger.error(f"UID flip toggle error: {e}")
+        await callback.answer("❌ Ошибка", show_alert=True)
+
+
+@router.callback_query(F.data == "uid_flip:symbols")
+async def uid_flip_symbols_menu(callback: CallbackQuery, user: UserSettings, db: Database):
+    """Меню выбора символов для UID flip"""
+    try:
+        flip_settings = await db.get_uid_flip_settings(user.user_id)
+        if not flip_settings:
+            await callback.answer("❌ Настройки не найдены", show_alert=True)
+            return
+
+        current = ", ".join(flip_settings.selected_symbols) if flip_settings.selected_symbols else "—"
+
+        await callback.message.edit_text(
+            f"**📋 Символы UID Flip Trading**\n\n"
+            f"Текущие: `{current}`\n\n"
+            f"Введите новые символы через запятую:\n"
+            f"_(Например: BTC, ETH, SOL)_",
+            reply_markup=InlineKeyboardBuilder().button(
+                text="🔙 Назад", callback_data="uid_flip:menu"
+            ).as_markup()
+        )
+        await callback.answer()
+
+        from aiogram.fsm.context import FSMContext
+        state = FSMContext(
+            storage=callback.bot._dispatcher.fsm.storage,
+            key=FSMContext.get_key(callback.from_user.id, callback.message.chat.id)
+        )
+        await state.set_state(SetupStates.waiting_for_uid_flip_symbols)
+
+    except Exception as e:
+        logger.error(f"UID flip symbols menu error: {e}")
+        await callback.answer("❌ Ошибка", show_alert=True)
+
+
+@router.callback_query(F.data == "uid_flip:leverage")
+async def uid_flip_leverage_menu(callback: CallbackQuery, user: UserSettings, db: Database):
+    """Меню плеча UID flip"""
+    try:
+        flip_settings = await db.get_uid_flip_settings(user.user_id)
+        if not flip_settings:
+            await callback.answer("❌ Настройки не найдены", show_alert=True)
+            return
+
+        text = (
+            f"**⚡ Плечо UID Flip Trading**\n\n"
+            f"Текущее: **{flip_settings.leverage}x**\n\n"
+            f"Введите новое плечо (1-300):\n"
+            f"_(Отправьте число сообщением)_"
+        )
+        keyboard = InlineKeyboardBuilder()
+        keyboard.button(text="🔙 Назад", callback_data="uid_flip:menu")
+        await callback.message.edit_text(text, reply_markup=keyboard.as_markup())
+        await callback.answer()
+
+        from aiogram.fsm.context import FSMContext
+        state = FSMContext(
+            storage=callback.bot._dispatcher.fsm.storage,
+            key=FSMContext.get_key(callback.from_user.id, callback.message.chat.id)
+        )
+        await state.set_state(SetupStates.waiting_for_uid_flip_leverage)
+
+    except Exception as e:
+        logger.error(f"UID flip leverage menu error: {e}")
+        await callback.answer("❌ Ошибка", show_alert=True)
+
+
+@router.callback_query(F.data == "uid_flip:position_size")
+async def uid_flip_position_size_menu(callback: CallbackQuery, user: UserSettings, db: Database):
+    """Меню размера позиции UID flip"""
+    try:
+        flip_settings = await db.get_uid_flip_settings(user.user_id)
+        if not flip_settings:
+            await callback.answer("❌ Настройки не найдены", show_alert=True)
+            return
+
+        text = (
+            f"**💰 Размер позиции UID Flip Trading**\n\n"
+            f"Текущий: **${flip_settings.position_size_usd:.0f}**\n\n"
+            f"Введите размер в USDT (1-10000):\n"
+            f"_(Отправьте число сообщением)_"
+        )
+        keyboard = InlineKeyboardBuilder()
+        keyboard.button(text="🔙 Назад", callback_data="uid_flip:menu")
+        await callback.message.edit_text(text, reply_markup=keyboard.as_markup())
+        await callback.answer()
+
+        from aiogram.fsm.context import FSMContext
+        state = FSMContext(
+            storage=callback.bot._dispatcher.fsm.storage,
+            key=FSMContext.get_key(callback.from_user.id, callback.message.chat.id)
+        )
+        await state.set_state(SetupStates.waiting_for_uid_flip_position_size)
+
+    except Exception as e:
+        logger.error(f"UID flip position size menu error: {e}")
+        await callback.answer("❌ Ошибка", show_alert=True)
+
+
+@router.callback_query(F.data == "uid_flip:stats")
+async def uid_flip_stats(callback: CallbackQuery, user: UserSettings, db: Database):
+    """Статистика UID flip trading"""
+    try:
+        from services.mexc_uid_trader import uid_flip_trader
+        status = await uid_flip_trader.get_session_status(user.user_id)
+        stats = await db.get_uid_flip_trade_stats(user.user_id)
+
+        today_pnl = status.get("today_pnl", 0)
+        today_count = status.get("today_count", 0)
+        is_active = status.get("active", False)
+
+        active_symbols = status.get("symbols", [])
+        symbols_text = ""
+        for sym_data in active_symbols:
+            has_pos = "🟢" if sym_data.get("has_position") else "⚪"
+            symbols_text += f"  {has_pos} {sym_data['symbol']} (флипов: {sym_data.get('trades_today', 0)})\n"
+
+        text = (
+            f"**📊 UID Flip Trading Статистика**\n\n"
+            f"🤖 Статус: {'🟢 Активен' if is_active else '🔴 Остановлен'}\n"
+            f"📊 Флипов сегодня: **{today_count}**\n"
+            f"💰 P&L сегодня: **${today_pnl:.4f}**\n\n"
+            f"**📈 Общая статистика (все время):**\n"
+            f"Всего сделок: **{stats.get('total_trades', 0)}**\n"
+            f"Общий P&L: **${stats.get('total_pnl', 0):.4f}**\n"
+            f"Винрейт: **{stats.get('win_rate', 0):.1f}%**\n"
+            f"Прибыльных: **{stats.get('wins', 0)}** | Убыточных: **{stats.get('losses', 0)}**\n\n"
+        )
+        if active_symbols:
+            text += f"**📋 Активные символы:**\n{symbols_text}"
+
+        keyboard = InlineKeyboardBuilder()
+        keyboard.button(text="🔄 Обновить", callback_data="uid_flip:stats")
+        keyboard.button(text="🔙 Назад", callback_data="uid_flip:menu")
+        keyboard.adjust(1)
+
+        await callback.message.edit_text(text, reply_markup=keyboard.as_markup())
+        await callback.answer()
+    except Exception as e:
+        logger.error(f"UID flip stats error: {e}")
+        await callback.answer("❌ Ошибка загрузки статистики", show_alert=True)
+
+
+# ----- UID Session Management -----
+
+async def show_uid_session_menu(callback: CallbackQuery, user: UserSettings, db: Database):
+    """Меню управления UID сессией"""
+    try:
+        flip_settings = await db.get_uid_flip_settings(user.user_id)
+        if not flip_settings:
+            flip_settings = await db.create_uid_flip_settings(user.user_id)
+
+        uid_display = f"`{flip_settings.uid[:30]}...`" if flip_settings.uid and len(flip_settings.uid) > 30 else f"`{flip_settings.uid}`" if flip_settings.uid else "❌ Не указан"
+        bearer_display = f"`{flip_settings.bearer_token[:30]}...`" if flip_settings.bearer_token and len(flip_settings.bearer_token) > 30 else "❌ Не указан"
+        cookies_display = "✅ Сохранены" if flip_settings.cookies else "❌ Не указаны"
+
+        text = (
+            f"**🔑 UID Сессия MEXC**\n\n"
+            f"🆔 UID: {uid_display}\n"
+            f"🔑 Bearer: {bearer_display}\n"
+            f"🍪 Cookies: {cookies_display}\n\n"
+        )
+
+        if flip_settings.uid and flip_settings.bearer_token:
+            try:
+                from services.mexc_uid_trader import MexcUIDClient
+                client = MexcUIDClient(
+                    uid=flip_settings.uid,
+                    bearer_token=flip_settings.bearer_token,
+                    cookies=flip_settings.cookies,
+                )
+                try:
+                    conn = await client.test_connection()
+                    if conn.get("success"):
+                        bal = conn.get("balance_usdt", 0)
+                        text += f"💳 Баланс: **${bal:.2f} USDT**\n✅ Сессия активна\n"
+                    else:
+                        text += f"⚠️ Сессия недействительна: `{conn.get('error', '')[:80]}`\n"
+                finally:
+                    await client.close()
+            except Exception as e:
+                text += f"⚠️ Ошибка проверки: `{str(e)[:80]}`\n"
+
+        keyboard = InlineKeyboardBuilder()
+        if flip_settings.uid or flip_settings.bearer_token:
+            keyboard.button(text="🔄 Обновить", callback_data="uid_flip:session_add")
+            keyboard.button(text="❌ Удалить", callback_data="uid_flip:session_delete")
+        else:
+            keyboard.button(text="➕ Добавить UID", callback_data="uid_flip:session_add")
+        keyboard.button(text="🔙 Назад", callback_data="uid_flip:menu")
+        keyboard.adjust(2, 1)
+
+        await callback.message.edit_text(text, reply_markup=keyboard.as_markup())
+        await callback.answer()
+    except Exception as e:
+        logger.error(f"UID session menu error: {e}")
+        await callback.answer("❌ Ошибка", show_alert=True)
+
+
+@router.callback_query(F.data == "uid_flip:session_menu")
+async def uid_flip_session_menu_handler(callback: CallbackQuery, user: UserSettings, db: Database):
+    await show_uid_session_menu(callback, user, db)
+
+
+@router.callback_query(F.data == "uid_flip:session_add")
+async def uid_flip_session_add(callback: CallbackQuery, state: FSMContext, user: UserSettings):
+    """Начать ввод UID данных"""
+    try:
+        await state.set_state(SetupStates.waiting_for_uid_input)
+        text = (
+            "**🆔 Добавление MEXC UID сессии**\n\n"
+            "**Как получить данные:**\n"
+            "1. Откройте futures.mexc.com в браузере\n"
+            "2. Залогиньтесь\n"
+            "3. Откройте DevTools (F12) → Network\n"
+            "4. Найдите UID в ответах API (поле `uid` или `userId`)\n"
+            "5. Скопируйте Bearer токен из заголовка Authorization\n\n"
+            "**Шаг 1/3: Введите UID:**"
+        )
+        keyboard = InlineKeyboardBuilder()
+        keyboard.button(text="🔙 Назад", callback_data="uid_flip:session_menu")
+        await callback.message.edit_text(text, reply_markup=keyboard.as_markup())
+        await callback.answer()
+    except Exception as e:
+        logger.error(f"UID session add error: {e}")
+        await callback.answer("❌ Ошибка", show_alert=True)
+
+
+@router.callback_query(F.data == "uid_flip:session_delete")
+async def uid_flip_session_delete(callback: CallbackQuery, user: UserSettings, db: Database):
+    """Удалить UID сессию"""
+    try:
+        flip_settings = await db.get_uid_flip_settings(user.user_id)
+        if not flip_settings:
+            await callback.answer("❌ Настройки не найдены", show_alert=True)
+            return
+
+        flip_settings.uid = ""
+        flip_settings.bearer_token = ""
+        flip_settings.cookies = ""
+        await db.update_uid_flip_settings(flip_settings)
+
+        await callback.answer("✅ UID сессия удалена", show_alert=True)
+        await show_uid_session_menu(callback, user, db)
+    except Exception as e:
+        logger.error(f"UID session delete error: {e}")
         await callback.answer("❌ Ошибка", show_alert=True)

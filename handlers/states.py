@@ -36,12 +36,19 @@ class SetupStates(StatesGroup):
     waiting_for_sl_price = State()
     waiting_for_tp_price = State()
     waiting_for_partial_percent = State()
-    # MEXC Flip Trading states
+    # MEXC Flip Trading states (API)
     waiting_for_flip_leverage = State()
     waiting_for_flip_position_size = State()
     waiting_for_flip_symbols = State()
     waiting_for_flip_api_key = State()      # Ввод API ключа MEXC
     waiting_for_flip_api_secret = State()   # Ввод API секрета MEXC
+    # MEXC UID Flip Trading states
+    waiting_for_uid_flip_leverage = State()
+    waiting_for_uid_flip_position_size = State()
+    waiting_for_uid_flip_symbols = State()
+    waiting_for_uid_input = State()         # Ввод UID MEXC
+    waiting_for_uid_bearer_token = State()  # Ввод Bearer Token
+    waiting_for_uid_cookies = State()       # Ввод Cookies
 
 @states_router.message(SetupStates.waiting_for_api_key)
 async def process_api_key(message: Message, state: FSMContext, user: UserSettings):
@@ -878,5 +885,255 @@ async def process_flip_api_secret(message: Message, state: FSMContext, user: Use
 
     except Exception as e:
         logger.error(f"API secret save error: {e}")
+        await message.answer(f"❌ Ошибка: {html.escape(str(e))[:200]}")
+        await state.clear()
+
+
+# ==================== MEXC UID FLIP TRADING STATE HANDLERS ====================
+
+@states_router.message(SetupStates.waiting_for_uid_input)
+async def process_uid_input(message: Message, state: FSMContext, user: UserSettings):
+    """Обработка ввода MEXC UID"""
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Отменено")
+        return
+
+    uid = message.text.strip()
+    if not uid or len(uid) < 3:
+        await message.answer("❌ UID слишком короткий. Введите корректный UID:")
+        return
+
+    await state.update_data(uid_flip_uid=uid)
+    await state.set_state(SetupStates.waiting_for_uid_bearer_token)
+
+    await message.answer(
+        f"✅ **UID сохранён:** `{uid[:20]}...`\n\n"
+        f"**🔐 Шаг 2/3: Введите Bearer Token**\n\n"
+        f"Откройте DevTools → Network, найдите заголовок `Authorization: Bearer ...`\n"
+        f"в любом запросе к futures.mexc.com и скопируйте токен после `Bearer `:\n\n"
+        f"_(Отправьте /cancel для отмены)_"
+    )
+
+
+@states_router.message(SetupStates.waiting_for_uid_bearer_token)
+async def process_uid_bearer_token(message: Message, state: FSMContext, user: UserSettings):
+    """Обработка ввода Bearer Token"""
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Отменено")
+        return
+
+    bearer = message.text.strip()
+    if len(bearer) < 20:
+        await message.answer("❌ Bearer Token слишком короткий. Попробуйте ещё:")
+        return
+
+    # Убираем префикс Bearer если пользователь скопировал его
+    bearer = bearer.replace("Bearer ", "").replace("bearer ", "")
+
+    await state.update_data(uid_flip_bearer=bearer)
+    await state.set_state(SetupStates.waiting_for_uid_cookies)
+
+    await message.answer(
+        f"✅ **Bearer Token сохранён**\n\n"
+        f"**🍪 Шаг 3/3: Введите Cookies (опционально)**\n\n"
+        f"Откройте DevTools → Application → Cookies, скопируйте ключевые cookies\n"
+        f"в формате `key1=value1; key2=value2`.\n\n"
+        f"Если не хотите вводить cookies — отправьте прочерк `-`:\n\n"
+        f"_(Отправьте /cancel для отмены)_"
+    )
+
+
+@states_router.message(SetupStates.waiting_for_uid_cookies)
+async def process_uid_cookies(message: Message, state: FSMContext, user: UserSettings, db: Database):
+    """Обработка ввода Cookies и сохранение всех UID данных"""
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Отменено")
+        return
+
+    cookies = message.text.strip()
+    if cookies == "-":
+        cookies = ""
+
+    data = await state.get_data()
+    uid = data.get('uid_flip_uid', '')
+    bearer = data.get('uid_flip_bearer', '')
+
+    if not uid or not bearer:
+        await message.answer("❌ Ошибка: UID или Bearer Token не найдены. Начните заново.")
+        await state.clear()
+        return
+
+    try:
+        # Сохраняем в БД
+        from services.mexc_uid_trader import UIDFlipSettings
+
+        flip_settings = await db.get_uid_flip_settings(user.user_id)
+        if not flip_settings:
+            flip_settings = await db.create_uid_flip_settings(user.user_id)
+
+        flip_settings.uid = uid
+        flip_settings.bearer_token = bearer
+        flip_settings.cookies = cookies
+        await db.update_uid_flip_settings(flip_settings)
+
+        await state.clear()
+
+        # Пробуем подключиться
+        await message.answer("🔄 Проверяю подключение через UID...")
+
+        from services.mexc_uid_trader import MexcUIDClient
+        client = MexcUIDClient(uid=uid, bearer_token=bearer, cookies=cookies)
+        try:
+            conn = await client.test_connection()
+
+            keyboard = InlineKeyboardBuilder()
+            keyboard.button(text="🔑 UID меню", callback_data="uid_flip:menu")
+            keyboard.button(text="📱 Меню", callback_data="menu:main")
+            keyboard.adjust(1)
+
+            if conn.get('success'):
+                bal = conn.get('balance_usdt', 0)
+                await message.answer(
+                    f"✅ **MEXC UID подключён!**\n\n"
+                    f"💳 Баланс: `${bal:.2f} USDT`\n"
+                    f"🆔 UID: `{uid[:20]}...`\n"
+                    f"🔑 Bearer: `{bearer[:20]}...`\n"
+                    f"{'🍪 Cookies: сохранены' if cookies else '🍪 Cookies: не указаны'}\n\n"
+                    f"Теперь вы можете запускать UID Flip Trading.",
+                    reply_markup=keyboard.as_markup()
+                )
+            else:
+                await message.answer(
+                    f"⚠️ **UID данные сохранены, но проверка не пройдена**\n\n"
+                    f"Причина: `{conn.get('error', 'Неизвестно')[:100]}`\n\n"
+                    f"Возможно, сессия истекла. Обновите Bearer Token.",
+                    reply_markup=keyboard.as_markup()
+                )
+        finally:
+            await client.close()
+
+    except Exception as e:
+        logger.error(f"UID cookies save error: {e}")
+        await message.answer(f"❌ Ошибка: {html.escape(str(e))[:200]}")
+        await state.clear()
+
+
+@states_router.message(SetupStates.waiting_for_uid_flip_leverage)
+async def process_uid_flip_leverage(message: Message, state: FSMContext, user: UserSettings, db: Database):
+    """Обработка ввода плеча для UID flip trading"""
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Отменено")
+        return
+
+    try:
+        leverage = int(message.text.strip())
+        if leverage < 1 or leverage > 300:
+            await message.answer("❌ Плечо от 1 до 300. Попробуйте:")
+            return
+
+        if db:
+            flip_settings = await db.get_uid_flip_settings(user.user_id)
+            if not flip_settings:
+                flip_settings = await db.create_uid_flip_settings(user.user_id)
+            flip_settings.leverage = leverage
+            await db.update_uid_flip_settings(flip_settings)
+
+        await state.clear()
+
+        keyboard = InlineKeyboardBuilder()
+        keyboard.button(text="⚡ К плечу", callback_data="uid_flip:leverage")
+        keyboard.button(text="🔑 UID меню", callback_data="uid_flip:menu")
+        keyboard.adjust(1)
+
+        await message.answer(f"✅ **Плечо UID установлено: {leverage}x**", reply_markup=keyboard.as_markup())
+
+    except ValueError:
+        await message.answer("❌ Введите целое число (например: 200):")
+    except Exception as e:
+        logger.error(f"UID flip leverage error: {e}")
+        await message.answer(f"❌ Ошибка: {html.escape(str(e))[:200]}")
+        await state.clear()
+
+
+@states_router.message(SetupStates.waiting_for_uid_flip_position_size)
+async def process_uid_flip_position_size(message: Message, state: FSMContext, user: UserSettings, db: Database):
+    """Обработка ввода размера позиции для UID flip trading"""
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Отменено")
+        return
+
+    try:
+        size = float(message.text.strip())
+        if size < 1 or size > 10000:
+            await message.answer("❌ Размер позиции от $1 до $10000:")
+            return
+
+        if db:
+            flip_settings = await db.get_uid_flip_settings(user.user_id)
+            if not flip_settings:
+                flip_settings = await db.create_uid_flip_settings(user.user_id)
+            flip_settings.position_size_usd = size
+            await db.update_uid_flip_settings(flip_settings)
+
+        await state.clear()
+
+        keyboard = InlineKeyboardBuilder()
+        keyboard.button(text="💰 К размеру", callback_data="uid_flip:position_size")
+        keyboard.button(text="🔑 UID меню", callback_data="uid_flip:menu")
+        keyboard.adjust(1)
+
+        await message.answer(f"✅ **Размер позиции UID: ${size:.0f}**", reply_markup=keyboard.as_markup())
+
+    except ValueError:
+        await message.answer("❌ Введите число (например: 100):")
+    except Exception as e:
+        logger.error(f"UID flip position size error: {e}")
+        await message.answer(f"❌ Ошибка: {html.escape(str(e))[:200]}")
+        await state.clear()
+
+
+@states_router.message(SetupStates.waiting_for_uid_flip_symbols)
+async def process_uid_flip_symbols(message: Message, state: FSMContext, user: UserSettings, db: Database):
+    """Обработка ввода символов для UID flip trading"""
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Отменено")
+        return
+
+    try:
+        raw = message.text.strip()
+        symbols = [s.strip().upper() for s in raw.replace(" ", ",").split(",") if s.strip()]
+
+        if not symbols:
+            await message.answer("❌ Введите хотя бы один символ (например: BTC, ETH, SOL):")
+            return
+
+        if len(symbols) > 20:
+            symbols = symbols[:20]
+
+        if db:
+            flip_settings = await db.get_uid_flip_settings(user.user_id)
+            if not flip_settings:
+                flip_settings = await db.create_uid_flip_settings(user.user_id)
+            flip_settings.selected_symbols = symbols
+            await db.update_uid_flip_settings(flip_settings)
+
+        await state.clear()
+
+        symbols_str = ", ".join(symbols)
+        keyboard = InlineKeyboardBuilder()
+        keyboard.button(text="📋 К символам", callback_data="uid_flip:symbols")
+        keyboard.button(text="🔑 UID меню", callback_data="uid_flip:menu")
+        keyboard.adjust(1)
+
+        await message.answer(f"✅ **Символы UID: {symbols_str}**", reply_markup=keyboard.as_markup())
+
+    except Exception as e:
+        logger.error(f"UID flip symbols error: {e}")
         await message.answer(f"❌ Ошибка: {html.escape(str(e))[:200]}")
         await state.clear()
