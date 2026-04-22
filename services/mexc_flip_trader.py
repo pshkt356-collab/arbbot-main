@@ -1118,11 +1118,30 @@ class FlipSession:
                     f"position=${position_size:.0f} ({self.settings.leverage}x)"
                 )
 
-            # --- Получаем precision символа ---
-            vol_scale, min_vol, vol_unit = await self.mexc_api.get_quantity_precision(self.symbol)
+            # --- Получаем детали контракта (precision + contractSize) ---
+            contract = await self.mexc_api.get_contract_detail(self.symbol)
+            if contract:
+                contract_size = float(contract.get('contractSize', 1))
+                vol_scale = int(contract.get('volScale', 0))
+                min_vol = float(contract.get('minVol', 1))
+                vol_unit = float(contract.get('volUnit', 1))
+                logger.info(
+                    f"[FlipSession] Contract {self.symbol}: contractSize={contract_size}, "
+                    f"volScale={vol_scale}, minVol={min_vol}, volUnit={vol_unit}"
+                )
+            else:
+                # Fallback если API detail недоступен
+                contract_size = 1.0
+                vol_scale, min_vol, vol_unit = 3, 0.001, 0.001
+                logger.warning(
+                    f"[FlipSession] No contract detail for {self.symbol}, fallback: "
+                    f"contractSize=1.0, volScale=3, minVol=0.001"
+                )
 
-            # Рассчитываем количество: (маржа * плечо) / цена
-            raw_quantity = position_size / binance_price
+            # MEXC futures USDT-M: vol = количество контрактов.
+            # Позиция (USDT) = qty * contractSize.
+            # qty = позиция / contractSize
+            raw_quantity = position_size / contract_size
 
             # Округляем quantity согласно правилам MEXC для данного символа
             quantity = self.mexc_api.round_quantity(raw_quantity, vol_scale, vol_unit, min_vol)
@@ -1130,14 +1149,16 @@ class FlipSession:
             if quantity <= 0:
                 logger.warning(
                     f"[FlipSession] Invalid quantity for {self.symbol}: raw={raw_quantity:.6f}, "
-                    f"rounded={quantity}, min_vol={min_vol}, vol_scale={vol_scale}, vol_unit={vol_unit}"
+                    f"rounded={quantity}, min_vol={min_vol}, vol_scale={vol_scale}, vol_unit={vol_unit}, "
+                    f"contractSize={contract_size}"
                 )
                 return
 
             # Открываем позицию
             logger.info(
                 f"[FlipSession] PLACING LONG order: user={self.user_id} symbol={self.symbol} "
-                f"qty={quantity} (raw={raw_quantity:.6f}) margin=${margin_usd:.2f} position=${position_size:.0f} "
+                f"qty={quantity} (raw={raw_quantity:.6f}) contractSize={contract_size} "
+                f"margin=${margin_usd:.2f} position=${position_size:.0f} "
                 f"({self.settings.leverage}x) mode={'TEST' if self.settings.test_mode else 'REAL'}"
             )
             result = await self.mexc_api.open_long(self.symbol, quantity, self.settings.leverage)
@@ -1226,23 +1247,42 @@ class FlipSession:
                     logger.error(f"[FlipSession] INSUFFICIENT MARGIN user={self.user_id}: available=${available:.2f}, margin_required=${margin_usd:.2f}. Please deposit USDT to MEXC futures account.")
                     return
 
-            # --- Получаем precision символа ---
-            vol_scale, min_vol, vol_unit = await self.mexc_api.get_quantity_precision(self.symbol)
+            # --- Получаем детали контракта (precision + contractSize) ---
+            contract = await self.mexc_api.get_contract_detail(self.symbol)
+            if contract:
+                contract_size = float(contract.get('contractSize', 1))
+                vol_scale = int(contract.get('volScale', 0))
+                min_vol = float(contract.get('minVol', 1))
+                vol_unit = float(contract.get('volUnit', 1))
+                logger.info(
+                    f"[FlipSession] Contract {self.symbol}: contractSize={contract_size}, "
+                    f"volScale={vol_scale}, minVol={min_vol}, volUnit={vol_unit}"
+                )
+            else:
+                contract_size = 1.0
+                vol_scale, min_vol, vol_unit = 3, 0.001, 0.001
+                logger.warning(
+                    f"[FlipSession] No contract detail for {self.symbol}, fallback: "
+                    f"contractSize=1.0, volScale=3, minVol=0.001"
+                )
 
-            # Рассчитываем количество
-            raw_quantity = position_size / binance_price
+            # MEXC futures USDT-M: vol = количество контрактов.
+            # qty = позиция / contractSize
+            raw_quantity = position_size / contract_size
             quantity = self.mexc_api.round_quantity(raw_quantity, vol_scale, vol_unit, min_vol)
 
             if quantity <= 0:
                 logger.warning(
                     f"[FlipSession] Invalid quantity for {self.symbol}: raw={raw_quantity:.6f}, "
-                    f"rounded={quantity}, min_vol={min_vol}, vol_scale={vol_scale}, vol_unit={vol_unit}"
+                    f"rounded={quantity}, min_vol={min_vol}, vol_scale={vol_scale}, vol_unit={vol_unit}, "
+                    f"contractSize={contract_size}"
                 )
                 return
 
             logger.info(
                 f"[FlipSession] PLACING SHORT order: user={self.user_id} symbol={self.symbol} "
-                f"qty={quantity} (raw={raw_quantity:.6f}) margin=${margin_usd:.2f} position=${position_size:.0f} "
+                f"qty={quantity} (raw={raw_quantity:.6f}) contractSize={contract_size} "
+                f"margin=${margin_usd:.2f} position=${position_size:.0f} "
                 f"({self.settings.leverage}x) mode={'TEST' if self.settings.test_mode else 'REAL'}"
             )
             result = await self.mexc_api.open_short(self.symbol, quantity, self.settings.leverage)
