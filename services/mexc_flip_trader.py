@@ -902,12 +902,13 @@ class FlipSession:
 
         async with self._position_lock:
             try:
+                logger.info(f"[FlipSession] HANDLER START user={self.user_id} dir={direction} has_pos={self.has_open_position} cooldown_until={self._open_failure_cooldown_until:.0f} now={time.time():.0f}")
                 if direction == 'up' and not self.has_open_position:
                     # Проверяем cooldown после неудачной попытки
                     now = time.time()
                     if now < self._open_failure_cooldown_until:
                         remaining = int(self._open_failure_cooldown_until - now)
-                        logger.debug(
+                        logger.info(
                             f"[FlipSession] OPEN COOLDOWN user={self.user_id} symbol={self.symbol}: "
                             f"{remaining}s remaining"
                         )
@@ -930,15 +931,16 @@ class FlipSession:
                     logger.info(f"[FlipSession] CLOSING long (reverse signal): user={self.user_id}, symbol={self.symbol}, trigger_price={binance_price:.4f}")
                     await self._close_position("reverse")
                 else:
-                    logger.debug(
+                    logger.info(
                         f"[FlipSession] SIGNAL IGNORED user={self.user_id} symbol={self.symbol}: "
-                        f"direction={direction} has_pos={self.has_open_position} close_on_reverse={self.settings.close_on_reverse}"
+                        f"direction={direction} has_pos={self.has_open_position} dir={self.current_direction} close_on_rev={self.settings.close_on_reverse}"
                     )
             except Exception as e:
                 logger.error(f"[FlipSession] Direction handler error: user={self.user_id}, symbol={self.symbol}: {e}", exc_info=True)
 
     async def _open_position(self, binance_price: float):
         """Открыть лонг позицию на MEXC"""
+        logger.info(f"[FlipSession] _open_position CALLED user={self.user_id} symbol={self.symbol} price={binance_price:.4f} test={self.settings.test_mode}")
         try:
             # Проверяем дневные лимиты перед открытием
             today_count = await self.db.get_today_flip_count(self.user_id)
@@ -1044,6 +1046,7 @@ class FlipSession:
 
     async def _open_short_position(self, binance_price: float):
         """Открыть шорт позицию на MEXC"""
+        logger.info(f"[FlipSession] _open_short_position CALLED user={self.user_id} symbol={self.symbol} price={binance_price:.4f} test={self.settings.test_mode}")
         try:
             # Проверяем дневные лимиты
             today_count = await self.db.get_today_flip_count(self.user_id)
