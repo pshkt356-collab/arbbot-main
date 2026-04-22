@@ -10,8 +10,9 @@ import time
 import logging
 import hmac
 import hashlib
+import math
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Callable
+from typing import Dict, List, Optional, Callable, Tuple
 from dataclasses import dataclass, field
 from collections import deque
 from decimal import Decimal, ROUND_DOWN
@@ -309,6 +310,8 @@ class MexcAPI:
         self.api_key = api_key or settings.mexc_api_key
         self.api_secret = api_secret or settings.mexc_api_secret
         self._session: Optional[aiohttp.ClientSession] = None
+        # Кэш деталей контрактов: {symbol: contract_data}
+        self._contract_cache: Dict[str, dict] = {}
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -429,6 +432,103 @@ class MexcAPI:
         except Exception as e:
             logger.error(f"MEXC depth error for {symbol}: {e}")
             return {}
+
+    async def get_contract_detail(self, symbol: str) -> dict:
+        """
+        Получить детали контракта с MEXC (precision, minVol, volUnit и т.д.).
+        Использует кэширование для снижения нагрузки на API.
+        Endpoint: GET /api/v1/contract/detail/{symbol}
+        """
+        mexc_symbol = f"{symbol.upper()}_USDT"
+
+        # Проверяем кэш
+        if mexc_symbol in self._contract_cache:
+            return self._contract_cache[mexc_symbol]
+
+        session = await self._get_session()
+        try:
+            async with session.get(
+                f"{self.BASE_URL}/api/v1/contract/detail/{mexc_symbol}"
+            ) as resp:
+                data = await resp.json()
+                if data.get('success') or data.get('code') == 0:
+                    contract = data.get('data', {})
+                    self._contract_cache[mexc_symbol] = contract
+                    logger.info(
+                        f"[MexcAPI] Contract detail loaded for {mexc_symbol}: "
+                        f"volScale={contract.get('volScale')}, minVol={contract.get('minVol')}, "
+                        f"volUnit={contract.get('volUnit')}, contractSize={contract.get('contractSize')}"
+                    )
+                    return contract
+                else:
+                    logger.warning(
+                        f"[MexcAPI] Failed to get contract detail for {mexc_symbol}: {data}"
+                    )
+                    return {}
+        except Exception as e:
+            logger.error(f"[MexcAPI] Get contract detail error for {mexc_symbol}: {e}")
+            return {}
+
+    async def get_quantity_precision(self, symbol: str) -> Tuple[int, float, float]:
+        """
+        Получить precision параметры для quantity символа.
+
+        Returns:
+            tuple: (vol_scale, min_vol, vol_unit)
+                vol_scale — количество знаков после запятой (0=целое)
+                min_vol   — минимальный объём ордера
+                vol_unit  — минимальный шаг объёма
+        """
+        contract = await self.get_contract_detail(symbol)
+        if not contract:
+            # Fallback: безопасные значения по умолчанию
+            logger.warning(f"[MexcAPI] No contract detail for {symbol}, using fallback precision=3")
+            return 3, 0.001, 0.001
+
+        vol_scale = int(contract.get('volScale', 0))
+        min_vol = float(contract.get('minVol', 1))
+        vol_unit = float(contract.get('volUnit', 1))
+        return vol_scale, min_vol, vol_unit
+
+    def clear_contract_cache(self):
+        """Очистить кэш контрактов (при смене ключей и т.д.)"""
+        self._contract_cache.clear()
+
+    @staticmethod
+    def round_quantity(quantity: float, vol_scale: int, vol_unit: float, min_vol: float) -> float:
+        """
+        Округлить quantity согласно правилам MEXC:
+        - Округление вниз до vol_scale знаков
+        - Округление вниз до кратности vol_unit
+        - Проверка минимального объёма min_vol
+        """
+        if quantity <= 0:
+            return 0.0
+
+        # Формируем строку квантования: '1' для целых, '0.001' для 3 знаков и т.д.
+        if vol_scale <= 0:
+            quantize_str = '1'
+        else:
+            quantize_str = '0.' + '0' * vol_scale
+
+        # Округляем до нужного количества знаков
+        rounded = float(Decimal(str(quantity)).quantize(Decimal(quantize_str), rounding=ROUND_DOWN))
+
+        # Округляем до кратности vol_unit (вниз)
+        if vol_unit > 0:
+            rounded = math.floor(rounded / vol_unit) * vol_unit
+            # Повторно округляем после операции с плавающей точкой
+            rounded = float(Decimal(str(rounded)).quantize(Decimal(quantize_str), rounding=ROUND_DOWN))
+
+        # Проверяем минимальный объём
+        if rounded < min_vol:
+            logger.warning(
+                f"[MexcAPI] Quantity {rounded} < minVol {min_vol} after rounding, "
+                f"original={quantity}, vol_scale={vol_scale}, vol_unit={vol_unit}"
+            )
+            return 0.0
+
+        return rounded
 
     async def set_leverage(self, symbol: str, leverage: int, open_type: int = 1, position_type: int = 1) -> bool:
         """Установить плечо для символа.
@@ -825,6 +925,8 @@ class FlipSession:
         self._position_lock = asyncio.Lock()
         # Храним время открытия сделки для точного расчета длительности
         self._opened_at: Optional[str] = None
+        # Сохраняем quantity при открытии позиции — используем при закрытии
+        self.current_quantity: float = 0.0
         # Cooldown после неудачной попытки открытия позиции (чтобы не спамить API)
         self._open_failure_cooldown_until: float = 0.0
         # Stop-loss, take-profit, time limit settings
@@ -1015,20 +1117,26 @@ class FlipSession:
                     f"position=${position_size:.0f} ({self.settings.leverage}x)"
                 )
 
-            # Рассчитываем количество: (маржа * плечо) / цена
-            quantity = position_size / binance_price
+            # --- Получаем precision символа ---
+            vol_scale, min_vol, vol_unit = await self.mexc_api.get_quantity_precision(self.symbol)
 
-            # Округляем quantity (для MEXC обычно 3 знака)
-            quantity = float(Decimal(str(quantity)).quantize(Decimal('0.001'), rounding=ROUND_DOWN))
+            # Рассчитываем количество: (маржа * плечо) / цена
+            raw_quantity = position_size / binance_price
+
+            # Округляем quantity согласно правилам MEXC для данного символа
+            quantity = self.mexc_api.round_quantity(raw_quantity, vol_scale, vol_unit, min_vol)
 
             if quantity <= 0:
-                logger.warning(f"[FlipSession] Invalid quantity for {self.symbol}: {quantity}")
+                logger.warning(
+                    f"[FlipSession] Invalid quantity for {self.symbol}: raw={raw_quantity:.6f}, "
+                    f"rounded={quantity}, min_vol={min_vol}, vol_scale={vol_scale}, vol_unit={vol_unit}"
+                )
                 return
 
             # Открываем позицию
             logger.info(
                 f"[FlipSession] PLACING LONG order: user={self.user_id} symbol={self.symbol} "
-                f"qty={quantity:.6f} margin=${margin_usd:.2f} position=${position_size:.0f} "
+                f"qty={quantity} (raw={raw_quantity:.6f}) margin=${margin_usd:.2f} position=${position_size:.0f} "
                 f"({self.settings.leverage}x) mode={'TEST' if self.settings.test_mode else 'REAL'}"
             )
             result = await self.mexc_api.open_long(self.symbol, quantity, self.settings.leverage)
@@ -1043,6 +1151,7 @@ class FlipSession:
             self.entry_price = entry_price
             self.entry_binance_price = binance_price
             self.has_open_position = True
+            self.current_quantity = quantity  # Сохраняем для закрытия
 
             # Сохраняем время открытия
             now_utc = datetime.now(timezone.utc)
@@ -1116,15 +1225,25 @@ class FlipSession:
                     logger.error(f"[FlipSession] INSUFFICIENT MARGIN user={self.user_id}: available=${available:.2f}, margin_required=${margin_usd:.2f}. Please deposit USDT to MEXC futures account.")
                     return
 
+            # --- Получаем precision символа ---
+            vol_scale, min_vol, vol_unit = await self.mexc_api.get_quantity_precision(self.symbol)
+
             # Рассчитываем количество
-            quantity = position_size / binance_price
-            quantity = float(Decimal(str(quantity)).quantize(Decimal('0.001'), rounding=ROUND_DOWN))
+            raw_quantity = position_size / binance_price
+            quantity = self.mexc_api.round_quantity(raw_quantity, vol_scale, vol_unit, min_vol)
 
             if quantity <= 0:
-                logger.warning(f"[FlipSession] Invalid quantity for {self.symbol}: {quantity}")
+                logger.warning(
+                    f"[FlipSession] Invalid quantity for {self.symbol}: raw={raw_quantity:.6f}, "
+                    f"rounded={quantity}, min_vol={min_vol}, vol_scale={vol_scale}, vol_unit={vol_unit}"
+                )
                 return
 
-            logger.info(f"[FlipSession] PLACING SHORT order: user={self.user_id} symbol={self.symbol} qty={quantity:.6f} margin=${margin_usd:.2f} position=${position_size:.0f} ({self.settings.leverage}x) mode={'TEST' if self.settings.test_mode else 'REAL'}")
+            logger.info(
+                f"[FlipSession] PLACING SHORT order: user={self.user_id} symbol={self.symbol} "
+                f"qty={quantity} (raw={raw_quantity:.6f}) margin=${margin_usd:.2f} position=${position_size:.0f} "
+                f"({self.settings.leverage}x) mode={'TEST' if self.settings.test_mode else 'REAL'}"
+            )
             result = await self.mexc_api.open_short(self.symbol, quantity, self.settings.leverage)
 
             if not result.get('success'):
@@ -1138,6 +1257,7 @@ class FlipSession:
             self.entry_binance_price = binance_price
             self.has_open_position = True
             self.current_direction = 'short'
+            self.current_quantity = quantity  # Сохраняем для закрытия
 
             now_utc = datetime.now(timezone.utc)
             self._opened_at = now_utc.isoformat()
@@ -1166,7 +1286,7 @@ class FlipSession:
             logger.error(f"Open short position error: user={self.user_id}, symbol={self.symbol}: {e}")
 
     async def _close_position(self, reason: str):
-        """Закрыть лонг позицию на MEXC"""
+        """Закрыть позицию на MEXC (лонг или шорт в зависимости от current_direction)."""
         if not self.has_open_position or not self.current_trade_id:
             return
 
@@ -1174,19 +1294,43 @@ class FlipSession:
             # Получаем текущую цену Binance
             binance_price = self.price_tracker.get_latest_price(self.symbol)
 
-            # Рассчитываем количество для закрытия
-            # Рассчитываем количество: position_size = margin * leverage
-            position_size = self.settings.position_size_usd * self.settings.leverage
-            quantity = position_size / self.entry_price
-            quantity = float(Decimal(str(quantity)).quantize(Decimal('0.001'), rounding=ROUND_DOWN))
+            # --- Используем сохранённую quantity из сессии ---
+            # Если current_quantity не установлен (старая сессия), пересчитываем
+            quantity = self.current_quantity
+            if quantity <= 0:
+                logger.warning(
+                    f"[FlipSession] current_quantity not set, recalculating for {self.symbol}"
+                )
+                position_size = self.settings.position_size_usd * self.settings.leverage
+                raw_quantity = position_size / self.entry_price if self.entry_price > 0 else 0
+
+                # Получаем precision и округляем
+                vol_scale, min_vol, vol_unit = await self.mexc_api.get_quantity_precision(self.symbol)
+                quantity = self.mexc_api.round_quantity(raw_quantity, vol_scale, vol_unit, min_vol)
 
             if quantity <= 0:
-                quantity = 0.001  # Минимальное количество
+                logger.error(
+                    f"[FlipSession] Cannot close position: invalid quantity={quantity} for {self.symbol}"
+                )
+                return
 
+            # Приводим quantity к актуальной precision перед отправкой
+            vol_scale, min_vol, vol_unit = await self.mexc_api.get_quantity_precision(self.symbol)
+            quantity = self.mexc_api.round_quantity(quantity, vol_scale, vol_unit, min_vol)
+
+            if quantity <= 0:
+                logger.error(
+                    f"[FlipSession] Cannot close position: quantity became 0 after rounding for {self.symbol}"
+                )
+                return
+
+            direction_label = self.current_direction or 'long'
             logger.info(
                 f"[FlipSession] PLACING CLOSE order: user={self.user_id} symbol={self.symbol} "
-                f"qty={quantity:.6f} reason={reason} mode={'TEST' if self.settings.test_mode else 'REAL'}"
+                f"qty={quantity} dir={direction_label} reason={reason} "
+                f"mode={'TEST' if self.settings.test_mode else 'REAL'}"
             )
+
             # Закрываем в зависимости от направления
             if self.current_direction == 'short':
                 result = await self.mexc_api.close_short(self.symbol, quantity)
@@ -1195,16 +1339,17 @@ class FlipSession:
 
             if not result.get('success'):
                 err_msg = result.get('error', 'Unknown error')
-                logger.error(f"[FlipSession] CLOSE LONG FAILED user={self.user_id} symbol={self.symbol}: {err_msg}")
+                logger.error(
+                    f"[FlipSession] CLOSE {direction_label.upper()} FAILED user={self.user_id} "
+                    f"symbol={self.symbol}: {err_msg}"
+                )
                 # Не сбрасываем has_open_position чтобы попробовать закрыть позже
                 return
 
             exit_price = result.get('price', binance_price)
 
-            # Рассчитываем PnL
-            # Для лонга: PnL = (exit - entry) / entry * leverage * position_size
+            # Рассчитываем PnL с учетом направления
             if self.entry_price > 0:
-                # Рассчитываем PnL с учетом направления
                 if self.current_direction == 'short':
                     # Для шорта: прибыль когда цена падает
                     price_change_pct = (self.entry_price - exit_price) / self.entry_price * 100
@@ -1243,7 +1388,7 @@ class FlipSession:
 
             emoji = "GREEN" if pnl_usd >= 0 else "RED"
             logger.info(
-                f"[FlipSession] LONG CLOSED #{self.current_trade_id}: {self.symbol} "
+                f"[FlipSession] {direction_label.upper()} CLOSED #{self.current_trade_id}: {self.symbol} "
                 f"entry={self.entry_price:.4f} exit={exit_price:.4f} "
                 f"PnL=${pnl_usd:.4f} ({price_change_pct:.4f}%) "
                 f"dur={duration_ms}ms reason={reason} [{emoji}] "
@@ -1255,6 +1400,7 @@ class FlipSession:
             self.entry_price = 0.0
             self.entry_binance_price = 0.0
             self.current_direction = None
+            self.current_quantity = 0.0
             self._opened_at = None
 
         except Exception as e:
@@ -1273,7 +1419,11 @@ class FlipSession:
                     self.entry_price = trade.entry_price
                     self.entry_binance_price = trade.binance_entry_price
                     self._opened_at = trade.opened_at
-                    logger.info(f"[FlipSession] RESTORED position: {self.symbol} #{trade.id} dir={trade.direction}")
+                    self.current_quantity = trade.quantity  # Восстанавливаем quantity из БД
+                    logger.info(
+                        f"[FlipSession] RESTORED position: {self.symbol} #{trade.id} "
+                        f"dir={trade.direction} qty={trade.quantity}"
+                    )
                     return
         except Exception as e:
             logger.error(f"[FlipSession] Error loading open position: {e}")
