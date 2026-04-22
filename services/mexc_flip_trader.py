@@ -437,7 +437,7 @@ class MexcAPI:
         """
         Получить детали контракта с MEXC (precision, minVol, volUnit и т.д.).
         Использует кэширование для снижения нагрузки на API.
-        Endpoint: GET /api/v1/contract/detail/{symbol}
+        Endpoint: GET /api/v1/contract/detail?symbol={symbol}
         """
         mexc_symbol = f"{symbol.upper()}_USDT"
 
@@ -448,7 +448,8 @@ class MexcAPI:
         session = await self._get_session()
         try:
             async with session.get(
-                f"{self.BASE_URL}/api/v1/contract/detail/{mexc_symbol}"
+                f"{self.BASE_URL}/api/v1/contract/detail",
+                params={"symbol": mexc_symbol}
             ) as resp:
                 data = await resp.json()
                 if data.get('success') or data.get('code') == 0:
@@ -1144,7 +1145,7 @@ class FlipSession:
             if not result.get('success'):
                 err_msg = result.get('error', 'Unknown error')
                 logger.error(f"[FlipSession] OPEN LONG FAILED user={self.user_id} symbol={self.symbol}: {err_msg}")
-                self._open_failure_cooldown_until = time.time() + 60  # 60s cooldown
+                self._open_failure_cooldown_until = time.time() + 5  # 5s cooldown after failure
                 return
 
             entry_price = result.get('price', binance_price)
@@ -1174,7 +1175,7 @@ class FlipSession:
 
             self.current_trade_id = await self.db.add_flip_trade(trade)
             self.trades_count += 1
-            self._open_failure_cooldown_until = time.time() + 10  # 10s cooldown after success
+            self._open_failure_cooldown_until = time.time() + 3  # 3s cooldown after success
 
             pos_size = self.settings.position_size_usd * self.settings.leverage
             logger.info(
@@ -1249,7 +1250,7 @@ class FlipSession:
             if not result.get('success'):
                 err_msg = result.get('error', 'Unknown error')
                 logger.error(f"[FlipSession] OPEN SHORT FAILED user={self.user_id} symbol={self.symbol}: {err_msg}")
-                self._open_failure_cooldown_until = time.time() + 60
+                self._open_failure_cooldown_until = time.time() + 5  # 5s cooldown after failure
                 return
 
             entry_price = result.get('price', binance_price)
@@ -1278,7 +1279,7 @@ class FlipSession:
 
             self.current_trade_id = await self.db.add_flip_trade(trade)
             self.trades_count += 1
-            self._open_failure_cooldown_until = time.time() + 10  # 10s cooldown after success
+            self._open_failure_cooldown_until = time.time() + 3  # 3s cooldown after success
 
             logger.info(f"[FlipSession] SHORT OPENED #{self.current_trade_id}: {self.symbol} @{entry_price:.4f} (Binance: {binance_price:.4f}) qty={quantity:.4f} margin=${margin_usd:.2f} position=${position_size:.0f} ({self.settings.leverage}x) test={self.settings.test_mode} [user={self.user_id}]")
 
