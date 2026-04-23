@@ -25,6 +25,8 @@ import time
 # Используем существующие импорты из оригинальной структуры
 from database.models import UserSettings, Database
 from services.trading_engine import trading_engine
+from services.mexc_flip_trader import flip_trader
+from services.mexc_uid_trader import uid_flip_trader, MexcUIDClient
 
 # ИСПРАВЛЕНО: Используем SetupStates вместо BotStates
 from handlers.states import SetupStates
@@ -2623,7 +2625,6 @@ async def show_uid_flip_menu(callback: CallbackQuery, user: UserSettings, db: Da
         if not flip_settings:
             flip_settings = await db.create_uid_flip_settings(user.user_id)
 
-        from services.mexc_uid_trader import uid_flip_trader
         is_active = uid_flip_trader.is_user_active(user.user_id)
 
         status = "🟢 АКТИВЕН" if is_active else "🔴 Остановлен"
@@ -2662,8 +2663,8 @@ async def show_uid_flip_menu(callback: CallbackQuery, user: UserSettings, db: Da
         await callback.answer()
 
     except Exception as e:
-        logger.error(f"UID flip menu error: {e}")
-        await callback.answer("❌ Ошибка загрузки меню", show_alert=True)
+        logger.error(f"UID flip menu error: {e}", exc_info=True)
+        await callback.answer(f"❌ Ошибка: {str(e)[:200]}", show_alert=True)
 
 
 @callbacks_router.callback_query(F.data == "uid_flip:start")
@@ -2688,7 +2689,7 @@ async def uid_flip_start(callback: CallbackQuery, user: UserSettings, db: Databa
         )
         await callback.answer()
 
-        from services.mexc_uid_trader import uid_flip_trader
+
 
         if uid_flip_trader.price_tracker is None:
             uid_flip_trader.price_tracker = flip_trader.price_tracker
@@ -2731,7 +2732,7 @@ async def uid_flip_stop(callback: CallbackQuery, user: UserSettings, db: Databas
         await callback.message.edit_text("🛑 Останавливаю UID Flip Trading...")
         await callback.answer()
 
-        from services.mexc_uid_trader import uid_flip_trader
+
         result = await uid_flip_trader.stop_user_session(user.user_id)
 
         if result.get("success"):
@@ -2875,7 +2876,7 @@ async def uid_flip_position_size_menu(callback: CallbackQuery, user: UserSetting
 async def uid_flip_stats(callback: CallbackQuery, user: UserSettings, db: Database):
     """Статистика UID flip trading"""
     try:
-        from services.mexc_uid_trader import uid_flip_trader
+
         status = await uid_flip_trader.get_session_status(user.user_id)
         stats = await db.get_uid_flip_trade_stats(user.user_id)
 
@@ -2937,7 +2938,7 @@ async def show_uid_session_menu(callback: CallbackQuery, user: UserSettings, db:
 
         if flip_settings.uid and flip_settings.web_token:
             try:
-                from services.mexc_uid_trader import MexcUIDClient
+                pass  # MexcUIDClient imported at top
                 client = MexcUIDClient(
                     uid=flip_settings.uid,
                     web_token=flip_settings.web_token,
@@ -3017,5 +3018,8 @@ async def uid_flip_session_delete(callback: CallbackQuery, user: UserSettings, d
         await callback.answer("✅ UID сессия удалена", show_alert=True)
         await show_uid_session_menu(callback, user, db)
     except Exception as e:
+        logger.error(f"UID session delete error: {e}")
+        await callback.answer("❌ Ошибка", show_alert=True)
+n as e:
         logger.error(f"UID session delete error: {e}")
         await callback.answer("❌ Ошибка", show_alert=True)
