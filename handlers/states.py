@@ -1135,6 +1135,3 @@ async def process_uid_flip_symbols(message: Message, state: FSMContext, user: Us
         logger.error(f"UID flip symbols error: {e}")
         await message.answer(f"❌ Ошибка: {html.escape(str(e))[:200]}")
         await state.clear()
-ols error: {e}")
-        await message.answer(f"❌ Ошибка: {html.escape(str(e))[:200]}")
-        await state.clear()
