@@ -347,6 +347,7 @@ class Database:
                 await self._migrate_add_flip_tables()
                 await self._migrate_add_flip_api_columns()
                 await self._migrate_add_uid_flip_tables()
+                await self._migrate_add_uid_flip_columns()
                 self._initialized = True
                 logger.info(f"Database initialized: {self._db_path} (WAL mode)")
             except Exception as e:
@@ -1091,6 +1092,29 @@ class Database:
                     logger.info("Migration: created uid_flip_settings and uid_flip_trades tables")
         except Exception as e:
             logger.error(f"Migration error for UID flip tables: {e}")
+
+    async def _migrate_add_uid_flip_columns(self):
+        """Миграция: добавление колонок uid/web_token/cookies в uid_flip_settings"""
+        try:
+            async with self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='uid_flip_settings'"
+            ) as cursor:
+                if not await cursor.fetchone():
+                    return
+            async with self._conn.execute("PRAGMA table_info(uid_flip_settings)") as cursor:
+                columns = [row['name'] for row in await cursor.fetchall()]
+            new_cols = {
+                'uid': "TEXT DEFAULT ''",
+                'web_token': "TEXT DEFAULT ''",
+                'cookies': "TEXT DEFAULT ''",
+            }
+            for col_name, col_type in new_cols.items():
+                if col_name not in columns:
+                    await self._conn.execute(f"ALTER TABLE uid_flip_settings ADD COLUMN {col_name} {col_type}")
+                    logger.info(f"Migration: added {col_name} column to uid_flip_settings")
+            await self._conn.commit()
+        except Exception as e:
+            logger.error(f"Migration error for UID flip columns: {e}")
 
     async def get_uid_flip_settings(self, user_id: int):
         """Получить настройки UID flip trading пользователя"""
