@@ -624,14 +624,9 @@ class UIDFlipSession:
         logger.info(f"[UIDFlipSession] Subscribed: user={self.user_id}, symbol={self.symbol}")
 
         try:
-            if not self.settings.test_mode:
-                logger.info(f"[UIDFlipSession] Setting leverage {self.settings.leverage}x for {self.symbol}")
-                lev_long = await self.mexc_client.set_leverage(self.symbol, self.settings.leverage, position_type=1)
-                lev_short = await self.mexc_client.set_leverage(self.symbol, self.settings.leverage, position_type=2)
-                if lev_long and lev_short:
-                    logger.info(f"[UIDFlipSession] Leverage OK: {self.symbol} {self.settings.leverage}x")
-                else:
-                    logger.warning(f"[UIDFlipSession] Leverage issue for {self.symbol}")
+            # NOTE: set_leverage требует API signature, недоступную через WEB token.
+            # Установите плечо вручную на futures.mexc.com перед запуском.
+            logger.info(f"[UIDFlipSession] Leverage should be set manually on site: {self.settings.leverage}x")
 
             heartbeat_counter = 0
             while self.is_running:
@@ -1371,6 +1366,19 @@ class UIDFlipTrader:
                     "leverage": t.leverage,
                     "opened_at": t.opened_at,
                 } for t in open_trades
+            ],
+        }
+
+    def is_user_active(self, user_id: int) -> bool:
+        for uid, _ in self.active_sessions.keys():
+            if uid == user_id:
+                return True
+        return False
+
+
+# Глобальный экземпляр
+uid_flip_trader = UIDFlipTrader()
+       } for t in open_trades
             ],
         }
 

@@ -2775,41 +2775,85 @@ async def uid_flip_toggle_test(callback: CallbackQuery, user: UserSettings, db: 
 
 
 @callbacks_router.callback_query(F.data == "uid_flip:symbols")
-async def uid_flip_symbols_menu(callback: CallbackQuery, user: UserSettings, db: Database):
-    """Меню выбора символов для UID flip"""
+async def show_uid_flip_symbols(callback: CallbackQuery, user: UserSettings, db: Database = None):
+    """Меню выбора символов для UID flip — кнопочный toggle"""
+    if not db:
+        await callback.answer("❌ База данных недоступна", show_alert=True)
+        return
     try:
         flip_settings = await db.get_uid_flip_settings(user.user_id)
         if not flip_settings:
-            await callback.answer("❌ Настройки не найдены", show_alert=True)
-            return
+            flip_settings = await db.create_uid_flip_settings(user.user_id)
 
-        current = ", ".join(flip_settings.selected_symbols) if flip_settings.selected_symbols else "—"
-
-        await callback.message.edit_text(
-            f"**📋 Символы UID Flip Trading**\n\n"
-            f"Текущие: `{current}`\n\n"
-            f"Введите новые символы через запятую:\n"
-            f"_(Например: BTC, ETH, SOL)_",
-            reply_markup=InlineKeyboardBuilder().button(
-                text="🔙 Назад", callback_data="uid_flip:menu"
-            ).as_markup()
+        AVAILABLE_SYMBOLS = ['BTC', 'ETH', 'SOL', 'TAO', 'ASTER', 'BCH', 'XRP', 'DOGE', 'BNB', 'LTC']
+        builder = InlineKeyboardBuilder()
+        for symbol in AVAILABLE_SYMBOLS:
+            is_selected = symbol in flip_settings.selected_symbols
+            emoji = "✅" if is_selected else "⬜"
+            builder.button(text=f"{emoji} {symbol}", callback_data=f"uid_flip:symbol_toggle:{symbol}")
+        builder.adjust(3)
+        builder.row(
+            InlineKeyboardButton(text="💾 Сохранить", callback_data="uid_flip:symbol_save"),
+            InlineKeyboardButton(text="🔙 Назад", callback_data="uid_flip:menu")
         )
-        await callback.answer()
-
-        from aiogram.fsm.context import FSMContext
-        state = FSMContext(
-            storage=callback.bot._dispatcher.fsm.storage,
-            key=FSMContext.get_key(callback.from_user.id, callback.message.chat.id)
-        )
-        await state.set_state(SetupStates.waiting_for_uid_flip_symbols)
-
+        selected = ", ".join(flip_settings.selected_symbols) if flip_settings.selected_symbols else "Не выбраны"
+        text = f"**💎 Выбор пар для UID Flip Trading**\n\nВыбрано: **{escape_html(selected)}**\n\nНажми на пару чтобы добавить/убрать:"
+        await safe_edit_text(callback, text, reply_markup=builder.as_markup())
     except Exception as e:
-        logger.error(f"UID flip symbols menu error: {e}")
+        logger.error(f"UID flip symbols error: {e}")
+        await safe_edit_text(callback, f"❌ Ошибка: {escape_html(str(e))[:100]}",
+            reply_markup=InlineKeyboardBuilder().button(text="🔙 Назад", callback_data="uid_flip:menu").as_markup())
+
+
+@callbacks_router.callback_query(F.data.startswith("uid_flip:symbol_toggle:"))
+async def toggle_uid_flip_symbol(callback: CallbackQuery, user: UserSettings, db: Database = None):
+    """Добавить/убрать пару из UID выбранных"""
+    if not db:
+        await callback.answer("❌ База данных недоступна", show_alert=True)
+        return
+    try:
+        symbol = callback.data.split(":")[2]
+        flip_settings = await db.get_uid_flip_settings(user.user_id)
+        if not flip_settings:
+            flip_settings = await db.create_uid_flip_settings(user.user_id)
+        if symbol in flip_settings.selected_symbols:
+            flip_settings.selected_symbols.remove(symbol)
+        else:
+            flip_settings.selected_symbols.append(symbol)
+        await db.update_uid_flip_settings(flip_settings)
+        await show_uid_flip_symbols(callback, user, db)
+    except Exception as e:
+        logger.error(f"Toggle UID symbol error: {e}")
+        await callback.answer("❌ Ошибка", show_alert=True)
+
+
+@callbacks_router.callback_query(F.data == "uid_flip:symbol_save")
+async def save_uid_flip_symbols(callback: CallbackQuery, user: UserSettings, db: Database = None):
+    """Сохранить выбор символов UID"""
+    if not db:
+        await callback.answer("❌ База данных недоступна", show_alert=True)
+        return
+    try:
+        flip_settings = await db.get_uid_flip_settings(user.user_id)
+        if not flip_settings:
+            flip_settings = await db.create_uid_flip_settings(user.user_id)
+        selected = ", ".join(flip_settings.selected_symbols) if flip_settings.selected_symbols else "Не выбраны"
+        await safe_edit_text(
+            callback,
+            f"✅ **Символы UID сохранены!**\n\nВыбрано: **{escape_html(selected)}**",
+            reply_markup=InlineKeyboardBuilder()
+                .button(text="💎 Изменить", callback_data="uid_flip:symbols")
+                .button(text="🔑 UID меню", callback_data="uid_flip:menu")
+                .as_markup()
+        )
+        await callback.answer("✅ Сохранено", show_alert=True)
+    except Exception as e:
+        logger.error(f"Save UID symbols error: {e}")
         await callback.answer("❌ Ошибка", show_alert=True)
 
 
 @callbacks_router.callback_query(F.data == "uid_flip:leverage")
-async def uid_flip_leverage_menu(callback: CallbackQuery, user: UserSettings, db: Database):
+async def uid_flip_leverage_menu(callback: CallbackQuery, user: UserSettings, db: Database, state: FSMContext):
     """Меню плеча UID flip"""
     try:
         flip_settings = await db.get_uid_flip_settings(user.user_id)
@@ -2820,19 +2864,13 @@ async def uid_flip_leverage_menu(callback: CallbackQuery, user: UserSettings, db
         text = (
             f"**⚡ Плечо UID Flip Trading**\n\n"
             f"Текущее: **{flip_settings.leverage}x**\n\n"
-            f"Введите новое плечо (1-300):\n"
-            f"_(Отправьте число сообщением)_"
+            f"⚠️ Плечо нужно установить вручную на futures.mexc.com\n\n"
+            f"Введите число для отображения (1-300):"
         )
         keyboard = InlineKeyboardBuilder()
         keyboard.button(text="🔙 Назад", callback_data="uid_flip:menu")
         await callback.message.edit_text(text, reply_markup=keyboard.as_markup())
         await callback.answer()
-
-        from aiogram.fsm.context import FSMContext
-        state = FSMContext(
-            storage=callback.bot._dispatcher.fsm.storage,
-            key=FSMContext.get_key(callback.from_user.id, callback.message.chat.id)
-        )
         await state.set_state(SetupStates.waiting_for_uid_flip_leverage)
 
     except Exception as e:
@@ -2841,7 +2879,7 @@ async def uid_flip_leverage_menu(callback: CallbackQuery, user: UserSettings, db
 
 
 @callbacks_router.callback_query(F.data == "uid_flip:position_size")
-async def uid_flip_position_size_menu(callback: CallbackQuery, user: UserSettings, db: Database):
+async def uid_flip_position_size_menu(callback: CallbackQuery, user: UserSettings, db: Database, state: FSMContext):
     """Меню размера позиции UID flip"""
     try:
         flip_settings = await db.get_uid_flip_settings(user.user_id)
@@ -2853,18 +2891,11 @@ async def uid_flip_position_size_menu(callback: CallbackQuery, user: UserSetting
             f"**💰 Размер позиции UID Flip Trading**\n\n"
             f"Текущий: **${flip_settings.position_size_usd:.0f}**\n\n"
             f"Введите размер в USDT (1-10000):\n"
-            f"_(Отправьте число сообщением)_"
         )
         keyboard = InlineKeyboardBuilder()
         keyboard.button(text="🔙 Назад", callback_data="uid_flip:menu")
         await callback.message.edit_text(text, reply_markup=keyboard.as_markup())
         await callback.answer()
-
-        from aiogram.fsm.context import FSMContext
-        state = FSMContext(
-            storage=callback.bot._dispatcher.fsm.storage,
-            key=FSMContext.get_key(callback.from_user.id, callback.message.chat.id)
-        )
         await state.set_state(SetupStates.waiting_for_uid_flip_position_size)
 
     except Exception as e:
