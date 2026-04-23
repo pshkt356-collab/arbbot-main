@@ -2989,7 +2989,7 @@ async def uid_flip_session_add(callback: CallbackQuery, state: FSMContext, user:
             "2. Залогиньтесь\n"
             "3. Откройте DevTools (F12) → Application → Cookies\n"
             "4. Найдите UID в ответах API (поле `uid` или `userId`)\n"
-            "5. Найдите cookie `u_id` — значение начинается с `WEB_`\n\n"
+            "5. Найдите cookie `u_id` — значение начинается с `WEB`\n\n"
             "**Шаг 1/3: Введите UID:**"
         )
         keyboard = InlineKeyboardBuilder()

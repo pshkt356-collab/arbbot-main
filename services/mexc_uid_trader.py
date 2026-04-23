@@ -7,14 +7,14 @@ MEXC UID Flip Trading Engine
 1. Пользователь логинится на futures.mexc.com в браузере
 2. Копирует из DevTools:
    - uid (userId из localStorage или ответов API)
-   - web token (Authorization header, начинается с WEB_)
+   - web token (Authorization header, начинается с WEB)
    - cookies (session cookies)
 3. Бот имитирует браузерные запросы к внутренним API MEXC
 
 Как получить WEB token:
 1. Откройте futures.mexc.com и залогиньтесь
 2. DevTools (F12) → Application → Cookies → futures.mexc.com
-3. Найдите cookie `u_id` — значение начинается с WEB_
+3. Найдите cookie `u_id` — значение начинается с WEB
 4. Это и есть ваш WEB token
 
 Преимущества:
@@ -44,7 +44,7 @@ class MexcUIDClient:
     """
     Клиент для торговли через MEXC web session (UID).
     Использует cookies + WEB token из браузерной сессии.
-    WEB token — это значение cookie `u_id`, начинается с WEB_
+    WEB token — это значение cookie `u_id`, начинается с WEB
     """
 
     BASE_URL = "https://futures.mexc.com"
@@ -55,7 +55,7 @@ class MexcUIDClient:
         """
         Args:
             uid: User ID из MEXC (виден в DevTools → localStorage → userId)
-            web_token: WEB token из cookie `u_id` (начинается с WEB_)
+            web_token: WEB token из cookie `u_id` (начинается с WEB)
             cookies: Все cookies из браузера (формат: "key1=val1; key2=val2")
         """
         self.uid = uid
@@ -76,7 +76,7 @@ class MexcUIDClient:
         }
 
         # MEXC использует WEB token в заголовке Authorization (не Bearer!)
-        # WEB token берётся из cookie u_id, формат: WEB_...
+        # WEB token берётся из cookie u_id, формат: WEB...
         if self.web_token:
             headers["Authorization"] = self.web_token
 
@@ -527,7 +527,7 @@ class UIDFlipSettings:
     test_mode: bool = True
     # UID session credentials
     uid: str = ""               # MEXC user ID
-    web_token: str = ""      # WEB token из cookie u_id (начинается с WEB_)
+    web_token: str = ""      # WEB token из cookie u_id (начинается с WEB)
     cookies: str = ""           # Cookies из браузера
     created_at: str = None
     updated_at: str = None

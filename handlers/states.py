@@ -925,10 +925,11 @@ async def process_uid_web_token(message: Message, state: FSMContext, user: UserS
         return
 
     web_token = message.text.strip()
-    if not web_token.startswith("WEB_"):
+    if not web_token.startswith("WEB"):
         await message.answer(
-            "❌ WEB Token должен начинаться с `WEB_`.\n\n"
-            "Убедитесь что вы скопировали значение cookie `u_id`:"
+            "❌ WEB Token должен начинаться с `WEB`.\n\n"
+            "Убедитесь что вы скопировали значение cookie `u_id` из DevTools:",
+            parse_mode="Markdown"
         )
         return
 
