@@ -1015,7 +1015,6 @@ async def show_positions_menu(callback: CallbackQuery, user: UserSettings):
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
 
 @callbacks_router.callback_query(F.data == "positions:open")
-@callbacks_router.callback_query(F.data == "positions:open")
 async def show_open_positions(callback: CallbackQuery, user: UserSettings, db=None):
     """Show open positions from DB"""
     await callback.answer()
@@ -1687,8 +1686,8 @@ async def show_position_details(callback: CallbackQuery, user: UserSettings, db:
             f"   TP: {trade.take_profit_price:.6f}\n"
         )
 
-        if trade.trailing_enabled:
-            text += f"   📊 Trailing: {trade.trailing_stop_price:.6f}\n"
+        if getattr(trade, 'trailing_enabled', False):
+            text += f"   📊 Trailing: {getattr(trade, 'trailing_stop_price', 0):.6f}\n"
 
         text += f"\n🔧 **Действия:**"
 
@@ -3045,13 +3044,6 @@ async def uid_flip_session_delete(callback: CallbackQuery, user: UserSettings, d
         flip_settings.web_token = ""
         flip_settings.cookies = ""
         await db.update_uid_flip_settings(flip_settings)
-
-        await callback.answer("✅ UID сессия удалена", show_alert=True)
-        await show_uid_session_menu(callback, user, db)
-    except Exception as e:
-        logger.error(f"UID session delete error: {e}")
-        await callback.answer("❌ Ошибка", show_alert=True)
-update_uid_flip_settings(flip_settings)
 
         await callback.answer("✅ UID сессия удалена", show_alert=True)
         await show_uid_session_menu(callback, user, db)

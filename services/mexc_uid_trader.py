@@ -1378,16 +1378,3 @@ class UIDFlipTrader:
 
 # Глобальный экземпляр
 uid_flip_trader = UIDFlipTrader()
-       } for t in open_trades
-            ],
-        }
-
-    def is_user_active(self, user_id: int) -> bool:
-        for uid, _ in self.active_sessions.keys():
-            if uid == user_id:
-                return True
-        return False
-
-
-# Глобальный экземпляр
-uid_flip_trader = UIDFlipTrader()

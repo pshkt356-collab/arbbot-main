@@ -998,7 +998,7 @@ async def process_uid_cookies(message: Message, state: FSMContext, user: UserSet
                     f"✅ **MEXC UID подключён!**\n\n"
                     f"💳 Баланс: `${bal:.2f} USDT`\n"
                     f"🆔 UID: `{uid[:20]}...`\n"
-                    f"🔑 WEB Token: `{web_token[:25]}...`\n"
+                    f"🔑 WEB Token: `{web_token[:25] if len(web_token) > 25 else web_token}...`\n"
                     f"{'🍪 Cookies: сохранены' if cookies else '🍪 Cookies: не указаны'}\n\n"
                     f"Теперь вы можете запускать UID Flip Trading.",
                     reply_markup=keyboard.as_markup()
