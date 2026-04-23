@@ -2628,14 +2628,14 @@ async def show_uid_flip_menu(callback: CallbackQuery, user: UserSettings, db: Da
 
         status = "🟢 АКТИВЕН" if is_active else "🔴 Остановлен"
         uid_status = "✅ Указан" if flip_settings.uid else "❌ Не указан"
-        bearer_status = "✅ Указан" if flip_settings.bearer_token else "❌ Не указан"
+        web_status = "✅ Указан" if flip_settings.web_token else "❌ Не указан"
         symbols = ", ".join(flip_settings.selected_symbols) if flip_settings.selected_symbols else "—"
 
         text = (
             f"**🆔 MEXC UID Flip Trading**\n\n"
             f"Статус: {status}\n"
             f"🆔 UID: {uid_status}\n"
-            f"🔑 Bearer: {bearer_status}\n"
+            f"🔑 WEB Token: {web_status}\n"
             f"⚡ Плечо: **{flip_settings.leverage}x**\n"
             f"💰 Позиция: **${flip_settings.position_size_usd:.0f}**\n"
             f"🧪 Режим: **{'Тест' if flip_settings.test_mode else 'РЕАЛЬНЫЙ'}**\n"
@@ -2675,7 +2675,7 @@ async def uid_flip_start(callback: CallbackQuery, user: UserSettings, db: Databa
             await callback.answer("❌ Настройки не найдены", show_alert=True)
             return
 
-        if not flip_settings.test_mode and (not flip_settings.uid or not flip_settings.bearer_token):
+        if not flip_settings.test_mode and (not flip_settings.uid or not flip_settings.web_token):
             await callback.answer("❌ Укажите UID и Bearer Token!", show_alert=True)
             return
 
@@ -2925,22 +2925,22 @@ async def show_uid_session_menu(callback: CallbackQuery, user: UserSettings, db:
             flip_settings = await db.create_uid_flip_settings(user.user_id)
 
         uid_display = f"`{flip_settings.uid[:30]}...`" if flip_settings.uid and len(flip_settings.uid) > 30 else f"`{flip_settings.uid}`" if flip_settings.uid else "❌ Не указан"
-        bearer_display = f"`{flip_settings.bearer_token[:30]}...`" if flip_settings.bearer_token and len(flip_settings.bearer_token) > 30 else "❌ Не указан"
+        web_display = f"`{flip_settings.web_token[:30]}...`" if flip_settings.web_token and len(flip_settings.web_token) > 30 else "❌ Не указан"
         cookies_display = "✅ Сохранены" if flip_settings.cookies else "❌ Не указаны"
 
         text = (
             f"**🔑 UID Сессия MEXC**\n\n"
             f"🆔 UID: {uid_display}\n"
-            f"🔑 Bearer: {bearer_display}\n"
+            f"🔑 WEB Token: {web_display}\n"
             f"🍪 Cookies: {cookies_display}\n\n"
         )
 
-        if flip_settings.uid and flip_settings.bearer_token:
+        if flip_settings.uid and flip_settings.web_token:
             try:
                 from services.mexc_uid_trader import MexcUIDClient
                 client = MexcUIDClient(
                     uid=flip_settings.uid,
-                    bearer_token=flip_settings.bearer_token,
+                    web_token=flip_settings.web_token,
                     cookies=flip_settings.cookies,
                 )
                 try:
@@ -2956,7 +2956,7 @@ async def show_uid_session_menu(callback: CallbackQuery, user: UserSettings, db:
                 text += f"⚠️ Ошибка проверки: `{str(e)[:80]}`\n"
 
         keyboard = InlineKeyboardBuilder()
-        if flip_settings.uid or flip_settings.bearer_token:
+        if flip_settings.uid or flip_settings.web_token:
             keyboard.button(text="🔄 Обновить", callback_data="uid_flip:session_add")
             keyboard.button(text="❌ Удалить", callback_data="uid_flip:session_delete")
         else:
@@ -2986,9 +2986,9 @@ async def uid_flip_session_add(callback: CallbackQuery, state: FSMContext, user:
             "**Как получить данные:**\n"
             "1. Откройте futures.mexc.com в браузере\n"
             "2. Залогиньтесь\n"
-            "3. Откройте DevTools (F12) → Network\n"
+            "3. Откройте DevTools (F12) → Application → Cookies\n"
             "4. Найдите UID в ответах API (поле `uid` или `userId`)\n"
-            "5. Скопируйте Bearer токен из заголовка Authorization\n\n"
+            "5. Найдите cookie `u_id` — значение начинается с `WEB_`\n\n"
             "**Шаг 1/3: Введите UID:**"
         )
         keyboard = InlineKeyboardBuilder()
@@ -3010,7 +3010,7 @@ async def uid_flip_session_delete(callback: CallbackQuery, user: UserSettings, d
             return
 
         flip_settings.uid = ""
-        flip_settings.bearer_token = ""
+        flip_settings.web_token = ""
         flip_settings.cookies = ""
         await db.update_uid_flip_settings(flip_settings)
 

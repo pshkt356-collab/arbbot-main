@@ -1054,7 +1054,7 @@ class Database:
                             min_price_movement_pct REAL DEFAULT 0.01,
                             test_mode BOOLEAN DEFAULT 1,
                             uid TEXT DEFAULT '',
-                            bearer_token TEXT DEFAULT '',
+                            web_token TEXT DEFAULT '',
                             cookies TEXT DEFAULT '',
                             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -1115,7 +1115,7 @@ class Database:
                     min_price_movement_pct=row['min_price_movement_pct'] if row['min_price_movement_pct'] is not None else 0.01,
                     test_mode=bool(row['test_mode']) if row['test_mode'] is not None else True,
                     uid=row['uid'] if row['uid'] else '',
-                    bearer_token=row['bearer_token'] if row['bearer_token'] else '',
+                    web_token=row['web_token'] if row['web_token'] else '',
                     cookies=row['cookies'] if row['cookies'] else '',
                     created_at=row['created_at'],
                     updated_at=row['updated_at']
@@ -1133,13 +1133,13 @@ class Database:
                 await self._conn.execute("""
                     INSERT INTO uid_flip_settings (user_id, enabled, selected_symbols, leverage,
                         position_size_usd, max_daily_flips, max_daily_loss_usd,
-                        min_price_movement_pct, test_mode, uid, bearer_token, cookies)
+                        min_price_movement_pct, test_mode, uid, web_token, cookies)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     user_id, int(settings.enabled), json.dumps(settings.selected_symbols),
                     settings.leverage, settings.position_size_usd, settings.max_daily_flips,
                     settings.max_daily_loss_usd, settings.min_price_movement_pct,
-                    int(settings.test_mode), settings.uid, settings.bearer_token, settings.cookies
+                    int(settings.test_mode), settings.uid, settings.web_token, settings.cookies
                 ))
                 await self._conn.commit()
                 logger.info(f"Created UID flip settings for user {user_id}")
@@ -1156,14 +1156,14 @@ class Database:
                     enabled = ?, selected_symbols = ?, leverage = ?,
                     position_size_usd = ?, max_daily_flips = ?,
                     max_daily_loss_usd = ?, min_price_movement_pct = ?,
-                    test_mode = ?, uid = ?, bearer_token = ?, cookies = ?,
+                    test_mode = ?, uid = ?, web_token = ?, cookies = ?,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE user_id = ?
             """, (
                 int(settings.enabled), json.dumps(settings.selected_symbols),
                 settings.leverage, settings.position_size_usd, settings.max_daily_flips,
                 settings.max_daily_loss_usd, settings.min_price_movement_pct,
-                int(settings.test_mode), settings.uid, settings.bearer_token, settings.cookies,
+                int(settings.test_mode), settings.uid, settings.web_token, settings.cookies,
                 settings.user_id
             ))
             await self._conn.commit()

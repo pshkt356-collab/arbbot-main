@@ -47,7 +47,7 @@ class SetupStates(StatesGroup):
     waiting_for_uid_flip_position_size = State()
     waiting_for_uid_flip_symbols = State()
     waiting_for_uid_input = State()         # Ввод UID MEXC
-    waiting_for_uid_bearer_token = State()  # Ввод Bearer Token
+    waiting_for_uid_web_token = State()     # Ввод WEB token (из cookie u_id)
     waiting_for_uid_cookies = State()       # Ввод Cookies
 
 @states_router.message(SetupStates.waiting_for_api_key)
@@ -905,40 +905,40 @@ async def process_uid_input(message: Message, state: FSMContext, user: UserSetti
         return
 
     await state.update_data(uid_flip_uid=uid)
-    await state.set_state(SetupStates.waiting_for_uid_bearer_token)
+    await state.set_state(SetupStates.waiting_for_uid_web_token)
 
     await message.answer(
         f"✅ **UID сохранён:** `{uid[:20]}...`\n\n"
-        f"**🔐 Шаг 2/3: Введите Bearer Token**\n\n"
-        f"Откройте DevTools → Network, найдите заголовок `Authorization: Bearer ...`\n"
-        f"в любом запросе к futures.mexc.com и скопируйте токен после `Bearer `:\n\n"
+        f"**🔐 Шаг 2/3: Введите WEB Token**\n\n"
+        f"Откройте DevTools (F12) → Application → Cookies → futures.mexc.com\n"
+        f"Найдите cookie `u_id` и скопируйте его значение (начинается с `WEB_`):\n\n"
         f"_(Отправьте /cancel для отмены)_"
     )
 
 
-@states_router.message(SetupStates.waiting_for_uid_bearer_token)
-async def process_uid_bearer_token(message: Message, state: FSMContext, user: UserSettings):
-    """Обработка ввода Bearer Token"""
+@states_router.message(SetupStates.waiting_for_uid_web_token)
+async def process_uid_web_token(message: Message, state: FSMContext, user: UserSettings):
+    """Обработка ввода WEB Token"""
     if message.text == "/cancel":
         await state.clear()
         await message.answer("❌ Отменено")
         return
 
-    bearer = message.text.strip()
-    if len(bearer) < 20:
-        await message.answer("❌ Bearer Token слишком короткий. Попробуйте ещё:")
+    web_token = message.text.strip()
+    if not web_token.startswith("WEB_"):
+        await message.answer(
+            "❌ WEB Token должен начинаться с `WEB_`.\n\n"
+            "Убедитесь что вы скопировали значение cookie `u_id`:"
+        )
         return
 
-    # Убираем префикс Bearer если пользователь скопировал его
-    bearer = bearer.replace("Bearer ", "").replace("bearer ", "")
-
-    await state.update_data(uid_flip_bearer=bearer)
+    await state.update_data(uid_flip_web_token=web_token)
     await state.set_state(SetupStates.waiting_for_uid_cookies)
 
     await message.answer(
-        f"✅ **Bearer Token сохранён**\n\n"
+        f"✅ **WEB Token сохранён**\n\n"
         f"**🍪 Шаг 3/3: Введите Cookies (опционально)**\n\n"
-        f"Откройте DevTools → Application → Cookies, скопируйте ключевые cookies\n"
+        f"Откройте DevTools → Application → Cookies, скопируйте все cookies\n"
         f"в формате `key1=value1; key2=value2`.\n\n"
         f"Если не хотите вводить cookies — отправьте прочерк `-`:\n\n"
         f"_(Отправьте /cancel для отмены)_"
@@ -959,23 +959,20 @@ async def process_uid_cookies(message: Message, state: FSMContext, user: UserSet
 
     data = await state.get_data()
     uid = data.get('uid_flip_uid', '')
-    bearer = data.get('uid_flip_bearer', '')
+    web_token = data.get('uid_flip_web_token', '')
 
-    if not uid or not bearer:
-        await message.answer("❌ Ошибка: UID или Bearer Token не найдены. Начните заново.")
+    if not uid or not web_token:
+        await message.answer("❌ Ошибка: UID или WEB Token не найдены. Начните заново.")
         await state.clear()
         return
 
     try:
-        # Сохраняем в БД
-        from services.mexc_uid_trader import UIDFlipSettings
-
         flip_settings = await db.get_uid_flip_settings(user.user_id)
         if not flip_settings:
             flip_settings = await db.create_uid_flip_settings(user.user_id)
 
         flip_settings.uid = uid
-        flip_settings.bearer_token = bearer
+        flip_settings.web_token = web_token
         flip_settings.cookies = cookies
         await db.update_uid_flip_settings(flip_settings)
 
@@ -985,7 +982,7 @@ async def process_uid_cookies(message: Message, state: FSMContext, user: UserSet
         await message.answer("🔄 Проверяю подключение через UID...")
 
         from services.mexc_uid_trader import MexcUIDClient
-        client = MexcUIDClient(uid=uid, bearer_token=bearer, cookies=cookies)
+        client = MexcUIDClient(uid=uid, web_token=web_token, cookies=cookies)
         try:
             conn = await client.test_connection()
 
@@ -1000,7 +997,7 @@ async def process_uid_cookies(message: Message, state: FSMContext, user: UserSet
                     f"✅ **MEXC UID подключён!**\n\n"
                     f"💳 Баланс: `${bal:.2f} USDT`\n"
                     f"🆔 UID: `{uid[:20]}...`\n"
-                    f"🔑 Bearer: `{bearer[:20]}...`\n"
+                    f"🔑 WEB Token: `{web_token[:25]}...`\n"
                     f"{'🍪 Cookies: сохранены' if cookies else '🍪 Cookies: не указаны'}\n\n"
                     f"Теперь вы можете запускать UID Flip Trading.",
                     reply_markup=keyboard.as_markup()
@@ -1009,7 +1006,7 @@ async def process_uid_cookies(message: Message, state: FSMContext, user: UserSet
                 await message.answer(
                     f"⚠️ **UID данные сохранены, но проверка не пройдена**\n\n"
                     f"Причина: `{conn.get('error', 'Неизвестно')[:100]}`\n\n"
-                    f"Возможно, сессия истекла. Обновите Bearer Token.",
+                    f"Возможно, WEB token истёк. Обновите его через меню.",
                     reply_markup=keyboard.as_markup()
                 )
         finally:

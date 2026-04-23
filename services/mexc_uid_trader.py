@@ -1,15 +1,21 @@
 """
 MEXC UID Flip Trading Engine
-Торговля через браузерную сессию (UID + cookies/bearer token).
+Торговля через браузерную сессию (UID + WEB token + cookies).
 Использует внутренние endpoint'ы MEXC web интерфейса.
 
 Принцип работы:
 1. Пользователь логинится на futures.mexc.com в браузере
 2. Копирует из DevTools:
    - uid (userId из localStorage или ответов API)
-   - bearer token (Authorization header)
+   - web token (Authorization header, начинается с WEB_)
    - cookies (session cookies)
 3. Бот имитирует браузерные запросы к внутренним API MEXC
+
+Как получить WEB token:
+1. Откройте futures.mexc.com и залогиньтесь
+2. DevTools (F12) → Application → Cookies → futures.mexc.com
+3. Найдите cookie `u_id` — значение начинается с WEB_
+4. Это и есть ваш WEB token
 
 Преимущества:
 - Нулевая комиссия (используются акции веб-интерфейса)
@@ -37,22 +43,23 @@ logger = logging.getLogger(__name__)
 class MexcUIDClient:
     """
     Клиент для торговли через MEXC web session (UID).
-    Использует cookies + bearer token из браузерной сессии.
+    Использует cookies + WEB token из браузерной сессии.
+    WEB token — это значение cookie `u_id`, начинается с WEB_
     """
 
     BASE_URL = "https://futures.mexc.com"
     API_URL = "https://futures.mexc.com/api/v1/private"
     PUBLIC_URL = "https://futures.mexc.com/api/v1/public"
 
-    def __init__(self, uid: str = None, bearer_token: str = None, cookies: str = None):
+    def __init__(self, uid: str = None, web_token: str = None, cookies: str = None):
         """
         Args:
             uid: User ID из MEXC (виден в DevTools → localStorage → userId)
-            bearer_token: Bearer token из DevTools → Network → Authorization header
-            cookies: Cookies из браузера (формат: "key1=val1; key2=val2")
+            web_token: WEB token из cookie `u_id` (начинается с WEB_)
+            cookies: Все cookies из браузера (формат: "key1=val1; key2=val2")
         """
         self.uid = uid
-        self.bearer_token = bearer_token
+        self.web_token = web_token
         self.cookies_raw = cookies
         self._session: Optional[aiohttp.ClientSession] = None
         self._contract_cache: Dict[str, dict] = {}
@@ -68,8 +75,10 @@ class MexcUIDClient:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         }
 
-        if self.bearer_token:
-            headers["Authorization"] = f"Bearer {self.bearer_token}"
+        # MEXC использует WEB token в заголовке Authorization (не Bearer!)
+        # WEB token берётся из cookie u_id, формат: WEB_...
+        if self.web_token:
+            headers["Authorization"] = self.web_token
 
         return headers
 
@@ -188,13 +197,13 @@ class MexcUIDClient:
         return rounded
 
     # ------------------------------------------------------------------
-    #  Приватные методы (требуют auth через bearer + cookies)
+    #  Приватные методы (требуют auth через WEB token + cookies)
     # ------------------------------------------------------------------
 
     async def test_connection(self) -> dict:
         """Проверить подключение через UID сессию"""
-        if not self.uid or not self.bearer_token:
-            return {"success": False, "error": "UID or bearer token not configured"}
+        if not self.uid or not self.web_token:
+            return {"success": False, "error": "UID or WEB token not configured"}
 
         balance_result = await self.get_balance()
         if balance_result.get("success"):
@@ -209,8 +218,8 @@ class MexcUIDClient:
 
     async def get_balance(self) -> dict:
         """Получить баланс фьючерсного аккаунта"""
-        if not self.bearer_token:
-            return {"success": False, "error": "Bearer token not configured"}
+        if not self.web_token:
+            return {"success": False, "error": "WEB token not configured"}
 
         session = await self._get_session()
         try:
@@ -276,7 +285,7 @@ class MexcUIDClient:
                     code = data.get("code")
                     msg = data.get("message", "")
                     if code == 401:
-                        return {"success": False, "error": "Session expired. Get new bearer token from browser."}
+                        return {"success": False, "error": "Session expired. Get new WEB token from browser."}
                     return {"success": False, "error": f"MEXC error: code={code}, msg={msg}"}
         except Exception as e:
             logger.error(f"[MexcUID] Balance error: {e}")
@@ -284,8 +293,8 @@ class MexcUIDClient:
 
     async def get_position(self, symbol: str) -> dict:
         """Получить текущую позицию по символу"""
-        if not self.bearer_token:
-            return {"success": False, "error": "Bearer token not configured"}
+        if not self.web_token:
+            return {"success": False, "error": "WEB token not configured"}
 
         session = await self._get_session()
         try:
@@ -329,8 +338,8 @@ class MexcUIDClient:
 
     async def set_leverage(self, symbol: str, leverage: int, position_type: int = 1) -> bool:
         """Установить плечо"""
-        if not self.bearer_token:
-            logger.warning("[MexcUID] No bearer token, skipping leverage set")
+        if not self.web_token:
+            logger.warning("[MexcUID] No WEB token, skipping leverage set")
             return True
 
         session = await self._get_session()
@@ -408,7 +417,7 @@ class MexcUIDClient:
         position_type: int = 1,
     ) -> dict:
         """Универсальный метод размещения ордера через UID сессию"""
-        if not self.bearer_token:
+        if not self.web_token:
             return self._emulate_order(symbol, side, quantity)
 
         session = await self._get_session()
@@ -466,7 +475,7 @@ class MexcUIDClient:
         code = data.get("code")
         msg = data.get("message", "")
         if code == 401:
-            return {"success": False, "error": "MEXC: Session expired. Update bearer token from browser."}
+            return {"success": False, "error": "MEXC: Session expired. Update WEB token from browser."}
         if code == 402:
             return {"success": False, "error": "MEXC: Token expired (402)."}
         if code == 406:
@@ -489,12 +498,12 @@ class MexcUIDClient:
             "test_mode": True,
         }
 
-    def update_credentials(self, uid: str = None, bearer_token: str = None, cookies: str = None):
+    def update_credentials(self, uid: str = None, web_token: str = None, cookies: str = None):
         """Обновить креденшелы UID сессии"""
         if uid:
             self.uid = uid
-        if bearer_token:
-            self.bearer_token = bearer_token
+        if web_token:
+            self.web_token = web_token
         if cookies:
             self.cookies_raw = cookies
             # Сбрасываем сессию чтобы пересоздать с новыми cookies
@@ -518,7 +527,7 @@ class UIDFlipSettings:
     test_mode: bool = True
     # UID session credentials
     uid: str = ""               # MEXC user ID
-    bearer_token: str = ""      # Bearer token из браузера
+    web_token: str = ""      # WEB token из cookie u_id (начинается с WEB_)
     cookies: str = ""           # Cookies из браузера
     created_at: str = None
     updated_at: str = None
@@ -1124,8 +1133,8 @@ class UIDFlipTrader:
                 return {"success": False, "error": "No symbols selected"}
 
             if not flip_settings.test_mode:
-                if not flip_settings.uid or not flip_settings.bearer_token:
-                    return {"success": False, "error": "UID and Bearer Token required for real trading."}
+                if not flip_settings.uid or not flip_settings.web_token:
+                    return {"success": False, "error": "UID and WEB Token required for real trading."}
 
             async with self._clients_lock:
                 old_client = self.user_clients.pop(user_id, None)
@@ -1137,7 +1146,7 @@ class UIDFlipTrader:
 
                 client = MexcUIDClient(
                     uid=flip_settings.uid,
-                    bearer_token=flip_settings.bearer_token,
+                    web_token=flip_settings.web_token,
                     cookies=flip_settings.cookies,
                 )
                 self.user_clients[user_id] = client
