@@ -3020,6 +3020,3 @@ async def uid_flip_session_delete(callback: CallbackQuery, user: UserSettings, d
     except Exception as e:
         logger.error(f"UID session delete error: {e}")
         await callback.answer("❌ Ошибка", show_alert=True)
-n as e:
-        logger.error(f"UID session delete error: {e}")
-        await callback.answer("❌ Ошибка", show_alert=True)
