@@ -79,7 +79,7 @@ async def process_api_key(message: Message, state: FSMContext, user: UserSetting
     if not exchange:
         # Log to stdout (visible in Railway logs)
         logger.warning(f"[FSM SESSION ERROR] user={user_id}, state={current_state}, data={data}")
-        
+
         # Show debug info directly to user for troubleshooting
         debug_info = f"state={current_state}, keys={list(data.keys()) if data else 'empty'}"
         await message.answer(
@@ -249,21 +249,21 @@ async def process_custom_leverage(message: Message, state: FSMContext, user: Use
         await state.clear()
         await message.answer("❌ Отменено")
         return
-        
+
     try:
         lev = int(message.text.strip())
         if lev < 1 or lev > 125:
             await message.answer("❌ Плечо должно быть от 1 до 125")
             return
-            
+
         user.risk_settings['max_leverage'] = lev
         await db.update_user(user)
         await state.clear()
-        
+
         keyboard = InlineKeyboardBuilder()
         keyboard.button(text="⚠️ Риск-меню", callback_data="setup:risk")
         keyboard.button(text="📱 Меню", callback_data="menu:main")
-        
+
         await message.answer(f"✅ Плечо установлено: {lev}x", reply_markup=keyboard.as_markup())
     except ValueError:
         await message.answer("❌ Введите число (например: 20):")
@@ -284,11 +284,11 @@ async def process_take_profit(message: Message, state: FSMContext, user: UserSet
         user.risk_settings['take_profit_percent'] = tp
         await db.update_user(user)
         await state.clear()
-        
+
         keyboard = InlineKeyboardBuilder()
         keyboard.button(text="⚠️ Риск-меню", callback_data="setup:risk")
         keyboard.button(text="📱 Меню", callback_data="menu:main")
-        
+
         await message.answer(f"✅ Тейк-профит установлен: {tp}%", reply_markup=keyboard.as_markup())
     except ValueError:
         await message.answer("❌ Введите число:")
@@ -309,11 +309,11 @@ async def process_breakeven(message: Message, state: FSMContext, user: UserSetti
         user.risk_settings['stop_loss_breakeven_trigger'] = be
         await db.update_user(user)
         await state.clear()
-        
+
         keyboard = InlineKeyboardBuilder()
         keyboard.button(text="⚠️ Риск-меню", callback_data="setup:risk")
         keyboard.button(text="📱 Меню", callback_data="menu:main")
-        
+
         await message.answer(f"✅ Триггер безубытка: {be}%", reply_markup=keyboard.as_markup())
     except ValueError:
         await message.answer("❌ Введите число:")
@@ -334,11 +334,11 @@ async def process_trailing(message: Message, state: FSMContext, user: UserSettin
         user.risk_settings['trailing_stop_distance'] = dist
         await db.update_user(user)
         await state.clear()
-        
+
         keyboard = InlineKeyboardBuilder()
         keyboard.button(text="⚠️ Риск-меню", callback_data="setup:risk")
         keyboard.button(text="📱 Меню", callback_data="menu:main")
-        
+
         await message.answer(f"✅ Дистанция трейлинга: {dist}%", reply_markup=keyboard.as_markup())
     except ValueError:
         await message.answer("❌ Введите число:")
@@ -359,11 +359,11 @@ async def process_max_hours(message: Message, state: FSMContext, user: UserSetti
         user.risk_settings['max_position_hours'] = hours
         await db.update_user(user)
         await state.clear()
-        
+
         keyboard = InlineKeyboardBuilder()
         keyboard.button(text="⚠️ Риск-меню", callback_data="setup:risk")
         keyboard.button(text="📱 Меню", callback_data="menu:main")
-        
+
         if hours == 0:
             await message.answer("✅ Авто-закрытие отключено", reply_markup=keyboard.as_markup())
         else:
@@ -387,11 +387,11 @@ async def process_balance_usage(message: Message, state: FSMContext, user: UserS
         user.risk_settings['balance_usage_percent'] = pct
         await db.update_user(user)
         await state.clear()
-        
+
         keyboard = InlineKeyboardBuilder()
         keyboard.button(text="⚠️ Риск-меню", callback_data="setup:risk")
         keyboard.button(text="📱 Меню", callback_data="menu:main")
-        
+
         await message.answer(f"✅ Использование баланса: {pct}%", reply_markup=keyboard.as_markup())
     except ValueError:
         await message.answer("❌ Введите число (например: 95):")
@@ -1133,5 +1133,8 @@ async def process_uid_flip_symbols(message: Message, state: FSMContext, user: Us
 
     except Exception as e:
         logger.error(f"UID flip symbols error: {e}")
+        await message.answer(f"❌ Ошибка: {html.escape(str(e))[:200]}")
+        await state.clear()
+ols error: {e}")
         await message.answer(f"❌ Ошибка: {html.escape(str(e))[:200]}")
         await state.clear()

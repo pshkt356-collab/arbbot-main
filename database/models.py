@@ -131,7 +131,7 @@ class UserSettings:
     arbitrage_mode: str = 'all'  # 'all' или 'futures_futures_only'
     scan_type: str = 'all'  # 'all', 'inter', 'basis', 'funding'
     funding_arbitrage_enabled: bool = True  # Фандинг арбитраж включен
-    
+
     # Дополнительные поля для совместимости с callbacks.py
     auto_trade_mode: bool = False  # Режим авто-трейдинга
     alerts_enabled: bool = True    # Включены ли алерты
@@ -165,8 +165,8 @@ class UserSettings:
         """Общий баланс: сумма всех кешированных балансов бирж"""
         if hasattr(self, '_cached_balances') and self._cached_balances:
             return sum(
-                bal.get('total', 0) 
-                for bal in self._cached_balances.values() 
+                bal.get('total', 0)
+                for bal in self._cached_balances.values()
                 if isinstance(bal, dict)
             )
         # Fallback to legacy storage in risk_settings
@@ -176,25 +176,25 @@ class UserSettings:
     def total_balance(self, value: float):
         """Установить общий баланс (сохраняет в risk_settings)"""
         self.risk_settings['total_balance'] = value
-    
+
     @property
     def available_balance(self) -> float:
         """Доступный баланс: сумма доступных средств на всех биржах"""
         if hasattr(self, '_cached_balances') and self._cached_balances:
             return sum(
-                bal.get('free', 0) 
-                for bal in self._cached_balances.values() 
+                bal.get('free', 0)
+                for bal in self._cached_balances.values()
                 if isinstance(bal, dict)
             )
         return self.risk_settings.get('available_balance', 0.0)
-    
+
     @property
     def locked_balance(self) -> float:
         """Заблокированный баланс: сумма средств в ордерах"""
         if hasattr(self, '_cached_balances') and self._cached_balances:
             return sum(
-                bal.get('used', 0) 
-                for bal in self._cached_balances.values() 
+                bal.get('used', 0)
+                for bal in self._cached_balances.values()
                 if isinstance(bal, dict)
             )
         return self.risk_settings.get('locked_balance', 0.0)
@@ -265,14 +265,14 @@ class FlipSettings:
     mexc_api_secret: str = ""  # API секрет MEXC
     created_at: str = None
     updated_at: str = None
-    
+
     def __post_init__(self):
         if self.created_at is None:
             self.created_at = datetime.now().isoformat()
         if self.updated_at is None:
             self.updated_at = datetime.now().isoformat()
 
-@dataclass 
+@dataclass
 class FlipTrade:
     """Одна сделка MEXC Flip Trading"""
     id: Optional[int] = None
@@ -869,7 +869,7 @@ class Database:
             if test_mode is not None:
                 # Фильтруем по JSON metadata.test_mode
                 async with self._conn.execute(
-                    """SELECT * FROM trades 
+                    """SELECT * FROM trades
                     WHERE user_id = ? AND status = 'open'
                     AND json_extract(metadata, '$.test_mode') = ?""",
                     (user_id, int(test_mode))
